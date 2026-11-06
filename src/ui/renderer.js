@@ -5,6 +5,7 @@ const { selectControl, editableControl, close: closeDropdown } = window.dropdown
 const $ = (id) => document.getElementById(id);
 const workspace = $('workspace');
 const dialog = $('dialog');
+const pageButtons = $('workspace-nav').querySelectorAll('[data-page]');
 const tabs = new Map();
 const jobs = new Map();
 const jobRows = new Map();
@@ -13,12 +14,12 @@ const actionLabels = { tail: '查看日志末尾', follow: '跟踪日志', journ
 const authLabels = { password: '密码', key: '私钥', agent: 'Agent' };
 const jobLabels = { queued: '等待', running: '传输中', committing: '提交中', done: '完成', canceled: '已取消', skipped: '已跳过', failed: '失败', unverified: '待确认' };
 let hosts = [];
+let hostsLoaded = false;
 let currentGroup = '';
 let selectedGroup = '';
 let active;
 let filesOpen = false;
 let vaultStatus = {};
-workspace.dataset.hosts = 'auto';
 
 function node(tag, className, ...children) {
   const element = document.createElement(tag);
@@ -133,6 +134,7 @@ async function refreshHosts() {
   const [result, timestamps] = await Promise.all([api.hosts.list(), api.hosts.recent()]);
   if (vaultStatus.locked) return;
   hosts = result;
+  hostsLoaded = true;
   for (const [id, time] of Object.entries(timestamps)) recent.set(id, time);
   renderHosts();
 }
@@ -146,6 +148,7 @@ function applyVaultState(state) {
     for (const pane of [$('key-dialog'), dialog]) if (pane.open) pane.close();
     $('keys-page').replaceChildren();
     hosts = [];
+    hostsLoaded = false;
     renderHosts();
     $('unlock-error').textContent = '';
     $('unlock-secret').focus();
@@ -688,7 +691,7 @@ function groupCard(group, count) {
   card.dataset.group = group;
   card.setAttribute('aria-label', `打开分组 ${group}，${count} 台主机`);
   card.setAttribute('aria-pressed', String(selectedGroup === group));
-  card.title = '双击打开分组';
+  card.title = `${group} · 双击打开分组`;
   card.addEventListener('click', (event) => {
     if (event.detail === 0) { openGroup(group); return; }
     selectedGroup = group;
@@ -706,11 +709,9 @@ function hostCard(host, showGroup) {
   const open = button('', () => openHost(host), 'host-open', `连接 ${host.name}`);
   const address = showGroup && host.group ? `${endpoint(host)} · ${host.group}` : endpoint(host);
   open.replaceChildren(icon, node('span', 'host-identity', node('strong', '', host.name), node('small', '', address)));
-  open.title = [address, host.tags?.join(', '), host.note].filter(Boolean).join('\n');
-  const row = node('div', 'host-row', open, node('small', 'host-auth', authLabels[host.auth] || 'SSH'),
+  open.title = [host.name, address, host.tags?.join(', '), host.note].filter(Boolean).join('\n');
+  return node('div', 'host-row', open, node('small', 'host-auth', authLabels[host.auth] || 'SSH'),
     button('⋯', () => editHost(host), 'host-edit', `编辑 ${host.name}`));
-  row.dataset.active = String(active?.host.id === host.id);
-  return row;
 }
 
 function hostSection(title, entries) {
@@ -827,14 +828,16 @@ function selectTab(tab, view = tab ? 'session' : 'hosts') {
   closeDropdown();
   active = tab;
   workspace.dataset.view = view;
-  for (const page of ['keys', 'vault']) {
-    $(`${page}-page`).hidden = page !== view;
-    $(`${page}-button`).setAttribute('aria-pressed', String(page === view));
+  $('work').hidden = view !== 'session';
+  for (const control of pageButtons) {
+    const current = control.dataset.page === view;
+    $(control.getAttribute('aria-controls')).hidden = !current;
+    if (current) control.setAttribute('aria-current', 'page');
+    else control.removeAttribute('aria-current');
   }
   if (view === 'keys' && !$('keys-page').firstChild) $('keys-page').append(keyBrowser());
   if (view !== 'keys') $('keys-page').replaceChildren();
   if (view === 'vault') renderVaultPage();
-  $('toggle-hosts').hidden = !tab;
   if (tab) { tab.used = Date.now(); recent.set(tab.host.id, tab.used); }
   if (tab?.kind === 'shell' && tab.status === 'ready') status(`${tab.host.name} · SSH 已连接`);
   else if (tab?.kind === 'command') status(`${tab.host.name} · ${actionLabels[tab.action]}`);
@@ -842,7 +845,8 @@ function selectTab(tab, view = tab ? 'session' : 'hosts') {
   $('terminal-find').hidden = true;
   for (const entry of tabs.values()) entry.view.hidden = entry !== tab;
   renderTabs();
-  renderHosts();
+  revealActiveTab();
+  if (view === 'hosts') renderHosts();
   renderContext();
   renderFiles();
   if (filesOpen) ensureFiles(origin());
@@ -855,21 +859,25 @@ function selectTab(tab, view = tab ? 'session' : 'hosts') {
   }
 }
 
+function revealActiveTab() {
+  $('tabs').querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
 function renderTabs() {
   const strip = $('tabs');
-  const home = button('主机', () => selectTab(), 'tab-home');
-  home.setAttribute('aria-pressed', String(workspace.dataset.view === 'hosts'));
-  strip.replaceChildren(home);
+  strip.replaceChildren();
   for (const tab of tabs.values()) {
     const title = tab.kind === 'shell' ? `${tab.host.name}${tab.number > 1 ? ` · ${tab.number}` : ''}` : `${tab.host.name} · ${actionLabels[tab.action]}`;
-    const open = button(`${tab.kind === 'shell' ? (tab.status === 'ready' ? '● ' : '○ ') : '≡ '}${title}`, () => selectTab(tab), 'tab-open', title);
+    const ready = tab.status === 'ready';
+    const icon = node('span', ready ? 'online' : 'muted', tab.kind === 'command' ? '≡' : ready ? '●' : '○');
+    icon.setAttribute('aria-hidden', 'true');
+    const open = button('', () => selectTab(tab), 'tab-open', title);
+    open.replaceChildren(icon, node('span', 'tab-title', title));
     open.setAttribute('aria-pressed', String(tab === active));
     const row = node('div', 'tab', open, button('×', () => closeTab(tab), 'tab-close', `关闭 ${title}`));
     row.dataset.active = String(tab === active);
     strip.append(row);
   }
-  strip.append(button('＋', () => openPalette('hosts'), '', '连接主机'));
-  strip.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 
 async function chooseSession() {
@@ -1022,36 +1030,54 @@ function updateSession(tab, next, detail = '') {
 }
 
 async function openPalette(scope = 'all') {
+  const newTab = scope === 'hosts';
+  if (newTab && !hostsLoaded) await refreshHosts();
   const session = origin();
   const search = input('', 'search');
-  search.placeholder = '搜索主机或命令…';
-  search.setAttribute('aria-label', '搜索主机或命令');
+  const searchLabel = { hosts: '搜索主机名称、地址或分组', commands: '搜索快捷命令', all: '搜索主机或命令' }[scope];
+  search.placeholder = `${searchLabel}…`;
+  search.setAttribute('aria-label', searchLabel);
   const choices = node('div', 'palette-list');
   let selected;
   let entries;
+  const choose = (run) => { selected = run; dialog.close(); };
   const update = () => {
     const all = [];
-    if (scope !== 'commands') for (const host of hosts) all.push([host.name, endpoint(host), () => openHost(host)]);
-    if (session?.status === 'ready' && scope !== 'hosts') {
+    if (scope !== 'commands') {
+      for (const host of hosts) {
+        const detail = newTab && host.group ? `${endpoint(host)} · ${host.group}` : endpoint(host);
+        all.push([host.name, detail, () => openHost(host, newTab)]);
+      }
+    }
+    if (session?.status === 'ready' && !newTab) {
       for (const [action, label] of Object.entries(actionLabels)) all.push([label, session.host.name, () => configureCommand(session, action)]);
       all.push(['在新标签连接', session.host.name, () => openHost(session.host, true)]);
     }
     const q = search.value.trim().toLowerCase();
     entries = all.filter(([label, detail]) => `${label} ${detail}`.toLowerCase().includes(q));
     choices.replaceChildren(...entries.map(([label, detail, run]) => {
-      const choice = button('', () => { selected = run; dialog.close(); });
+      const choice = button('', () => choose(run));
       choice.replaceChildren(node('span', '', label), node('small', '', detail));
       return choice;
     }));
-    if (!entries.length) choices.append(node('p', 'muted', '没有可用的结果。'));
+    if (!entries.length) {
+      const empty = newTab
+        ? hosts.length ? '没有找到匹配的主机。' : '暂无已保存的主机，可先新建一台主机。'
+        : '没有可用的结果。';
+      const hint = node('p', 'muted', empty);
+      hint.setAttribute('role', 'status');
+      choices.append(hint);
+    }
+    const submit = search.form?.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = !entries.length;
   };
   search.addEventListener('input', update);
+  const title = { hosts: '新建 SSH 标签', commands: '快捷命令', all: '主机与命令' }[scope];
+  const extra = newTab ? [button('新建主机', () => choose(() => editHost()), 'outlined')] : [];
+  const selection = prompt(title, [search, choices], newTab ? '连接首项' : '打开首项', () => entries[0]?.[2], extra);
   update();
-  const first = await prompt(scope === 'commands' ? '快捷命令' : '主机与命令', [search, choices], '打开首项', () => {
-    if (!entries.length) throw new Error('没有可用的结果。');
-    return entries[0][2];
-  });
-  await (selected || first)?.();
+  const first = await selection;
+  if (!vaultStatus.locked) await (selected || first)?.();
 }
 
 async function configureCommand(session, action, file) {
@@ -1279,6 +1305,7 @@ api.onEvent((event) => {
 });
 
 new ResizeObserver(() => { if (active) active.fit.fit(); }).observe($('terminal-stage'));
+new ResizeObserver(revealActiveTab).observe(document.querySelector('.tabbar'));
 $('host-search').addEventListener('input', renderHosts);
 $('tag-filter').addEventListener('change', renderHosts);
 $('all-hosts').addEventListener('click', () => openGroup(''));
@@ -1292,8 +1319,12 @@ $('remove-group').addEventListener('click', async () => {
     renderHosts();
   } catch (error) { status(message(error)); }
 });
-$('keys-button').addEventListener('click', () => selectTab(undefined, 'keys'));
-$('vault-button').addEventListener('click', () => { if (workspace.dataset.view !== 'vault') selectTab(undefined, 'vault'); });
+for (const control of pageButtons) {
+  control.addEventListener('click', () => {
+    const page = control.dataset.page;
+    if (page !== workspace.dataset.view) selectTab(undefined, page);
+  });
+}
 if (api.chrome) {
   const titlebar = document.querySelector('.titlebar');
   const isChromeClick = (event) => event.button === 0 && !event.target.closest('button, a, input');
@@ -1351,7 +1382,20 @@ hostLayout.addEventListener('change', () => {
   workspace.dataset.hostLayout = hostLayout.value;
   try { localStorage.setItem('host-layout', hostLayout.value); } catch { /* Use the in-memory choice. */ }
 });
-$('toggle-hosts').addEventListener('click', () => { workspace.dataset.hosts = getComputedStyle($('hosts')).display === 'none' ? 'on' : 'off'; });
+const toggleNav = $('toggle-nav');
+function setNavigationCollapsed(collapsed) {
+  workspace.dataset.navCollapsed = String(collapsed);
+  toggleNav.setAttribute('aria-expanded', String(!collapsed));
+  toggleNav.title = collapsed ? '展开导航' : '收起导航';
+  toggleNav.setAttribute('aria-label', toggleNav.title);
+}
+try { setNavigationCollapsed(localStorage.getItem('nav-collapsed') === 'true'); } catch { /* The sidebar starts expanded. */ }
+toggleNav.addEventListener('click', () => {
+  const collapsed = workspace.dataset.navCollapsed !== 'true';
+  setNavigationCollapsed(collapsed);
+  try { localStorage.setItem('nav-collapsed', String(collapsed)); } catch { /* Use the in-memory choice. */ }
+});
+$('add-tab').addEventListener('click', () => openPalette('hosts').catch((error) => status(message(error))));
 $('palette-button').addEventListener('click', () => openPalette().catch((error) => status(message(error))));
 $('queue-button').addEventListener('click', () => setQueue($('queue').hidden));
 $('terminal-find').addEventListener('submit', (event) => { event.preventDefault(); const query = event.currentTarget.querySelector('input').value; if (query) active?.search.findNext(query); });
