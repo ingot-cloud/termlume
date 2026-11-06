@@ -1,0 +1,86 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export TERMLUME_TEST_FIXTURE
+TERMLUME_TEST_FIXTURE=$(mktemp -d /tmp/termlume-tests.XXXXXX)
+fixture=$TERMLUME_TEST_FIXTURE
+pids=()
+cleanup() {
+  if [ -n "${pids[0]:-}" ]; then
+    kill "${pids[@]}" 2>/dev/null || true
+    wait "${pids[@]}" 2>/dev/null || true
+  fi
+  rm -rf "$fixture"
+}
+trap cleanup EXIT
+mkdir "$fixture/remote" "$fixture/local"
+ssh-keygen -q -t ed25519 -N '' -f "$fixture/host"
+ssh-keygen -q -t ed25519 -N '' -f "$fixture/client"
+ssh-keygen -q -t rsa -b 2048 -N 'fixture key passphrase' -f "$fixture/client-rsa"
+cat "$fixture/client.pub" "$fixture/client-rsa.pub" > "$fixture/authorized_keys"
+port=$(node -e '
+const server = require("node:net").createServer();
+server.listen(0, "127.0.0.1", () => { console.log(server.address().port); server.close(); });
+')
+printf '%s\n' "$port" > "$fixture/openssh-port"
+printf '[127.0.0.1]:%s %s\n' "$port" "$(cut -d ' ' -f 1,2 "$fixture/host.pub")" > "$fixture/known_hosts"
+cat > "$fixture/sshd_config" <<CONFIG
+ListenAddress 127.0.0.1
+Port $port
+HostKey $fixture/host
+AuthorizedKeysFile $fixture/authorized_keys
+StrictModes no
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers $(id -un)
+PidFile $fixture/sshd.pid
+Subsystem sftp /usr/libexec/sftp-server
+CONFIG
+/usr/bin/git init --bare --quiet "$fixture/repo.git"
+printf 'Termlume 日志回归\nsecond line\n' > "$fixture/remote/sample log.txt"
+/usr/sbin/sshd -D -e -f "$fixture/sshd_config" > "$fixture/sshd.log" 2>&1 &
+pids+=("$!")
+export SSH_AUTH_SOCK="$fixture/agent.sock"
+/usr/bin/ssh-agent -D -a "$SSH_AUTH_SOCK" > "$fixture/agent.log" 2>&1 &
+pids+=("$!")
+node - "$fixture" <<'NODE' &
+const { appendFileSync, readFileSync, writeFileSync } = require('node:fs');
+const { join } = require('node:path');
+const { Server } = require('ssh2');
+const vault = require('./src/vault.cjs');
+const fixture = process.argv[2];
+(async () => {
+  const recovery = Buffer.alloc(32, 17).toString('base64url');
+  const { key, header } = await vault.createVault('fixture passphrase 测试', recovery);
+  const host = { id: '550e8400-e29b-41d4-a716-446655440000', name: '旧主机',
+    address: 'example.com', port: 22, auth: 'password', username: 'fixture' };
+  writeFileSync(join(fixture, 'legacy.json'), JSON.stringify(vault.encodeVault(key, header, 'local',
+    { hosts: [host], fingerprints: [], localPasswords: { [host.id]: 'Electron safeStorage fixture' } })));
+  key.fill(0);
+  const server = new Server({ hostKeys: [readFileSync(join(fixture, 'host'))] }, (client) => {
+    client.on('error', () => {});
+    client.on('authentication', (ctx) => {
+      if (ctx.method === 'password') appendFileSync(join(fixture, 'password-attempts'), 'attempt\n');
+      if (ctx.method === 'password' && ctx.username === 'pilot' && ctx.password === 'pilot-local-only') ctx.accept();
+      else ctx.reject(['password']);
+    });
+    client.on('ready', () => client.on('session', (accept) => {
+      const session = accept();
+      session.on('pty', (confirm) => confirm());
+      session.on('shell', (open) => open().write('test shell\r\n'));
+    }));
+  });
+  server.listen(0, '127.0.0.1', () => writeFileSync(join(fixture, 'password-server.json'), JSON.stringify(server.address())));
+})().catch((err) => { console.error(err); process.exit(1); });
+NODE
+pids+=("$!")
+for attempt in {1..100}; do
+  if [ -S "$SSH_AUTH_SOCK" ] && [ -s "$fixture/password-server.json" ] && /usr/bin/grep -q 'Server listening' "$fixture/sshd.log"; then break; fi
+  sleep 0.05
+done
+/usr/bin/ssh-add "$fixture/client"
+/usr/bin/ssh -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$fixture/known_hosts" -p "$port" "$(id -un)@127.0.0.1" true
+npm run tauri:assets
+cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib -- --include-ignored --test-threads=1

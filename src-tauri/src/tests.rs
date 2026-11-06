@@ -1,0 +1,434 @@
+use super::*;
+use tauri::ipc::InvokeResponseBody;
+use tokio::sync::mpsc;
+
+fn make_workspace(
+    home: &std::path::Path,
+    legacy: Option<PathBuf>,
+) -> (tempfile::TempDir, Workspace) {
+    let profile = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(profile.path().to_path_buf(), home.into(), legacy).unwrap();
+    (profile, ws)
+}
+fn events(ws: &Workspace) -> mpsc::UnboundedReceiver<Value> {
+    let (send, receive) = mpsc::unbounded_channel();
+    let weak = Arc::downgrade(&ws.0);
+    *ws.events.lock().unwrap() = Some(Channel::new(move |response| {
+        if let InvokeResponseBody::Json(payload) = response {
+            let event: Value = serde_json::from_str(&payload).unwrap();
+            if let Some(inner) = weak.upgrade() {
+                if let Ok(ack) = id(&event["ack"]) {
+                    if let Some(tx) = inner.acks.lock().unwrap().remove(&ack) {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _ = send.send(event);
+        }
+        Ok(())
+    }));
+    receive
+}
+async fn until(
+    rx: &mut mpsc::UnboundedReceiver<Value>,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = rx.recv().await.unwrap();
+            if predicate(&event) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for a workbench event")
+}
+async fn call(ws: &Workspace, name: &str, value: Value) -> Value {
+    dispatch(ws, name, value)
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+async fn connect_tab(
+    ws: &Workspace,
+    rx: &mut mpsc::UnboundedReceiver<Value>,
+    host: &Value,
+    secret: &str,
+    saved: bool,
+    remember: bool,
+) -> Uuid {
+    let tab = Uuid::new_v4();
+    call(ws,"ssh:connect",json!({"id":tab,"expected":host,"secret":secret,"useSaved":saved,"remember":remember,"dimensions":{"rows":24,"cols":80}})).await;
+    loop {
+        let e = until(rx, |e| {
+            e["id"] == tab.to_string() && matches!(e["type"].as_str(), Some("trust" | "session"))
+        })
+        .await;
+        if e["type"] == "trust" {
+            call(ws, "ssh:trust", json!({"id":tab,"accepted":true})).await;
+        } else {
+            assert_eq!(e["status"], "ready", "{e}");
+            return tab;
+        }
+    }
+}
+
+#[tokio::test]
+async fn vault_and_host_requests_round_trip() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let hosts = call(&ws,"hosts:save",json!({"address":" [::1] ","port":2222,"username":" root ","auth":"agent","group":"test","tags":["one","one"],"logPath":"/tmp/a'b"})).await;
+    assert_eq!(hosts[0]["address"], "::1");
+    assert_eq!(hosts[0]["tags"], json!(["one"]));
+    let recovery = call(&ws, "vault:recovery-code", Value::Null).await;
+    call(
+        &ws,
+        "vault:enable",
+        json!({"password":"workspace test password", "recovery":recovery}),
+    )
+    .await;
+    call(&ws, "vault:lock", Value::Null).await;
+    assert!(dispatch(&ws, "hosts:list", Value::Null).await.is_err());
+    assert!(dispatch(&ws, "vault:unlock", json!({"secret":"bad"}))
+        .await
+        .is_err());
+    call(
+        &ws,
+        "vault:unlock",
+        json!({"secret":recovery,"useRecovery":true}),
+    )
+    .await;
+    assert_eq!(call(&ws, "hosts:list", Value::Null).await, hosts);
+    assert!(
+        !std::fs::read_to_string(profile.path().join("workspace.json"))
+            .unwrap()
+            .contains("root")
+    );
+    assert_eq!(
+        call(
+            &ws,
+            "commands:preview",
+            json!({"action":"tail","argument":"/tmp/a'b","lines":4})
+        )
+        .await,
+        "tail -n 4 '/tmp/a'\\''b'"
+    );
+    let key = call(
+        &ws,
+        "keys:generate",
+        json!({"name":"fixture","passphrase":"test key passphrase"}),
+    )
+    .await;
+    assert!(key["publicKey"]
+        .as_str()
+        .unwrap()
+        .starts_with("ssh-ed25519 "));
+    let keys = call(&ws, "keys:scan", Value::Null).await;
+    assert_eq!(keys["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(keys["keys"][0]["encrypted"], true);
+    assert!(dispatch(
+        &ws,
+        "keys:generate",
+        json!({"name":"fixture","passphrase":""})
+    )
+    .await
+    .is_err());
+    let preview = keys::import_config("Host jump\n HostName server\n ProxyJump other\nHost plain\n HostName direct\n User admin\n IdentityFile ~/localkey\n",home.path());
+    assert_eq!(preview["rows"][0]["issue"], "需要跳板机或代理");
+    assert_eq!(preview["rows"][1]["auth"], "key");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires an isolated localhost OpenSSH fixture and agent"]
+async fn macos_transport_migration_and_sync() {
+    let fixture = PathBuf::from(std::env::var_os("TERMLUME_TEST_FIXTURE").unwrap());
+    let (_profile, ws) = make_workspace(&fixture, Some(fixture.join("legacy.json")));
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
+    call(
+        &ws,
+        "vault:unlock",
+        json!({"secret":"fixture passphrase 测试"}),
+    )
+    .await;
+    let old = call(&ws, "hosts:list", Value::Null).await;
+    assert_eq!(old[0]["name"], "旧主机");
+    assert_eq!(
+        call(&ws, "hosts:has-password", old[0]["id"].clone()).await,
+        false
+    );
+    let user = std::env::var("USER").unwrap();
+    let openssh_port = std::fs::read_to_string(fixture.join("openssh-port"))
+        .unwrap()
+        .trim()
+        .parse::<u16>()
+        .unwrap();
+    let add_host = |auth: &str, key_path: Option<PathBuf>, port: u16, user: &str| json!({"name":auth,"address":"127.0.0.1","port":port,"username":user,"auth":auth,"keyPath":key_path});
+    let agent = call(&ws, "keys:agent", Value::Null).await;
+    assert_eq!(agent["available"], true);
+    assert!(!agent["keys"].as_array().unwrap().is_empty());
+    let host1 = call(
+        &ws,
+        "hosts:save",
+        add_host("agent", None, openssh_port, &user),
+    )
+    .await[1]
+        .clone();
+    let host2 = call(
+        &ws,
+        "hosts:save",
+        add_host("key", Some(fixture.join("client-rsa")), openssh_port, &user),
+    )
+    .await[2]
+        .clone();
+    let mut rx = events(&ws);
+    let first = connect_tab(&ws, &mut rx, &host1, "", false, false).await;
+    let second = connect_tab(&ws, &mut rx, &host2, "fixture key passphrase", false, false).await;
+    call(
+        &ws,
+        "ssh:resize",
+        json!({"id":first,"size":{"rows":34,"cols":92}}),
+    )
+    .await;
+    call(
+        &ws,
+        "ssh:input",
+        json!({"id":first,"data":"printf 'TERMLUME_%s\\n' 'TERMINAL'; stty size\r"}),
+    )
+    .await;
+    let mut terminal = String::new();
+    loop {
+        let e = until(&mut rx, |e| {
+            e["type"] == "output" && e["id"] == first.to_string()
+        })
+        .await;
+        terminal.push_str(&String::from_utf8_lossy(
+            &STANDARD.decode(e["bytes"].as_str().unwrap()).unwrap(),
+        ));
+        if terminal.contains("TERMLUME_TERMINAL") && terminal.contains("34 92") {
+            break;
+        }
+    }
+    let command = Uuid::new_v4();
+    let remote_dir = fixture.join("remote");
+    let log = remote_dir.join("sample log.txt");
+    call(&ws,"commands:start",json!({"id":command,"sessionId":second,"request":{"action":"tail","argument":log,"lines":2}})).await;
+    let output = until(&mut rx, |e| {
+        e["type"] == "output" && e["id"] == command.to_string()
+    })
+    .await;
+    assert!(
+        String::from_utf8_lossy(&STANDARD.decode(output["bytes"].as_str().unwrap()).unwrap())
+            .contains("日志回归")
+    );
+    assert_eq!(
+        until(&mut rx, |e| e["type"] == "command"
+            && e["id"] == command.to_string()
+            && e["status"] != "running")
+        .await["status"],
+        "done"
+    );
+    let follow = Uuid::new_v4();
+    call(
+        &ws,
+        "commands:start",
+        json!({"id":follow,"sessionId":second,"request":{"action":"follow","argument":log}}),
+    )
+    .await;
+    until(&mut rx, |e| {
+        e["type"] == "output" && e["id"] == follow.to_string()
+    })
+    .await;
+    call(&ws, "commands:stop", json!(follow)).await;
+    assert_eq!(
+        until(&mut rx, |e| e["type"] == "command"
+            && e["id"] == follow.to_string()
+            && e["status"] != "running")
+        .await["status"],
+        "stopped"
+    );
+
+    let files = call(
+        &ws,
+        "files:list",
+        json!({"id":second,"directory":remote_dir}),
+    )
+    .await;
+    assert!(files["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["name"] == "sample log.txt"));
+    let folder = format!("mkdir-{}", Uuid::new_v4());
+    call(
+        &ws,
+        "files:mkdir",
+        json!({"id":second,"directory":remote_dir,"name":folder}),
+    )
+    .await;
+    assert!(remote_dir.join(&folder).is_dir());
+    let session = ws.connections.connected(second).unwrap();
+    let source = fixture
+        .join("local")
+        .join(format!("input-{}.bin", Uuid::new_v4()));
+    let data = vec![42; 1024 * 1024];
+    std::fs::write(&source, &data).unwrap();
+    let remote = remote_dir
+        .join(&folder)
+        .join("round trip.bin")
+        .to_string_lossy()
+        .into_owned();
+    let output = fixture
+        .join("local")
+        .join(format!("output-{}.bin", Uuid::new_v4()));
+    for (upload, local, policy) in [
+        (true, source.clone(), "skip"),
+        (true, source.clone(), "replace"),
+        (false, output.clone(), "skip"),
+        (false, output.clone(), "keep"),
+    ] {
+        let prepared = ws
+            .transfers
+            .stage(session.clone(), upload, vec![(remote.clone(), local)])
+            .await
+            .unwrap();
+        call(
+            &ws,
+            "files:enqueue",
+            json!({"ticket":prepared["ticket"],"policy":policy}),
+        )
+        .await;
+        let result = until(&mut rx, |e| {
+            e["type"] == "transfer"
+                && matches!(
+                    e["status"].as_str(),
+                    Some("done" | "skipped" | "failed" | "unverified")
+                )
+        })
+        .await;
+        assert_eq!(result["status"], "done", "{result}");
+        assert_eq!(result["bytes"], 1048576);
+    }
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    let password_fixture: Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("password-server.json")).unwrap())
+            .unwrap();
+    let port = password_fixture["port"].as_u64().unwrap() as u16;
+    let mut draft = add_host("password", None, port, "pilot");
+    draft["localPassword"] = json!("pilot-local-only");
+    let host3 = call(&ws, "hosts:save", draft).await[3].clone();
+    assert!(host3.get("localPassword").is_none());
+    assert_eq!(
+        call(&ws, "hosts:reveal-password", host3["id"].clone()).await,
+        "pilot-local-only"
+    );
+    assert!(!ws
+        .store
+        .lock()
+        .unwrap()
+        .data()
+        .unwrap()
+        .snapshot()
+        .iter()
+        .any(|row| row.password.is_some()));
+    let rejected = Uuid::new_v4();
+    call(
+        &ws,
+        "ssh:connect",
+        json!({"id":rejected, "expected":host3, "secret":"", "useSaved":true}),
+    )
+    .await;
+    until(&mut rx, |e| {
+        e["id"] == rejected.to_string() && e["type"] == "trust"
+    })
+    .await;
+    assert!(!fixture.join("password-attempts").exists());
+    call(&ws, "ssh:trust", json!({"id":rejected, "accepted":false})).await;
+    until(&mut rx, |e| {
+        e["id"] == rejected.to_string() && e["status"] == "closed"
+    })
+    .await;
+    assert!(!fixture.join("password-attempts").exists());
+    let offline_saved = connect_tab(&ws, &mut rx, &host3, "", true, false).await;
+    call(&ws, "ssh:close", json!(offline_saved)).await;
+    let mut renamed = host3.clone();
+    renamed["name"] = json!("密码主机");
+    call(&ws, "hosts:save", renamed.clone()).await;
+    assert_eq!(
+        call(&ws, "hosts:reveal-password", host3["id"].clone()).await,
+        "pilot-local-only"
+    );
+    let mut replace = renamed.clone();
+    replace["localPassword"] = json!("new-local-only");
+    call(&ws, "hosts:save", replace).await;
+    assert_eq!(
+        call(&ws, "hosts:reveal-password", host3["id"].clone()).await,
+        "new-local-only"
+    );
+    let mut retarget = renamed;
+    retarget["username"] = json!("other");
+    call(&ws, "hosts:save", retarget).await;
+    assert!(dispatch(&ws, "hosts:reveal-password", host3["id"].clone())
+        .await
+        .is_err());
+    call(&ws, "hosts:save", host3.clone()).await;
+    let password_tab = connect_tab(&ws, &mut rx, &host3, "pilot-local-only", false, true).await;
+    let save = until(&mut rx, |e| {
+        e["type"] == "password" && e["id"] == password_tab.to_string()
+    })
+    .await;
+    assert_eq!(save["failed"], false, "{save}");
+    let saved = connect_tab(&ws, &mut rx, &host3, "", true, false).await;
+    call(&ws, "ssh:close", json!(saved)).await;
+    call(&ws, "hosts:clear-password", host3["id"].clone()).await;
+    assert_eq!(
+        call(&ws, "hosts:has-password", host3["id"].clone()).await,
+        false
+    );
+
+    let remote = format!(
+        "ssh://{user}@127.0.0.1:{openssh_port}{}/repo.git",
+        fixture.display()
+    );
+    let synced = call(&ws, "vault:sync", json!({"address":remote})).await;
+    assert_eq!(synced["state"]["remote"], remote);
+    let (_other, other) = make_workspace(&fixture, None);
+    call(
+        &other,
+        "vault:restore-git",
+        json!({"address":remote,"secret":"fixture passphrase 测试"}),
+    )
+    .await;
+    let on_other = call(&other, "hosts:list", Value::Null).await;
+    assert_eq!(on_other.as_array().unwrap().len(), 4);
+    let mut ours = host1.clone();
+    ours["note"] = json!("本机修改");
+    call(&ws, "hosts:save", ours).await;
+    let mut theirs = on_other
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == host1["id"])
+        .unwrap()
+        .clone();
+    theirs["note"] = json!("仓库修改");
+    call(&other, "hosts:save", theirs).await;
+    call(&other, "vault:sync", json!({"address":remote})).await;
+    let conflict = call(&ws, "vault:sync", json!({"address":remote})).await;
+    assert_eq!(conflict["conflicts"][0]["id"], host1["id"]);
+    let mut choices = serde_json::Map::new();
+    choices.insert(host1["id"].as_str().unwrap().to_string(), json!("remote"));
+    call(
+        &ws,
+        "vault:sync",
+        json!({"address":remote,"ticket":conflict["ticket"],"choices":choices}),
+    )
+    .await;
+    let resolved = call(&ws, "hosts:list", Value::Null).await;
+    assert!(resolved
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|h| h["id"] == host1["id"] && h["note"] == "仓库修改"));
+    ws.connections.close_all();
+}

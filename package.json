@@ -1,0 +1,28 @@
+{
+  "name": "termlume",
+  "productName": "Termlume",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Termlume macOS SSH workspace",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "tauri dev",
+    "electron:dev": "electron .",
+    "test": "node --test",
+    "tauri:assets": "node scripts/tauri-assets.cjs",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:test:macos": "bash scripts/test-macos.sh"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-search": "0.16.0",
+    "@xterm/xterm": "6.0.0",
+    "libsodium-wrappers-sumo": "0.8.4",
+    "ssh2": "1.17.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4",
+    "electron": "45.2.3"
+  }
+}

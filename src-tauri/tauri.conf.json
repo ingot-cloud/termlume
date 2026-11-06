@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Termlume",
+  "version": "0.1.0",
+  "identifier": "app.termlume.desktop",
+  "build": {
+    "beforeDevCommand": "npm run tauri:assets",
+    "beforeBuildCommand": "npm run tauri:assets",
+    "frontendDist": "../dist/tauri-ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Termlume",
+        "width": 1140,
+        "height": 740,
+        "minWidth": 550,
+        "minHeight": 490,
+        "create": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'none'; script-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

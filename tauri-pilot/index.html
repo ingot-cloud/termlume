@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <title>Termlume · Tauri 验证版</title>
+  <link rel="stylesheet" href="./xterm.css">
+  <link rel="stylesheet" href="./pilot.css">
+  <script defer src="./xterm.js"></script>
+  <script defer src="./addon-fit.js"></script>
+  <script defer src="./pilot.js"></script>
+</head>
+<body>
+  <header>
+    <strong>Termlume</strong><span>Tauri 验证版</span>
+    <output id="connection-status" aria-live="polite">未连接</output>
+    <button id="disconnect" type="button" disabled>断开</button>
+  </header>
+  <main>
+    <details id="connection" open>
+      <summary>SSH 连接</summary>
+      <form id="connection-form" autocomplete="off">
+        <label>主机<input id="host" required maxlength="255" placeholder="example.com" autocapitalize="none" spellcheck="false"></label>
+        <label>端口<input id="port" type="number" min="1" max="65535" value="22" required></label>
+        <label>用户名<input id="user" required maxlength="255" autocapitalize="none" spellcheck="false"></label>
+        <label>密码<input id="password" type="password" maxlength="4096" required></label>
+        <label class="fingerprint">服务器主机指纹<input id="fingerprint" required pattern="SHA256:[A-Za-z0-9+/]{43}" placeholder="SHA256:…" autocapitalize="none" spellcheck="false"></label>
+        <button type="submit" id="connect">连接</button>
+        <small>从可信渠道取得 SHA256 指纹后再连接。</small>
+      </form>
+    </details>
+    <section class="terminal" aria-label="SSH 终端">
+      <div id="terminal"></div>
+      <div id="terminal-keys" aria-label="终端快捷键">
+        <button type="button" data-key="escape">Esc</button>
+        <button type="button" data-key="tab">Tab</button>
+        <button type="button" data-key="interrupt">Ctrl+C</button>
+        <button type="button" data-key="up">↑</button>
+        <button type="button" data-key="down">↓</button>
+        <button type="button" data-key="left">←</button>
+        <button type="button" data-key="right">→</button>
+      </div>
+    </section>
+    <div id="desktop-tools" hidden>
+      <details>
+        <summary>文件传输</summary>
+        <form id="transfer-form">
+          <label>远端文件路径<input id="remote" placeholder="/tmp/file.txt" required maxlength="4096" autocapitalize="none" spellcheck="false"></label>
+          <button type="submit" value="upload">上传</button>
+          <button type="submit" value="download">下载</button>
+          <output id="transfer-result" aria-live="polite"></output>
+        </form>
+      </details>
+      <details>
+        <summary>旧保险库</summary>
+        <form id="vault-form" autocomplete="off">
+          <label>主密码或恢复密钥<input id="vault-secret" type="password" required maxlength="1024"></label>
+          <label class="check"><input type="checkbox" id="recovery"> 使用恢复密钥</label>
+          <button id="verify-vault" type="submit">选择加密备份并验证</button>
+          <output id="vault-result" aria-live="polite"></output>
+        </form>
+      </details>
+    </div>
+  </main>
+</body>
+</html>

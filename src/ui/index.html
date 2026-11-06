@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Termlume</title>
+  <link rel="stylesheet" href="/xterm.css">
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/xterm.js"></script>
+  <script defer src="/fit.js"></script>
+  <script defer src="/search.js"></script>
+  <script defer src="/dropdown.js"></script>
+  <script defer src="/renderer.js"></script>
+</head>
+<body>
+  <header class="titlebar">
+    <span class="brand"><span class="mark" aria-hidden="true">›_</span> Termlume</span>
+    <div class="titlebar-tools">
+      <button id="palette-button" class="launcher"><span class="search-mark" aria-hidden="true"></span>查找主机或命令 <kbd>⌘ K</kbd></button>
+      <nav class="titlebar-nav" aria-label="工作台工具">
+        <button id="keys-button" aria-controls="keys-page" aria-pressed="false">SSH 密钥</button>
+        <button id="vault-button" aria-controls="vault-page" aria-pressed="false">保险库</button>
+      </nav>
+    </div>
+  </header>
+  <div id="workspace" data-view="hosts" data-host-layout="cards">
+    <div class="tabbar">
+      <button id="toggle-hosts" aria-label="切换主机栏" title="切换主机栏" hidden>☰</button>
+      <nav id="tabs" aria-label="工作台标签"></nav>
+    </div>
+    <div id="workspace-body">
+    <aside id="hosts" aria-label="主机列表">
+      <header class="section-head">
+        <div><h1>主机</h1><p class="host-total"><span id="host-count">0</span> 台已保存</p></div>
+        <div class="host-header-actions"><button id="import-hosts">导入 OpenSSH…</button><button id="add-host" class="primary">＋ 新建主机</button></div>
+      </header>
+      <div class="host-filters">
+        <input id="host-search" type="search" placeholder="搜索主机或分组" aria-label="搜索主机和分组">
+        <select id="tag-filter" aria-label="筛选标签"></select>
+        <button id="remove-group" hidden>移除分组</button>
+        <select id="host-layout" aria-label="主机视图">
+          <option value="cards" data-icon="▦">卡片</option><option value="rows" data-icon="☷">列表</option>
+        </select>
+      </div>
+      <nav id="host-breadcrumb" aria-label="主机分组路径" hidden>
+        <button id="all-hosts">全部主机</button><span aria-hidden="true">›</span><span id="current-group" aria-current="location"></span>
+      </nav>
+      <div id="host-list"></div>
+    </aside>
+    <main id="work">
+      <header id="toolbar" hidden>
+        <div id="context"></div>
+        <div id="session-actions"></div>
+      </header>
+      <div id="content">
+        <section id="terminal-stage" aria-label="终端工作区">
+          <div id="terminal-views"></div>
+          <div id="session-notice" hidden></div>
+          <form id="terminal-find" hidden>
+            <input type="search" aria-label="查找终端输出" placeholder="查找终端输出">
+            <button type="submit" aria-label="下一个结果">↓</button>
+            <button type="button" id="close-find" aria-label="关闭查找">×</button>
+          </form>
+        </section>
+        <aside id="files" aria-label="远端文件" hidden></aside>
+      </div>
+    </main>
+    <section id="keys-page" class="settings-page" aria-label="SSH 密钥" hidden></section>
+    <section id="vault-page" class="settings-page" aria-label="保险库" hidden></section>
+    </div>
+  </div>
+  <section id="queue" aria-label="传输任务" hidden></section>
+  <footer class="footer">
+    <span id="status" role="status" aria-live="polite">就绪</span>
+    <button id="queue-button" aria-expanded="false">⇄ 传输</button>
+  </footer>
+  <dialog id="dialog" aria-labelledby="dialog-title"></dialog>
+  <dialog id="key-dialog" aria-labelledby="key-dialog-title"></dialog>
+  <section id="vault-lock" hidden>
+    <form id="unlock-form">
+      <span class="settings-icon" aria-hidden="true">◇</span>
+      <h1>保险库已锁定</h1>
+      <p class="muted">使用主密码或恢复密钥重新访问工作台。</p>
+      <label>解锁方式<select id="unlock-mode" aria-label="解锁方式"><option value="password">主密码</option><option value="recovery">恢复密钥</option></select></label>
+      <label>解锁凭据<input id="unlock-secret" type="password" required autocomplete="off"></label>
+      <p id="unlock-error" class="danger" role="alert"></p>
+      <button type="submit" class="primary">解锁</button>
+    </form>
+  </section>
+</body>
+</html>
