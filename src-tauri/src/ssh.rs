@@ -726,6 +726,42 @@ pub fn remote_path(value: &str) -> Result<String, String> {
     }
     Ok(format!("/{}", parts.join("/")))
 }
+pub async fn terminal_directory(session: &Session) -> Option<String> {
+    let script = include_str!("../../src/terminal-directory.sh").replace('\'', "'\\''");
+    let command = format!("sh -c '{script}'");
+    let client = session.client.get()?;
+    let mut channel = tokio::time::timeout(Duration::from_secs(3), client.channel_open_session())
+        .await
+        .ok()?
+        .ok()?;
+    let read = async {
+        channel.exec(true, command.into_bytes()).await.ok()?;
+        let mut output = Vec::new();
+        let mut exit = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } if output.len() + data.len() <= 4097 => {
+                    output.extend_from_slice(&data);
+                }
+                ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                ChannelMsg::Data { .. } | ChannelMsg::Failure => return None,
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        if exit != Some(0) {
+            return None;
+        }
+        remote_path(std::str::from_utf8(output.strip_suffix(&[0])?).ok()?).ok()
+    };
+    let directory = tokio::select! {
+        _ = session.cancel.cancelled() => None,
+        result = tokio::time::timeout(Duration::from_secs(3), read) => result.ok().flatten(),
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(500), channel.close()).await;
+    directory
+}
+
 pub fn file_name(name: &str) -> Result<&str, String> {
     if name.is_empty()
         || matches!(name, "." | "..")

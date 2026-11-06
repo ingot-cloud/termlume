@@ -233,6 +233,7 @@ const resources = new Map([
   ['/style.css', [path.join(rendererDir, 'style.css'), 'text/css']],
   ['/renderer.js', [path.join(rendererDir, 'renderer.js'), 'text/javascript']],
   ['/dropdown.js', [path.join(rendererDir, 'dropdown.js'), 'text/javascript']],
+  ['/terminal-paths.js', [path.join(rendererDir, 'terminal-paths.js'), 'text/javascript']],
   ['/xterm.js', [path.join(dependencies, 'xterm/lib/xterm.js'), 'text/javascript']],
   ['/xterm.css', [path.join(dependencies, 'xterm/css/xterm.css'), 'text/css']],
   ['/fit.js', [path.join(dependencies, 'addon-fit/lib/addon-fit.js'), 'text/javascript']],
@@ -243,7 +244,10 @@ let window;
 let store;
 let ssh;
 let transfers;
+const historyLimit = 200;
+let pendingTransferHistory = [];
 const tickets = new Map();
+let droppedFiles;
 const defaultKeyDirectory = path.join(os.homedir(), '.ssh');
 const keyDirectories = new Set([defaultKeyDirectory]);
 const idleDuration = 15 * 60_000;
@@ -253,6 +257,28 @@ let pendingConflict;
 const emit = (event) => {
   if (window && !window.isDestroyed()) window.webContents.send('workspace:event', event);
 };
+
+function transferHistory(edit = (records) => records) {
+  const stored = store.data.transferHistory || [];
+  const records = edit([...stored, ...pendingTransferHistory]).slice(-historyLimit);
+  if (records.length !== stored.length || records.some((item, index) => item !== stored[index])) {
+    store.update({ ...store.data, transferHistory: records });
+  }
+  pendingTransferHistory = [];
+  return records;
+}
+
+function publishTransfer(event) {
+  if (!['queued', 'running', 'committing'].includes(event.status)) {
+    event.finishedAt = Date.now();
+    pendingTransferHistory.push(event);
+    if (pendingTransferHistory.length > historyLimit) pendingTransferHistory.shift();
+    if (store.data) {
+      try { transferHistory(); } catch { /* Retry on the next history read. */ }
+    }
+  }
+  emit(event);
+}
 
 function createWindow() {
   window = new BrowserWindow({
@@ -268,6 +294,7 @@ function createWindow() {
     for (const id of ssh.sessions.keys()) transfers.cancelSession(id);
     ssh.dispose();
     tickets.clear();
+    droppedFiles = undefined;
   });
   void window.loadURL(pageURL);
 }
@@ -305,6 +332,7 @@ function lockVault() {
   if (!store.key) return vaultState();
   syncTask?.abort();
   pendingConflict = undefined;
+  droppedFiles = undefined;
   store.lock();
   for (const [id, session] of ssh.sessions) {
     if (session.channel) continue;
@@ -566,6 +594,7 @@ function registerHandlers() {
   listen('ssh:input', ({ id, data }) => ssh.input(id, data));
   listen('ssh:resize', ({ id, size }) => ssh.resize(id, size));
   listen('ssh:ack', (id) => ssh.acknowledge(id));
+  handle('ssh:directory', (id) => ssh.directory(id));
 
   handle('commands:preview', commandFor);
   handle('commands:start', ({ id, sessionId, request }) => ssh.command(checkId(id), sessionId, request));
@@ -573,21 +602,50 @@ function registerHandlers() {
   handle('commands:close', (id) => ssh.closeCommand(id));
 
   handle('files:list', ({ id, directory }) => ssh.list(id, directory));
+  handle('files:inspect', ({ id, path }) => ssh.inspect(id, path));
   handle('files:mkdir', ({ id, directory, name }) => ssh.mkdir(id, directory, name));
-  handle('files:prepare', async ({ id, direction, directory, names }) => {
+  handle('files:create-file', ({ id, directory, name }) => ssh.createFile(id, directory, name));
+  handle('files:history', () => transferHistory());
+  handle('files:remove-history', (value) => {
+    const id = value === null ? null : checkId(value);
+    const removed = [];
+    transferHistory((records) => records.filter((record) => {
+      if (record.direction !== 'down' || (id !== null && id !== record.id)) return true;
+      removed.push(record.id);
+      return false;
+    }));
+    return removed;
+  });
+  listen('files:capture-drop', ({ ticket, paths }) => {
+    if (Array.isArray(paths) && paths.length > 0 && paths.length <= 100 &&
+        paths.every((entry) => typeof entry === 'string' && path.isAbsolute(entry))) {
+      droppedFiles = { ticket, paths, expires: Date.now() + 5 * 60_000 };
+    }
+  });
+  handle('files:prepare', async ({ id, direction, directory, names, dropTicket }) => {
     const session = ssh.connected(id);
     if (direction !== 'up' && (direction !== 'down' || !Array.isArray(names) || names.length < 1 || names.length > 100)) {
       throw new Error('每次可选择 1 至 100 个普通文件。');
     }
     const upload = direction === 'up';
-    const selected = await dialog.showOpenDialog(window, {
-      title: upload ? '选择要上传的文件' : '选择下载目录',
-      properties: upload ? ['openFile', 'multiSelections'] : ['openDirectory', 'createDirectory']
-    });
-    if (selected.canceled) return null;
+    let paths;
+    if (dropTicket) {
+      if (!upload || droppedFiles?.ticket !== dropTicket || droppedFiles.expires < Date.now()) {
+        throw new Error('拖入的文件已失效，请重新拖入。');
+      }
+      paths = droppedFiles.paths;
+      droppedFiles = undefined;
+    } else {
+      const selected = await dialog.showOpenDialog(window, {
+        title: upload ? '选择要上传的文件' : '选择下载目录',
+        properties: upload ? ['openFile', 'multiSelections'] : ['openDirectory', 'createDirectory']
+      });
+      if (selected.canceled) return null;
+      paths = selected.filePaths;
+    }
     if (ssh.connected(id) !== session) throw new Error('SSH 会话已变化，请重新选择文件。');
-    if (selected.filePaths.length > 100) throw new Error('每次可选择最多 100 个普通文件。');
-    const files = await transfers.prepare(id, direction, directory, upload ? selected.filePaths : names, selected.filePaths[0]);
+    if (paths.length > 100) throw new Error('每次可选择最多 100 个普通文件。');
+    const files = await transfers.prepare(id, direction, directory, upload ? paths : names, paths[0]);
     const ticket = randomUUID();
     for (const [key, pending] of tickets) if (pending.expires < Date.now()) tickets.delete(key);
     tickets.set(ticket, { files, expires: Date.now() + 5 * 60_000 });
@@ -615,7 +673,7 @@ async function launch() {
   });
   store = new HostStore(app.getPath('userData'));
   ssh = new WorkspaceSSH(store, emit);
-  transfers = new Transfers(ssh, emit);
+  transfers = new Transfers(ssh, publishTransfer);
   registerHandlers();
   setInterval(() => { if (store.key && Date.now() - lastActivity >= idleDuration) lockVault(); }, 5_000).unref();
   createWindow();

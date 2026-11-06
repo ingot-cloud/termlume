@@ -4699,6 +4699,7 @@ dependencies = [
  "rfd",
  "russh",
  "russh-sftp",
+ "rustix",
  "security-framework",
  "serde",
  "serde_json",

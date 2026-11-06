@@ -35,15 +35,23 @@
           if (inputs.get(value.id) === queue) return request('ssh:input', value);
         }).catch(() => {});
       },
-      resize: notify('ssh:resize'), ack: notify('ssh:ack')
+      resize: notify('ssh:resize'), ack: notify('ssh:ack'), directory: (id) => request('ssh:directory', id)
     },
     commands: bind({ preview: 'commands:preview', start: 'commands:start', stop: 'commands:stop', close: 'commands:close' }),
-    files: bind({ list: 'files:list', mkdir: 'files:mkdir', prepare: 'files:prepare', enqueue: 'files:enqueue', discard: 'files:discard', cancel: 'files:cancel', retry: 'files:retry' }),
+    files: {
+      ...bind({ list: 'files:list', inspect: 'files:inspect', mkdir: 'files:mkdir', createFile: 'files:create-file', history: 'files:history', removeHistory: 'files:remove-history', prepare: 'files:prepare', enqueue: 'files:enqueue', discard: 'files:discard', cancel: 'files:cancel', retry: 'files:retry' }),
+      directoryDownloads: /Mac|Linux/.test(navigator.platform)
+    },
     onEvent(listener) {
       const events = new Channel();
       events.onmessage = (event) => {
         if (event.type === 'output') event.bytes = Uint8Array.from(atob(event.bytes), (byte) => byte.charCodeAt(0));
         if (event.type === 'session' && event.status === 'closed') inputs.delete(event.id);
+        if (event.type === 'file-drag' && event.position) {
+          // Wry supplies AppKit points on macOS, even though Tauri labels the payload physical.
+          const scale = navigator.platform.startsWith('Mac') ? 1 : devicePixelRatio;
+          event.position = { x: event.position.x / scale, y: event.position.y / scale };
+        }
         listener(event);
       };
       return invoke('workspace_subscribe', { events });

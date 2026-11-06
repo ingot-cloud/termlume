@@ -7,6 +7,7 @@ const assets = {
   'style.css': 'src/ui/style.css',
   'renderer.js': 'src/ui/renderer.js',
   'dropdown.js': 'src/ui/dropdown.js',
+  'terminal-paths.js': 'src/ui/terminal-paths.js',
   'bridge.js': 'src/ui/tauri-bridge.js',
   'xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js',
   'xterm.css': 'node_modules/@xterm/xterm/css/xterm.css',

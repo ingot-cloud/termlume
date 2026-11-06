@@ -12,6 +12,7 @@
     "tauri:assets": "node scripts/tauri-assets.cjs",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
+    "tauri:build:signed": "node scripts/macos-signed.cjs",
     "tauri:test:macos": "bash scripts/test-macos.sh"
   },
   "dependencies": {

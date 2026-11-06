@@ -109,6 +109,8 @@ impl Workspace {
             return store.status();
         }
         if store.lock() {
+            #[cfg(desktop)]
+            self.transfers.clear_drop();
             if let Some(task) = self.sync_cancel.lock().unwrap().as_ref() {
                 task.cancel();
             }
@@ -363,15 +365,41 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         "commands:stop" | "commands:close" => ws
             .connections
             .stop_command(id(&value)?, name == "commands:close"),
+        "ssh:directory" => {
+            let session = ws.connections.connected(id(&value)?)?;
+            return Ok(json!(ssh::terminal_directory(&session).await));
+        }
         #[cfg(desktop)]
         "files:list" => {
             let session = ws.connections.connected(id(&value["id"])?)?;
             return transfer::list(&session, value["directory"].as_str().unwrap_or("")).await;
         }
         #[cfg(desktop)]
+        "files:inspect" => {
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            return transfer::inspect_path(&session, string(&value["path"])?).await;
+        }
+        #[cfg(desktop)]
         "files:mkdir" => {
             let session = ws.connections.connected(id(&value["id"])?)?;
             transfer::mkdir(
+                &session,
+                string(&value["directory"])?,
+                string(&value["name"])?,
+            )
+            .await?;
+        }
+        #[cfg(desktop)]
+        "files:history" => return Ok(json!(ws.transfers.history(ws)?)),
+        #[cfg(desktop)]
+        "files:remove-history" => {
+            let id = (!value.is_null()).then(|| id(&value)).transpose()?;
+            return Ok(json!(ws.transfers.remove_history(ws, id)?));
+        }
+        #[cfg(desktop)]
+        "files:create-file" => {
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            transfer::create_file(
                 &session,
                 string(&value["directory"])?,
                 string(&value["name"])?,
@@ -662,6 +690,7 @@ async fn restore(ws: &Workspace, value: Value, from_git: bool) -> Result<Value, 
     if store.revision != revision {
         return Err("工作区已变化，请重试恢复。".into());
     }
+    data.transfer_history = store.data()?.transfer_history.clone();
     store.install(key, &header, data)?;
     *ws.last_activity.lock().unwrap() = Instant::now();
     Ok(store.status())
@@ -686,10 +715,11 @@ pub fn run() {
             let workspace =
                 Workspace::new(directory, home, legacy).map_err(std::io::Error::other)?;
             app.manage(workspace.clone());
+            let idle_workspace = workspace.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(5)).await;
-                    workspace.lock(true);
+                    idle_workspace.lock(true);
                 }
             });
             let mut window =
@@ -706,7 +736,36 @@ pub fn run() {
                     .traffic_light_position(tauri::LogicalPosition::new(14.0, 24.0))
                     .hidden_title(true);
             }
+            #[cfg(not(desktop))]
             window.build()?;
+            #[cfg(desktop)]
+            let window = window.build()?;
+            #[cfg(desktop)]
+            window.on_window_event(move |event| {
+                use tauri::{DragDropEvent, WindowEvent};
+                let WindowEvent::DragDrop(event) = event else {
+                    return;
+                };
+                let drag = match event {
+                    DragDropEvent::Enter { position, paths } if !paths.is_empty() => {
+                        json!({"type":"file-drag","phase":"enter","position":position,"count":paths.len()})
+                    }
+                    DragDropEvent::Over { position } => {
+                        json!({"type":"file-drag","phase":"over","position":position})
+                    }
+                    DragDropEvent::Drop { paths, position } if !paths.is_empty() => {
+                        let store = workspace.store.lock().unwrap();
+                        if store.data().is_err() {
+                            return;
+                        }
+                        let ticket = (paths.len() <= 100)
+                            .then(|| workspace.transfers.capture_drop(paths.clone()));
+                        json!({"type":"file-drag","phase":"drop","position":position,"count":paths.len(),"ticket":ticket})
+                    }
+                    _ => json!({"type":"file-drag","phase":"leave"}),
+                };
+                workspace.emit(drag);
+            });
             Ok(())
         })
         .on_window_event(|window, event| {

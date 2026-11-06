@@ -187,6 +187,8 @@ pub struct Data {
     pub recent: BTreeMap<Uuid, u64>,
     pub local_passwords: BTreeMap<Uuid, LocalPassword>,
     pub portable_passwords: BTreeMap<Uuid, Password>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub transfer_history: Vec<Value>,
     pub sync: Option<Binding>,
 }
 impl Data {
@@ -323,9 +325,12 @@ impl Store {
     }
     pub fn status(&self) -> Value {
         let sync = self.data.as_ref().and_then(|data| data.sync.as_ref());
-        json!({"enabled": self.envelope.is_some(), "locked": self.data.is_none(), "remote": sync.map(|s| s.remote.as_str()).unwrap_or(""), "lastSynced": sync.and_then(|s| s.last_synced)})
+        json!({"enabled": self.envelope.is_some(), "locked": self.data.is_none(), "remote": sync.map(|s| s.remote.as_str()).unwrap_or(""), "lastSynced": sync.and_then(|s| s.last_synced), "fileTransfers": cfg!(desktop)})
     }
     fn write(&self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.len() as u64 > MAX_DOCUMENT {
+            return Err("工作区文件超过大小上限。".into());
+        }
         let mut tmp =
             tempfile::NamedTempFile::new_in(self.file.parent().ok_or("工作区路径无效。")?)
                 .map_err(error)?;

@@ -1,6 +1,7 @@
 'use strict';
 
 const api = window.termlume;
+const terminalPaths = window.terminalPaths;
 const { selectControl, editableControl, close: closeDropdown } = window.dropdowns;
 const $ = (id) => document.getElementById(id);
 const workspace = $('workspace');
@@ -9,10 +10,18 @@ const pageButtons = $('workspace-nav').querySelectorAll('[data-page]');
 const tabs = new Map();
 const jobs = new Map();
 const jobRows = new Map();
+const removedJobs = new Set();
+const transferFilters = $('transfer-filters').querySelectorAll('button');
+const transferHistoryLimit = 200;
 const recent = new Map();
 const actionLabels = { tail: '查看日志末尾', follow: '跟踪日志', journal: '查看服务日志', disk: '查看磁盘' };
 const authLabels = { password: '密码', key: '私钥', agent: 'Agent' };
 const jobLabels = { queued: '等待', running: '传输中', committing: '提交中', done: '完成', canceled: '已取消', skipped: '已跳过', failed: '失败', unverified: '待确认' };
+const terminalFontSize = 14;
+const searchOptions = { decorations: {
+  matchBackground: '#544622', matchBorder: '#b49352', matchOverviewRuler: '#b49352',
+  activeMatchBackground: '#795120', activeMatchBorder: '#ffd68d', activeMatchColorOverviewRuler: '#ffd68d'
+} };
 let hosts = [];
 let hostsLoaded = false;
 let currentGroup = '';
@@ -20,6 +29,11 @@ let selectedGroup = '';
 let active;
 let filesOpen = false;
 let vaultStatus = {};
+let draggedFileCount = 0;
+let transferDirection = '';
+let loadingHistory;
+let historyReady = false;
+let editingHistory = false;
 
 function node(tag, className, ...children) {
   const element = document.createElement(tag);
@@ -57,24 +71,29 @@ function input(value = '', type = 'text') {
 }
 
 function field(label, element) { return node('label', '', label, element); }
-function settingsIcon(kind) {
-  const icon = node('span', 'settings-icon');
-  icon.setAttribute('aria-hidden', 'true');
+function chromeIcon(kind) {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'chrome-icon');
+  svg.setAttribute('aria-hidden', 'true');
   svg.setAttribute('viewBox', '0 0 24 24');
   const path = document.createElementNS(svg.namespaceURI, 'path');
   path.setAttribute('d', {
     key: 'M15.5 13.5a5 5 0 1 0-5-5 5 5 0 0 0 .5 2.2L4 17.7V21h3.3l1.5-1.5V17h2.5l2.5-2.5m3.6-7.2h.01',
     lock: 'M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3',
     file: 'M6 3h8l4 4v14H6zM14 3v5h4m-9 5h6m-6 4h6',
+    folder: 'M3 6h7l2 2h9v11H3z',
+    'new-tab': 'M4 4h16v16H4zM12 8v8m-4-4h8',
+    terminal: 'M3 5h18v14H3zM7 9l3 3-3 3m6 0h4',
     sync: 'M20 10a8 8 0 0 0-14-4L4 8m0-4v4h4m-4 6a8 8 0 0 0 14 4l2-2m0 4v-4h-4'
   }[kind]);
   svg.append(path);
-  icon.append(svg);
-  return icon;
+  return svg;
 }
+function settingsIcon(kind) { return node('span', 'settings-icon', chromeIcon(kind)); }
 function endpoint(host) { return `${host.username}@${host.address}${host.port === 22 ? '' : `:${host.port}`}`; }
-function origin(tab = active) { return tab?.kind === 'command' ? tabs.get(tab.sessionId) : tab; }
+function origin(tab = active) {
+  return tab?.kind === 'command' ? tabs.get(tab.sessionId) : tab?.kind === 'shell' ? tab : undefined;
+}
 function address(path) { return path === '/' ? '' : path.replace(/\/$/, ''); }
 function pathOf(tab, name) { return `${address(tab.files.directory)}/${name}`; }
 
@@ -137,22 +156,28 @@ async function refreshHosts() {
   hostsLoaded = true;
   for (const [id, time] of Object.entries(timestamps)) recent.set(id, time);
   renderHosts();
+  if (active?.kind === 'new') renderQuickConnect(active);
 }
 
 function applyVaultState(state) {
   vaultStatus = state;
+  const transfersSupported = state.fileTransfers !== false;
+  document.querySelector('[data-page="transfers"]').hidden = $('queue-button').hidden = !transfersSupported;
   document.body.classList.toggle('vault-locked', state.locked);
   $('vault-lock').hidden = !state.locked;
   if (state.locked) {
+    historyReady = false;
+    $('terminal-drop').hidden = true;
     closeDropdown();
-    for (const pane of [$('key-dialog'), dialog]) if (pane.open) pane.close();
+    for (const pane of [$('key-dialog'), $('session-switcher'), dialog]) if (pane.open) pane.close();
     $('keys-page').replaceChildren();
     hosts = [];
     hostsLoaded = false;
     renderHosts();
+    $('quick-connect-results').replaceChildren();
     $('unlock-error').textContent = '';
     $('unlock-secret').focus();
-  }
+  } else if (transfersSupported && !historyReady) void loadTransferHistory();
   if (workspace.dataset.view === 'vault') renderVaultPage();
 }
 
@@ -529,7 +554,7 @@ function passwordEditor(host, auth, hasPassword, sameTarget) {
   return { pane, password, hide, update };
 }
 
-async function editHost(host) {
+async function editHost(host, draftTab) {
   const hasPassword = host?.auth === 'password' && await api.hosts.hasPassword(host.id);
   const name = input(host?.name);
   const addressField = input(host?.address);
@@ -651,7 +676,8 @@ async function editHost(host) {
   if (result) {
     hosts = result.hosts;
     renderHosts();
-    if (result.connect) await openHost(hosts.at(-1));
+    if (active?.kind === 'new') renderQuickConnect(active);
+    if (result.connect) await openHost(hosts.at(-1), { draftTab });
     return;
   }
   const choice = dialog.returnValue;
@@ -718,6 +744,14 @@ function hostSection(title, entries) {
   return node('section', 'host-section', node('h2', 'host-group', title), node('div', 'host-entries', ...entries));
 }
 
+function hostMatches(host, query) {
+  return `${host.name} ${endpoint(host)} ${host.group || ''} ${(host.tags || []).join(' ')} ${host.note || ''}`.toLowerCase().includes(query);
+}
+
+function recentFirst(a, b) {
+  return (recent.get(b.id) || 0) - (recent.get(a.id) || 0) || a.name.localeCompare(b.name, 'zh-CN');
+}
+
 function renderHosts() {
   const groups = new Map();
   for (const host of hosts) {
@@ -744,10 +778,9 @@ function renderHosts() {
   const tag = tagControl.value;
   const query = $('host-search').value.trim().toLowerCase();
   const searching = Boolean(query || tag);
-  const matching = scope.filter((host) => (!tag || host.tags?.includes(tag))
-    && `${host.name} ${endpoint(host)} ${host.group} ${(host.tags || []).join(' ')} ${host.note || ''}`.toLowerCase().includes(query));
+  const matching = scope.filter((host) => (!tag || host.tags?.includes(tag)) && hostMatches(host, query));
   const visibleHosts = currentGroup || searching ? matching : matching.filter((host) => !host.group);
-  visibleHosts.sort((a, b) => (recent.get(b.id) || 0) - (recent.get(a.id) || 0) || a.name.localeCompare(b.name, 'zh-CN'));
+  visibleHosts.sort(recentFirst);
   const matchingGroups = new Set(matching.map((host) => host.group));
   const visibleGroups = currentGroup ? [] : [...groups]
     .filter(([group]) => !searching || matchingGroups.has(group))
@@ -798,18 +831,40 @@ function attachTerminal(tab) {
   view.hidden = true;
   $('terminal-views').append(view);
   const terminal = new Terminal({
-    fontFamily: 'SFMono-Regular, Menlo, monospace', fontSize: 13, scrollback: 6000,
+    fontFamily: 'SFMono-Regular, Menlo, monospace', fontSize: terminalFontSize, lineHeight: 1.2, scrollback: 6000,
     cursorBlink: tab.kind === 'shell', disableStdin: tab.kind === 'command',
-    convertEol: tab.kind === 'command', theme: { background: '#11161f', foreground: '#e3ebf5', cursor: '#a6ceff', selectionBackground: '#365579' }
+    convertEol: tab.kind === 'command', allowProposedApi: true, minimumContrastRatio: 4.5, theme: {
+      background: '#11161f', foreground: '#e8edf6', cursor: '#a6ceff', selectionBackground: '#365579',
+      black: '#596578', brightBlack: '#9aa9bf', red: '#f58291', brightRed: '#ffacb7',
+      green: '#84d5a4', brightGreen: '#a2e9bb', yellow: '#e7c47d', brightYellow: '#ffdb97',
+      blue: '#83aff6', brightBlue: '#a6c7ff', magenta: '#c9a2f4', brightMagenta: '#e0bfff',
+      cyan: '#7ccedb', brightCyan: '#a0e7f0', white: '#d3dceb', brightWhite: '#f4f7fc'
+    }
   });
   const fit = new FitAddon.FitAddon();
   const search = new SearchAddon.SearchAddon();
   terminal.loadAddon(fit);
   terminal.loadAddon(search);
   terminal.open(view);
+  const paths = terminalPaths.observe(terminal, (path, text) => {
+    const action = path ? openTerminalPath(tab, path) : chooseTerminalPath(tab, text);
+    void action.catch((error) => status(message(error)));
+  }, () => { if (active === tab) renderTerminalDirectory(); }, () => tab.kind === 'shell' && tab.status === 'ready');
+  view.addEventListener('contextmenu', (event) => {
+    const selected = terminal.getSelection().trim();
+    if (!selected || selected.includes('\n') || !readySession(origin(tab))) return;
+    event.preventDefault();
+    void chooseTerminalPath(tab, selected).catch((error) => status(message(error)));
+  });
   terminal.attachCustomKeyEventHandler((event) => !event.metaKey);
-  terminal.onData((data) => { if (tab.status === 'ready') api.ssh.input({ id: tab.id, data }); });
+  terminal.onData((data) => {
+    paths.invalidate(data);
+    if (tab.status === 'ready') api.ssh.input({ id: tab.id, data });
+  });
   terminal.onResize((size) => { if (tab.kind === 'shell') api.ssh.resize({ id: tab.id, size }); });
+  for (const event of [terminal.onScroll, terminal.onWriteParsed]) event(() => {
+    if (active === tab) renderTerminalBottom();
+  });
   view.addEventListener('paste', async (event) => {
     if (tab.kind !== 'shell' || tab.status !== 'ready') return;
     const text = event.clipboardData?.getData('text/plain');
@@ -821,14 +876,15 @@ function attachTerminal(tab) {
       if (await prompt('确认多行粘贴', [node('p', '', `目标 ${endpoint(tab.host)}`), preview], '粘贴', () => true) && active === tab && tab.status === 'ready') terminal.paste(text);
     } catch (error) { status(message(error)); }
   }, true);
-  Object.assign(tab, { view, terminal, fit, search });
+  Object.assign(tab, { view, terminal, fit, search, paths });
 }
 
-function selectTab(tab, view = tab ? 'session' : 'hosts') {
+function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session' : 'hosts') {
   closeDropdown();
   active = tab;
   workspace.dataset.view = view;
   $('work').hidden = view !== 'session';
+  $('new-tab-page').hidden = view !== 'new-tab';
   for (const control of pageButtons) {
     const current = control.dataset.page === view;
     $(control.getAttribute('aria-controls')).hidden = !current;
@@ -838,76 +894,210 @@ function selectTab(tab, view = tab ? 'session' : 'hosts') {
   if (view === 'keys' && !$('keys-page').firstChild) $('keys-page').append(keyBrowser());
   if (view !== 'keys') $('keys-page').replaceChildren();
   if (view === 'vault') renderVaultPage();
-  if (tab) { tab.used = Date.now(); recent.set(tab.host.id, tab.used); }
-  if (tab?.kind === 'shell' && tab.status === 'ready') status(`${tab.host.name} · SSH 已连接`);
+  if (view === 'transfers') {
+    refreshTransferActions();
+    void loadTransferHistory();
+  }
+  if (tab) tab.used = Date.now();
+  if (tab?.kind === 'shell' && tab.status === 'ready') {
+    recent.set(tab.host.id, tab.used);
+    status(`${tab.host.name} · SSH 已连接`);
+  }
   else if (tab?.kind === 'command') status(`${tab.host.name} · ${actionLabels[tab.action]}`);
-  else if (view !== 'session') status(({ hosts: '已保存的主机', keys: 'SSH 密钥', vault: '保险库' })[view]);
+  else if (view !== 'session') status(({ hosts: '已保存的主机', 'new-tab': '选择要连接的主机', keys: 'SSH 密钥', transfers: '上传和下载记录', vault: '保险库' })[view]);
   $('terminal-find').hidden = true;
-  for (const entry of tabs.values()) entry.view.hidden = entry !== tab;
+  $('terminal-drop').hidden = true;
+  renderTerminalBottom();
+  for (const entry of tabs.values()) if (entry.view) entry.view.hidden = entry !== tab;
   renderTabs();
-  revealActiveTab();
+  revealActiveTab('smooth');
   if (view === 'hosts') renderHosts();
   renderContext();
   renderFiles();
   if (filesOpen) ensureFiles(origin());
-  if (tab) {
+  if (tab?.kind === 'new') {
+    $('quick-connect-search').value = tab.query;
+    renderQuickConnect(tab);
+    $('new-tab-page').scrollTop = 0;
+    if (!vaultStatus.locked) $('quick-connect-search').focus({ preventScroll: true });
+  } else if (tab) {
     requestAnimationFrame(() => {
       if (active !== tab) return;
       tab.fit.fit();
-      if (!dialog.open) tab.terminal.focus();
+      focusTerminal(tab);
     });
   }
 }
 
-function revealActiveTab() {
-  $('tabs').querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+function focusTerminal(tab) {
+  if (active === tab && !vaultStatus.locked && !dialog.open && !$('key-dialog').open && !$('session-switcher').open) {
+    tab?.terminal?.focus();
+  }
+}
+
+function updateTabEdges() {
+  const strip = $('tabs');
+  strip.dataset.moreLeft = String(strip.scrollLeft > 1);
+  strip.dataset.moreRight = String(strip.scrollWidth - strip.clientWidth - strip.scrollLeft > 1);
+}
+
+function revealActiveTab(behavior = 'auto') {
+  const strip = $('tabs');
+  const row = active?.tabRow;
+  if (row) {
+    const viewport = strip.getBoundingClientRect();
+    const bounds = row.getBoundingClientRect();
+    const delta = bounds.left < viewport.left + 2 ? bounds.left - viewport.left - 2
+      : Math.max(0, bounds.right - viewport.right + 2);
+    if (Math.abs(delta) > 1) {
+      if (matchMedia('(prefers-reduced-motion: reduce)').matches) behavior = 'auto';
+      strip.scrollTo({ left: strip.scrollLeft + delta, behavior });
+    }
+  }
+  updateTabEdges();
+}
+
+function tabName(tab) {
+  if (tab.kind === 'new') return '新建标签';
+  return tab.kind === 'command' ? `${tab.host.name} · ${actionLabels[tab.action]}` : tab.host.name;
+}
+
+function tabTitle(tab) {
+  return tabName(tab) + (tab.number > 1 ? ` · ${tab.number}` : '');
+}
+
+function tabIcon(tab) {
+  return chromeIcon(({ new: 'new-tab', command: 'file', shell: 'terminal' })[tab.kind]);
 }
 
 function renderTabs() {
   const strip = $('tabs');
-  strip.replaceChildren();
   for (const tab of tabs.values()) {
-    const title = tab.kind === 'shell' ? `${tab.host.name}${tab.number > 1 ? ` · ${tab.number}` : ''}` : `${tab.host.name} · ${actionLabels[tab.action]}`;
-    const ready = tab.status === 'ready';
-    const icon = node('span', ready ? 'online' : 'muted', tab.kind === 'command' ? '≡' : ready ? '●' : '○');
-    icon.setAttribute('aria-hidden', 'true');
-    const open = button('', () => selectTab(tab), 'tab-open', title);
-    open.replaceChildren(icon, node('span', 'tab-title', title));
-    open.setAttribute('aria-pressed', String(tab === active));
-    const row = node('div', 'tab', open, button('×', () => closeTab(tab), 'tab-close', `关闭 ${title}`));
-    row.dataset.active = String(tab === active);
-    strip.append(row);
+    if (tab.tabRow?.dataset.kind !== tab.kind) {
+      const title = tabTitle(tab);
+      const open = button('', () => selectTab(tab), 'tab-open', title);
+      open.replaceChildren(node('span', 'tab-title', tabName(tab)),
+        ...(tab.number > 1 ? [node('span', 'tab-number', String(tab.number))] : []));
+      const close = button('×', () => closeTab(tab), 'tab-close', `关闭 ${title}`);
+      const icon = tabIcon(tab);
+      const leading = tab.kind === 'new' ? node('span', 'tab-leading', icon, close) : close;
+      if (tab.kind !== 'new') open.append(icon);
+      const row = node('div', 'tab', leading, open);
+      row.dataset.kind = tab.kind;
+      if (tab.tabRow) tab.tabRow.replaceWith(row);
+      else strip.append(row);
+      tab.tabRow = row;
+    }
+    tab.tabRow.dataset.active = String(tab === active);
+    tab.tabRow.querySelector('.tab-open').setAttribute('aria-pressed', String(tab === active));
   }
+  $('switch-tabs').hidden = tabs.size < 2;
+  updateTabEdges();
 }
 
-async function chooseSession() {
-  let selected;
-  const entries = [...tabs.values()].map((tab) => button(`${tab.host.name}${tab.number > 1 ? ` · ${tab.number}` : ''}${tab.kind === 'command' ? ` · ${actionLabels[tab.action]}` : ''}`, () => {
-    selected = tab;
-    dialog.close();
-  }));
-  await prompt('切换会话', [node('div', 'palette-list', ...entries)], '关闭', () => null);
-  if (selected && tabs.has(selected.id)) selectTab(selected);
+function tabChoice(tab) {
+  const detail = tab === active ? '当前标签' : tab.host ? endpoint(tab.host) : '选择主机';
+  const choice = button('', () => {
+    if ($('session-switcher').open) $('session-switcher').close();
+    selectTab(tab);
+  }, 'tab-choice');
+  choice.append(tabIcon(tab), node('span', '', tabTitle(tab)), node('small', '', detail));
+  if (tab === active) choice.setAttribute('aria-current', 'true');
+  return choice;
+}
+
+function matchingTabs(query) {
+  return [...tabs.values()].filter((tab) =>
+    `${tabTitle(tab)} ${tab.host ? endpoint(tab.host) : ''}`.toLowerCase().includes(query));
+}
+
+function renderSessionSwitcher() {
+  const query = $('session-switcher-search').value.trim().toLowerCase();
+  const entries = matchingTabs(query).map(tabChoice);
+  $('session-switcher-results').replaceChildren(...(entries.length ? entries : [node('p', 'muted', '没有匹配的标签。')]));
+}
+
+function chooseSession() {
+  const switcher = $('session-switcher');
+  if (tabs.size < 2 || vaultStatus.locked || dialog.open || $('key-dialog').open || switcher.open) return;
+  closeDropdown();
+  $('session-switcher-search').value = '';
+  renderSessionSwitcher();
+  $('switch-tabs').setAttribute('aria-expanded', 'true');
+  switcher.showModal();
+  $('session-switcher-search').focus();
+}
+
+function quickConnectGroup(title, entries) {
+  return node('section', 'quick-connect-group', node('h2', '', title), ...entries);
+}
+
+function renderQuickConnect(draftTab) {
+  const results = $('quick-connect-results');
+  const query = draftTab.query.trim().toLowerCase();
+  const matching = hosts.filter((host) => hostMatches(host, query)).sort(recentFirst);
+  const visited = query ? [] : matching.filter((host) => recent.has(host.id)).slice(0, 8);
+  const groups = [];
+  const hostChoice = (host) => {
+    const choice = button('', () => openHost(host, { draftTab }), 'tab-choice');
+    choice.append(chromeIcon('terminal'), node('span', '', host.name),
+      node('small', '', [endpoint(host), host.group].filter(Boolean).join(' · ')));
+    choice.title = [host.name, endpoint(host), host.group].filter(Boolean).join(' · ');
+    return choice;
+  };
+  if (visited.length) groups.push(quickConnectGroup('最近连接', visited.map(hostChoice)));
+  const saved = matching.filter((host) => !visited.includes(host));
+  if (saved.length) groups.push(quickConnectGroup(query ? '匹配的主机' : '已保存的主机', saved.map(hostChoice)));
+  if (query) {
+    const entries = matchingTabs(query).filter((tab) => tab !== draftTab).map(tabChoice);
+    if (entries.length) groups.push(quickConnectGroup('已打开的标签', entries));
+  }
+  if (!groups.length) {
+    const hint = query ? '没有匹配的主机或标签。' : hostsLoaded ? '还没有已保存的主机。' : draftTab.loadError || '正在读取主机…';
+    groups.push(quickConnectGroup('快速连接', [node('p', 'muted', hint)]));
+  }
+  results.replaceChildren(...groups);
+}
+
+async function addNewTab() {
+  if (vaultStatus.locked) return;
+  const tab = { id: sessionId(), kind: 'new', query: '' };
+  tabs.set(tab.id, tab);
+  selectTab(tab);
+  if (!hostsLoaded) {
+    try { await refreshHosts(); }
+    catch (error) {
+      tab.loadError = message(error);
+      if (active === tab && tab.kind === 'new') renderQuickConnect(tab);
+    }
+  }
 }
 
 function renderContext() {
   const tab = active;
   const session = origin(tab);
-  $('toolbar').hidden = !tab;
+  $('toolbar').hidden = !tab?.terminal;
+  renderTerminalDirectory();
   $('session-notice').hidden = true;
-  if (!tab) return;
+  if (!tab?.terminal) return;
   const labels = { idle: '等待连接', connecting: '连接中', trust: '核对主机指纹', ready: '已连接', closed: '已断开', running: '运行中', done: '已完成', stopped: '已停止', failed: '失败' };
   $('context').replaceChildren(node('strong', '', endpoint(tab.host)), node('span', tab.status === 'ready' ? 'online' : 'muted', labels[tab.status] || tab.status));
   const controls = $('session-actions');
   controls.replaceChildren();
-  if (tabs.size > 1) controls.append(button('会话', chooseSession));
   if (tab.kind === 'shell' && tab.status === 'closed') controls.append(button(tab.promptForPassword ? '重新输入密码' : '重连', () => connect(tab)));
-  if (tab.kind === 'command' && tab.action === 'follow' && ['running', 'connecting'].includes(tab.status)) controls.append(button('停止跟踪', () => api.commands.stop(tab.id)));
+  if (tab.kind === 'command') {
+    if (session) controls.append(button('返回终端', () => selectTab(session), 'outlined'));
+    if (tab.action === 'follow' && ['running', 'connecting'].includes(tab.status)) controls.append(button('停止跟踪', () => api.commands.stop(tab.id)));
+  } else {
+    const output = [...tabs.values()].findLast((entry) => entry.kind === 'command' && entry.sessionId === tab.id);
+    if (output) controls.append(button('查看输出', () => selectTab(output), 'outlined', `查看输出 · ${actionLabels[output.action]}`));
+  }
   const shortcuts = button('快捷命令', () => openPalette('commands'));
   shortcuts.disabled = session?.status !== 'ready';
   controls.append(shortcuts);
   const fileButton = button('文件', toggleFiles);
-  fileButton.setAttribute('aria-pressed', String(filesOpen));
+  fileButton.setAttribute('aria-expanded', String(filesOpen && Boolean(session)));
+  fileButton.setAttribute('aria-controls', 'files');
   fileButton.disabled = !session;
   controls.append(fileButton);
 
@@ -958,9 +1148,9 @@ async function enterCredential(tab) {
 async function connect(tab, enterPassword = false) {
   if (tab.status === 'connecting' || !tabs.has(tab.id)) return;
   tab.status = 'connecting';
+  tab.paths.reset();
   tab.message = '';
   tab.passwordSaveError = '';
-  renderTabs();
   renderContext();
   try {
     const passwordAuth = tab.host.auth === 'password';
@@ -982,13 +1172,16 @@ async function connect(tab, enterPassword = false) {
   }
 }
 
-async function openHost(host, force = false) {
-  if (host.auth === 'key' && !host.keyPath) { await editHost(host); return; }
+async function openHost(host, { force = false, draftTab } = {}) {
+  if (draftTab && (active !== draftTab || draftTab.kind !== 'new')) return;
+  if (host.auth === 'key' && !host.keyPath) { await editHost(host, draftTab); return; }
   const sessions = [...tabs.values()].filter((tab) => tab.kind === 'shell' && tab.host.id === host.id);
   const existing = sessions.filter((tab) => ['ready', 'trust', 'connecting'].includes(tab.status)
     && ['address', 'port', 'username', 'auth', 'keyPath'].every((field) => tab.host[field] === host[field])).sort((a, b) => b.used - a.used)[0];
-  if (existing && !force) { selectTab(existing); return; }
-  const tab = { id: sessionId(), kind: 'shell', host, status: 'idle', number: Math.max(0, ...sessions.map((entry) => entry.number)) + 1, attempts: 0, files: { selected: new Set() } };
+  if (existing && !force && !draftTab) { selectTab(existing); return; }
+  const tab = draftTab || { id: sessionId() };
+  Object.assign(tab, { kind: 'shell', host, status: 'idle', number: Math.max(0, ...sessions.map((entry) => entry.number)) + 1,
+    attempts: 0, files: { selected: new Set() } });
   attachTerminal(tab);
   tabs.set(tab.id, tab);
   selectTab(tab);
@@ -1001,40 +1194,50 @@ async function closeTab(tab) {
     if (ongoing.some((job) => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭会话。'); return; }
     if (ongoing.length && !await confirm('关闭 SSH 会话', `取消「${tab.host.name}」正在传输的 ${ongoing.length} 项任务？`, '取消任务并关闭')) return;
     await api.ssh.close(tab.id);
-  } else {
+  } else if (tab.kind === 'command') {
     await api.commands.close(tab.id);
   }
   tabs.delete(tab.id);
+  tab.tabRow.remove();
+  refreshTransferActions(tab.id);
   for (const acknowledge of tab.pendingAcks?.values() || []) acknowledge();
-  tab.terminal.dispose();
-  tab.view.remove();
+  tab.terminal?.dispose();
+  tab.view?.remove();
   if (active === tab) selectTab(tabs.get(tab.sessionId) || [...tabs.values()].sort((a, b) => b.used - a.used)[0]);
-  else renderTabs();
+  else {
+    renderTabs();
+    if (active?.sessionId === tab.id || active?.id === tab.sessionId) {
+      renderContext();
+      renderFiles();
+    }
+  }
 }
 
 function updateSession(tab, next, detail = '') {
   tab.status = next;
   tab.message = detail;
   if (next === 'ready') {
+    recent.set(tab.host.id, Date.now());
     void api.hosts.touch(tab.host.id).catch(() => {});
     status(`${tab.host.name} · SSH 已连接`);
-    if (active === tab && !dialog.open) tab.terminal.focus();
+    focusTerminal(tab);
+    if (active?.kind === 'new') renderQuickConnect(active);
     if (filesOpen && origin() === tab) ensureFiles(tab);
   } else if (next === 'closed') {
+    tab.paths.reset();
     tab.terminal.write(`\r\n\x1b[90m${detail.replace(/[\x00-\x1f\x7f]/g, ' ')}\x1b[0m\r\n`);
     status(`${tab.host.name} · ${detail}`);
   }
-  renderTabs();
-  renderContext();
+  if (active === tab || origin() === tab) renderContext();
   if (filesOpen && origin() === tab) renderFiles();
+  refreshTransferActions(tab.id);
 }
 
 async function openPalette(scope = 'all') {
-  const newTab = scope === 'hosts';
-  if (newTab && !hostsLoaded) await refreshHosts();
+  const source = active;
   const session = origin();
   const search = input('', 'search');
-  const searchLabel = { hosts: '搜索主机名称、地址或分组', commands: '搜索快捷命令', all: '搜索主机或命令' }[scope];
+  const searchLabel = scope === 'commands' ? '搜索快捷命令' : '搜索主机或命令';
   search.placeholder = `${searchLabel}…`;
   search.setAttribute('aria-label', searchLabel);
   const choices = node('div', 'palette-list');
@@ -1044,14 +1247,11 @@ async function openPalette(scope = 'all') {
   const update = () => {
     const all = [];
     if (scope !== 'commands') {
-      for (const host of hosts) {
-        const detail = newTab && host.group ? `${endpoint(host)} · ${host.group}` : endpoint(host);
-        all.push([host.name, detail, () => openHost(host, newTab)]);
-      }
+      for (const host of hosts) all.push([host.name, endpoint(host), () => openHost(host)]);
     }
-    if (session?.status === 'ready' && !newTab) {
+    if (readySession(session)) {
       for (const [action, label] of Object.entries(actionLabels)) all.push([label, session.host.name, () => configureCommand(session, action)]);
-      all.push(['在新标签连接', session.host.name, () => openHost(session.host, true)]);
+      all.push(['在新标签连接', session.host.name, () => openHost(session.host, { force: true })]);
     }
     const q = search.value.trim().toLowerCase();
     entries = all.filter(([label, detail]) => `${label} ${detail}`.toLowerCase().includes(q));
@@ -1061,10 +1261,7 @@ async function openPalette(scope = 'all') {
       return choice;
     }));
     if (!entries.length) {
-      const empty = newTab
-        ? hosts.length ? '没有找到匹配的主机。' : '暂无已保存的主机，可先新建一台主机。'
-        : '没有可用的结果。';
-      const hint = node('p', 'muted', empty);
+      const hint = node('p', 'muted', '没有可用的结果。');
       hint.setAttribute('role', 'status');
       choices.append(hint);
     }
@@ -1072,15 +1269,18 @@ async function openPalette(scope = 'all') {
     if (submit) submit.disabled = !entries.length;
   };
   search.addEventListener('input', update);
-  const title = { hosts: '新建 SSH 标签', commands: '快捷命令', all: '主机与命令' }[scope];
-  const extra = newTab ? [button('新建主机', () => choose(() => editHost()), 'outlined')] : [];
-  const selection = prompt(title, [search, choices], newTab ? '连接首项' : '打开首项', () => entries[0]?.[2], extra);
+  const title = scope === 'commands' ? '快捷命令' : '主机与命令';
+  const selection = prompt(title, [search, choices], '打开首项', () => entries[0]?.[2]);
   update();
   const first = await selection;
-  if (!vaultStatus.locked) await (selected || first)?.();
+  const run = selected || first;
+  if (!vaultStatus.locked && run) await run();
+  else focusTerminal(source);
 }
 
 async function configureCommand(session, action, file) {
+  const source = active;
+  const attempt = session.attempts;
   const profile = hosts.find((host) => host.id === session.host.id && endpoint(host) === endpoint(session.host)) || session.host;
   const argument = input(file || (action === 'journal' ? profile.service || 'sshd.service' : profile.logPath || ''));
   argument.placeholder = action === 'journal' ? '例如 nginx.service' : '/var/log/example.log';
@@ -1101,15 +1301,27 @@ async function configureCommand(session, action, file) {
   void update();
   const fields = [node('p', '', `目标 ${endpoint(session.host)}`)];
   if (action !== 'disk') fields.push(field(action === 'journal' ? '服务名' : '日志文件绝对路径', argument), field('行数', lines));
-  const details = await prompt(actionLabels[action], [...fields, preview], '打开输出标签', async () => ({ request: request(), preview: await api.commands.preview(request()) }));
-  if (!details) return;
+  const details = await prompt(actionLabels[action], [...fields, preview], file ? '打开输出标签' : '运行命令', async () => {
+    if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择命令。');
+    const command = request();
+    return { request: command, preview: await api.commands.preview(command) };
+  });
+  if (!details || !readySession(session, attempt)) { focusTerminal(source); return; }
   const tab = { id: sessionId(), kind: 'command', sessionId: session.id, host: session.host, action, status: 'connecting' };
   attachTerminal(tab);
   tab.terminal.write(`\x1b[90m$ ${details.preview}\x1b[0m\r\n`);
   tabs.set(tab.id, tab);
-  selectTab(tab);
+  if (file) selectTab(tab);
+  else {
+    selectTab(session);
+    status(`已启动「${actionLabels[action]}」 · 查看输出可打开命令标签`);
+  }
   try { await api.commands.start({ id: tab.id, sessionId: session.id, request: details.request }); }
-  catch (error) { updateSession(tab, 'failed', message(error)); }
+  catch (error) {
+    if (!tabs.has(tab.id)) return;
+    updateSession(tab, 'failed', message(error));
+    if (active === session) status(`${actionLabels[action]}失败 · ${message(error)}`);
+  }
 }
 
 function toggleFiles() {
@@ -1117,11 +1329,181 @@ function toggleFiles() {
   renderContext();
   renderFiles();
   if (filesOpen) ensureFiles(origin());
-  else active?.terminal.focus();
+  else focusTerminal(active);
+}
+
+function readySession(tab, attempt = tab?.attempts) {
+  return !vaultStatus.locked && tab?.status === 'ready' && tabs.get(tab.id) === tab && tab.attempts === attempt;
+}
+
+function renderTerminalDirectory() {
+  const control = $('terminal-path');
+  const tab = active;
+  const directory = tab?.paths?.directory;
+  control.hidden = !readySession(origin(tab));
+  control.title = directory ? `Shell 上次报告的目录 ${directory} · 打开路径操作` : '打开远端路径 · ⌘ 单击终端中的路径';
+}
+
+function renderTerminalBottom() {
+  const control = $('terminal-bottom');
+  const buffer = active?.terminal?.buffer.active;
+  control.hidden = !buffer || buffer.type !== 'normal' || buffer.viewportY >= buffer.baseY;
+  if (control.hidden && active) active.newOutput = false;
+  control.textContent = active?.newOutput ? '有新输出 · 回到底部 ↓' : '回到底部 ↓';
+}
+
+async function currentTerminalDirectory(tab) {
+  const reported = tab.paths.uploadDirectory;
+  if (reported) return reported;
+  const probed = await api.ssh.directory?.(tab.id);
+  return terminalPaths.absolute(probed) ? probed : undefined;
+}
+
+async function chooseTerminalPath(source = active, selected) {
+  const tab = origin(source);
+  if (!readySession(tab) || active !== source || dialog.open) return;
+  const attempt = tab.attempts;
+  const directory = source === tab && !terminalPaths.absolute(selected) ? await currentTerminalDirectory(tab) : undefined;
+  if (active !== source || !readySession(tab, attempt) || dialog.open) return;
+  const value = input(selected ? terminalPaths.resolve(selected, directory) || selected : directory);
+  value.placeholder = '/var/log/app.log';
+  const fields = [field('路径', value),
+    node('p', 'muted', '可按住 ⌘ 单击路径，也可选中文字后右键打开此窗口。请核对远端路径。')];
+  if (source.kind === 'shell') {
+    const report = String.raw`termlume_report_dir() { if [[ $PWD != *[[:cntrl:]]* ]]; then printf '\033]1337;CurrentDir=%s\007' "$PWD"; fi; }`;
+    const bash = report + String.raw`; PROMPT_COMMAND+=(termlume_report_dir); PS1+='\[\e]133;B\a\]'`;
+    const zsh = report + String.raw`; autoload -Uz add-zsh-hook; add-zsh-hook precmd termlume_report_dir; PROMPT+=$'%{\e]133;B\a%}'`;
+    fields.push(node('details', 'terminal-path-help', node('summary', '', '启用当前会话的目录识别'),
+      node('p', 'muted', '关闭此窗口，在远端空提示符粘贴并执行对应命令一次。'),
+      node('strong', '', 'Bash 5.1+'), node('code', 'command-preview', bash),
+      node('strong', '', 'Zsh'), node('code', 'command-preview', zsh)));
+  }
+  const inspected = await prompt('远端路径', fields, '打开', () => {
+    const path = terminalPaths.resolve(value.value, directory);
+    if (!path) throw new Error('请输入有效的远端路径。');
+    if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化，请重新选择路径。');
+    return api.files.inspect({ id: tab.id, path });
+  });
+  if (inspected && readySession(tab, attempt)) await openTerminalPath(source, inspected.path, inspected);
+}
+
+async function openTerminalPath(source, candidate, inspected) {
+  const tab = origin(source);
+  if (active !== source || !readySession(tab) || dialog.open) return;
+  const attempt = tab.attempts;
+  const emptyPrompt = source === tab ? tab.paths.emptyPrompt : undefined;
+  const { path, kind, downloadable } = inspected || await api.files.inspect({ id: tab.id, path: candidate });
+  if (active !== source || !readySession(tab, attempt) || dialog.open) return;
+
+  const detail = node('p', '', endpoint(tab.host), ' · ', node('code', '', path));
+  const downloadPath = async () => {
+    if (!readySession(tab, attempt)) return;
+    const split = path.lastIndexOf('/');
+    await prepareTransfer(tab, 'down', [path.slice(split + 1)], { directory: path.slice(0, split) || '/' });
+  };
+  if (kind === 'file') {
+    const download = await prompt('远端文件', [detail], '下载到本机', () => true);
+    if (download) await downloadPath();
+  } else if (kind === 'directory') {
+    const command = `cd -- '${path.replaceAll("'", "'\\''")}'`;
+    if (emptyPrompt && emptyPrompt === tab.paths.emptyPrompt && !tab.pendingAcks?.size) {
+      tab.paths.invalidate('\r');
+      tab.terminal.focus();
+      api.ssh.input({ id: tab.id, data: command + '\r' });
+      return;
+    }
+    const copy = input(command);
+    copy.readOnly = true;
+    let download = false;
+    const actions = path !== '/' && downloadable && api.files.directoryDownloads
+      ? [button('下载目录…', () => { download = true; dialog.close(); }, 'outlined')]
+      : [];
+    const browse = await prompt('远端目录', [detail, field('切换目录命令（可复制）', copy)], '在文件面板中打开', () => true, actions);
+    if (download) await downloadPath();
+    if (browse && readySession(tab, attempt) && active === source) {
+      filesOpen = true;
+      renderContext();
+      await loadFiles(tab, path);
+    }
+  } else {
+    status('该路径是链接或特殊文件。');
+  }
+}
+
+function handleFileDrag({ phase, position, count, ticket }) {
+  if (phase === 'enter' || phase === 'drop') draggedFileCount = count;
+  if (phase === 'leave') draggedFileCount = 0;
+  const overlay = $('terminal-drop');
+  const tab = active;
+  const rect = $('terminal-stage').getBoundingClientRect();
+  const eligible = draggedFileCount > 0 && readySession(tab) && !dialog.open &&
+    !$('session-switcher').open &&
+    position && position.x >= rect.left && position.x < rect.right && position.y >= rect.top && position.y < rect.bottom;
+  overlay.hidden = phase === 'drop' || !eligible;
+  if (phase === 'drop') {
+    draggedFileCount = 0;
+    if (eligible) void uploadDroppedFiles(tab, ticket, count).catch((error) => status(message(error)));
+  } else if (eligible) {
+    const directory = tab.paths.uploadDirectory;
+    overlay.textContent = draggedFileCount > 100 ? '每次可上传最多 100 个普通文件。'
+      : directory ? `上传到 ${endpoint(tab.host)}:${directory}` : `上传到 ${endpoint(tab.host)} · 松手后读取终端目录`;
+  }
+}
+
+async function uploadDroppedFiles(tab, ticket, count) {
+  if (count > 100) throw new Error('每次可上传最多 100 个普通文件。');
+  const attempt = tab.attempts;
+  status('正在核对当前终端目录…');
+  let directory = await currentTerminalDirectory(tab);
+  if (!readySession(tab, attempt) || active !== tab || dialog.open || $('session-switcher').open) return;
+  status(`${tab.host.name} · SSH 已连接`);
+  if (!directory) {
+    directory = await chooseRemoteDirectory(tab, attempt, count);
+  }
+  if (directory && readySession(tab, attempt)) await prepareTransfer(tab, 'up', undefined, { directory, dropTicket: ticket });
+}
+
+async function chooseRemoteDirectory(tab, attempt, count) {
+  const path = input(tab.files.directory);
+  path.placeholder = '/srv/app';
+  const entries = node('div', 'palette-list');
+  let revision = 0;
+  const browse = async (directory) => {
+    const version = ++revision;
+    const typed = path.value;
+    entries.replaceChildren(node('p', 'muted', '正在读取目录…'));
+    try {
+      const result = await api.files.list({ id: tab.id, directory });
+      if (version !== revision || !entries.isConnected) return;
+      if (path.value === typed) path.value = result.directory;
+      const folders = result.entries.filter(({ kind }) => kind === 'directory');
+      entries.replaceChildren(...folders.map(({ name }) => button(`▸ ${name}`, () => browse(`${address(result.directory)}/${name}`))));
+      if (!folders.length) entries.append(node('p', 'muted', '没有子目录。'));
+    } catch (error) {
+      if (version === revision && entries.isConnected) entries.replaceChildren(node('p', 'danger', message(error)));
+    }
+  };
+  const parent = button('上一级', () => browse(path.value.replace(/\/[^/]+\/?$/, '') || '/'));
+  const open = button('浏览', () => browse(path.value), 'outlined');
+  const selection = prompt('选择上传目录', [
+    node('p', '', `${endpoint(tab.host)} · ${count} 个本机项目`),
+    node('p', 'muted', '当前终端目录无法确认。请选择一个远端目录。'),
+    field('远端目录', path), node('div', 'file-tools', parent, open), entries
+  ], '使用此目录', async () => {
+    if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化，请重新拖入文件。');
+    if (!terminalPaths.absolute(path.value)) throw new Error('请选择远端目录。');
+    const result = await api.files.inspect({ id: tab.id, path: path.value });
+    if (result.kind !== 'directory') throw new Error('请选择远端目录。');
+    return result.path;
+  });
+  void browse(path.value);
+  return selection;
 }
 
 function ensureFiles(tab) {
-  if (tab?.status === 'ready' && !tab.files.entries && !tab.files.loading && !tab.files.error) void loadFiles(tab, tab.files.directory);
+  if (tab?.status === 'ready' && !tab.files.entries && !tab.files.loading && !tab.files.error) {
+    void loadFiles(tab, tab.files.directory || tab.paths.uploadDirectory);
+  }
 }
 
 async function loadFiles(tab, directory) {
@@ -1133,7 +1515,10 @@ async function loadFiles(tab, directory) {
   try {
     const result = await api.files.list({ id: tab.id, directory });
     if (files.generation !== generation) return;
-    if (files.directory !== result.directory) files.selected.clear();
+    if (files.directory !== result.directory) {
+      files.selected.clear();
+      files.scrollTop = 0;
+    }
     Object.assign(files, result);
   } catch (error) {
     if (files.generation === generation) files.error = message(error);
@@ -1153,11 +1538,15 @@ function bytes(size) {
 function renderFiles() {
   const panel = $('files');
   const tab = origin();
-  panel.hidden = !filesOpen || !tab;
-  workspace.dataset.files = panel.hidden ? 'closed' : 'open';
-  if (panel.hidden) return;
+  const open = filesOpen && Boolean(tab);
+  panel.inert = !open;
+  workspace.dataset.files = open ? 'open' : 'closed';
+  if (!open) return;
   const files = tab.files;
-  const heading = node('header', 'section-head', node('strong', '', `远端文件 · ${tab.host.name}`), button('×', toggleFiles, '', '关闭文件区'));
+  const host = node('small', 'file-host', tab.host.name);
+  host.title = tab.host.name;
+  const heading = node('header', 'file-heading', chromeIcon('folder'),
+    node('div', '', node('strong', '', '远端文件'), host), button('×', toggleFiles, '', '关闭文件区'));
   panel.replaceChildren(heading);
   if (tab.status !== 'ready') { panel.append(node('p', 'inline-status muted', '连接 SSH 后可浏览文件。')); return; }
   const directory = input(files.directory || '');
@@ -1173,51 +1562,97 @@ function renderFiles() {
   if (files.error) panel.append(node('p', 'inline-status danger', files.error));
   if (!files.directory || !files.entries) return;
 
-  const select = [...files.selected].filter((name) => files.entries.some((entry) => entry.kind === 'file' && entry.name === name));
+  const selectable = (kind) => kind === 'file' || (kind === 'directory' && api.files.directoryDownloads);
+  const selection = () => files.entries.filter(({ name, kind }) => selectable(kind) && files.selected.has(name));
+  const logPath = () => {
+    const [entry, other] = selection();
+    return entry?.kind === 'file' && !other ? pathOf(tab, entry.name) : undefined;
+  };
   const upload = button('↑ 上传', () => prepareTransfer(tab, 'up'));
-  const download = button('↓ 下载', () => prepareTransfer(tab, 'down', select));
-  const follow = button('跟踪日志', () => configureCommand(tab, 'follow', pathOf(tab, select[0])));
-  const tail = button('查看末尾', () => configureCommand(tab, 'tail', pathOf(tab, select[0])));
-  const mkdir = button('新建文件夹', () => newDirectory(tab));
-  download.disabled = !select.length;
-  follow.disabled = tail.disabled = select.length !== 1;
-  panel.append(node('div', 'file-tools', upload, download, follow, tail, mkdir));
+  const download = button('↓ 下载', () => prepareTransfer(tab, 'down', selection().map(({ name }) => name)));
+  const follow = button('跟踪日志', () => configureCommand(tab, 'follow', logPath()));
+  const tail = button('查看末尾', () => configureCommand(tab, 'tail', logPath()));
+  const mkdir = button('新建文件夹', () => createRemoteItem(tab, true), 'outlined');
+  mkdir.prepend(chromeIcon('folder'));
+  const touch = button('新建文件', () => createRemoteItem(tab, false), 'outlined');
+  touch.prepend(chromeIcon('file'));
+  const selectedCount = node('small', 'muted');
+  const updateSelection = () => {
+    const count = selection().length;
+    download.disabled = count === 0;
+    follow.disabled = tail.disabled = !logPath();
+    selectedCount.textContent = count ? `已选 ${count} 项` : '';
+    selectedCount.hidden = count === 0;
+  };
+  updateSelection();
+  panel.append(node('div', 'file-toolbar', node('div', 'file-tools', upload, download, follow, tail),
+    node('div', 'file-tools file-create', mkdir, touch, selectedCount)));
   const list = node('div', 'file-list');
   for (const { name, kind, size } of files.entries) {
     const row = node('div', 'file-row');
-    if (kind === 'directory') row.append(button(`▸ ${name}`, () => loadFiles(tab, pathOf(tab, name))));
-    else if (kind === 'file') {
+    if (selectable(kind)) {
       const checkbox = input('', 'checkbox');
       checkbox.checked = files.selected.has(name);
       checkbox.setAttribute('aria-label', `选择 ${name}`);
-      const toggle = () => { if (files.selected.has(name)) files.selected.delete(name); else files.selected.add(name); renderFiles(); };
-      checkbox.addEventListener('change', toggle);
-      row.append(checkbox, button(name, toggle));
-    } else row.append(node('span', 'muted', name));
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) files.selected.add(name);
+        else files.selected.delete(name);
+        row.classList.toggle('selected', checkbox.checked);
+        updateSelection();
+      });
+      row.classList.toggle('selected', checkbox.checked);
+      row.append(checkbox);
+      if (kind === 'file') row.append(fileEntry(name, kind, () => checkbox.click()));
+    }
+    if (kind === 'directory') row.append(fileEntry(name, kind, () => loadFiles(tab, pathOf(tab, name))));
+    if (kind === 'other') row.append(node('span', 'muted', name));
     row.append(node('small', '', kind === 'directory' ? '目录' : kind === 'file' ? bytes(size) : '链接或特殊文件'));
+    if (selectable(kind)) row.append(button('↓', () => prepareTransfer(tab, 'down', [name]), 'file-download', `下载 ${name}`));
     list.append(row);
   }
   if (!files.entries.length) list.append(node('p', 'inline-status muted', '空目录'));
   panel.append(list);
+  list.scrollTop = files.scrollTop || 0;
+  list.addEventListener('scroll', () => {
+    if (list.isConnected) files.scrollTop = list.scrollTop;
+  }, { passive: true });
 }
 
-async function newDirectory(tab) {
+function fileEntry(name, kind, action) {
+  const entry = button('', action, `file-entry file-entry-${kind}`, name);
+  entry.replaceChildren(chromeIcon(kind === 'directory' ? 'folder' : 'file'), node('span', '', name));
+  return entry;
+}
+
+async function createRemoteItem(tab, folder) {
   const directory = tab.files.directory;
+  const attempt = tab.attempts;
   const name = input();
   name.required = true;
-  const created = await prompt('新建文件夹', [node('p', '', `${tab.host.name} · ${directory}`), field('名称', name)], '创建', async () => {
-    await api.files.mkdir({ id: tab.id, directory, name: name.value });
+  const created = await prompt(folder ? '新建文件夹' : '新建文件', [
+    node('p', '', `${tab.host.name} · ${directory}`), field('名称', name)
+  ], '创建', async () => {
+    if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化，请重新打开文件抽屉。');
+    await api.files[folder ? 'mkdir' : 'createFile']({ id: tab.id, directory, name: name.value });
     return true;
   });
-  if (created) await loadFiles(tab, directory);
+  if (created && readySession(tab, attempt) && tab.files.directory === directory) await loadFiles(tab, directory);
 }
 
-async function prepareTransfer(tab, direction, names) {
-  const directory = tab.files.directory;
-  const prepared = await api.files.prepare({ id: tab.id, direction, directory, names });
+async function prepareTransfer(tab, direction, names, { directory = tab.files.directory, dropTicket } = {}) {
+  const attempt = tab.attempts;
+  const preparing = direction === 'down' ? '正在准备下载，请选择本机保存位置…' : '正在准备上传…';
+  if (origin() === tab) status(preparing);
+  let prepared;
+  try {
+    prepared = await api.files.prepare({ id: tab.id, direction, directory, names, dropTicket });
+  } finally {
+    if ($('status').textContent === preparing && origin() === tab) status(`${tab.host.name} · SSH 已连接`);
+  }
   if (!prepared) return;
   const { ticket, files } = prepared;
   try {
+    if (!readySession(tab, attempt)) return;
     const choices = node('select');
     const conflicts = files.filter((file) => file.exists);
     for (const [value, label] of [['skip', '跳过同名文件'], ['keep', '另存为新名称'], ['replace', '覆盖已确认的同名普通文件']]) {
@@ -1226,68 +1661,179 @@ async function prepareTransfer(tab, direction, names) {
       option.value = value;
       choices.append(option);
     }
-    const targets = node('ul', 'target-list', ...files.map((file) => node('li', '', `${file.target}${file.exists ? '（已存在）' : ''}`)));
+    const targets = node('ul', 'target-list', ...files.map((file) => node('li', '',
+      `${file.target}${file.kind === 'directory' ? '（目录）' : ''}${file.exists ? '（已存在）' : ''}`)));
     const fields = [node('p', '', `${tab.host.name} · ${directory}`), targets];
+    const skipped = files.reduce((sum, file) => sum + (file.skipped || 0), 0);
+    if (skipped) fields.push(node('p', 'muted', `将跳过 ${skipped} 个链接、特殊文件或不支持的文件名。`));
     if (conflicts.length) fields.push(field('同名文件', selectControl(choices, '同名文件处理方式')));
     const confirmed = await prompt(direction === 'up' ? '确认上传' : '确认下载', fields, '开始传输', async () => {
+      if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化，请重新选择文件。');
       await api.files.enqueue({ ticket, policy: choices.value });
       return true;
     });
-    if (confirmed) setQueue(true);
+    if (confirmed) status('已加入传输队列，可在「传输记录」查看进度。');
   } finally {
     await api.files.discard(ticket);
   }
 }
 
-function setQueue(open) {
-  $('queue').hidden = !open;
-  $('queue-button').setAttribute('aria-expanded', String(open));
-  if (!jobs.size) $('queue').replaceChildren(node('span', 'muted', '暂无传输任务。'));
+function loadTransferHistory() {
+  if (loadingHistory) return loadingHistory;
+  const feedback = $('transfer-feedback');
+  feedback.textContent = '正在读取传输记录…';
+  feedback.hidden = false;
+  loadingHistory = api.files.history().then((records) => {
+    if (vaultStatus.locked) return;
+    for (const record of records) if (!jobs.has(record.id)) updateJob(record, true);
+    historyReady = true;
+    feedback.hidden = true;
+    renderTransferSummary();
+  }).catch((error) => {
+    feedback.textContent = message(error);
+  }).finally(() => { loadingHistory = undefined; });
+  return loadingHistory;
 }
 
-function updateJob(job) {
+function forgetJob(id) {
+  jobRows.get(id)?.element.remove();
+  jobRows.delete(id);
+  jobs.delete(id);
+}
+
+async function removeDownloadHistory(id = null) {
+  if (editingHistory || !historyReady) return;
+  editingHistory = true;
+  renderTransferSummary();
+  try {
+    if (!id && !await confirm('清空下载记录', '将移除所有已结束的下载记录。已下载的文件会保留。', '清空记录')) return;
+    const ids = await api.files.removeHistory(id);
+    for (const removed of ids) {
+      removedJobs.add(removed);
+      forgetJob(removed);
+    }
+    if (ids.length) status(id ? '已删除下载记录。' : '已清空下载记录。');
+  } finally {
+    editingHistory = false;
+    renderTransferSummary();
+  }
+}
+
+function renderTransferSummary() {
+  let running = 0;
+  let failed = 0;
+  let shownActive = 0;
+  let shownHistory = 0;
+  let canClear = false;
+  for (const job of jobs.values()) {
+    const visible = !transferDirection || job.direction === transferDirection;
+    jobRows.get(job.id).element.hidden = !visible;
+    if (job.finishedAt) {
+      if (visible) shownHistory += 1;
+      if (job.direction === 'down') canClear = true;
+      if (!job.archived && ['failed', 'unverified'].includes(job.status)) failed += 1;
+    } else {
+      running += 1;
+      if (visible) shownActive += 1;
+    }
+  }
+  $('queue-button').textContent = `⇄ 传输记录${running ? ` · ${running} 项进行中` : ''}${failed ? ` · ${failed} 项待处理` : ''}`;
+  $('transfer-active-empty').hidden = shownActive > 0;
+  $('transfer-history-empty').hidden = !historyReady || shownHistory > 0;
+  $('clear-downloads').disabled = !historyReady || editingHistory || !canClear;
+}
+
+function updateJob(event, archived = false) {
+  if (removedJobs.has(event.id)) return;
+  const previous = jobs.get(event.id);
+  if (previous?.finishedAt && !event.finishedAt) return;
+  const job = { ...event, archived };
+  const finished = Boolean(job.finishedAt);
+  const firstLiveCompletion = finished && !archived && (!previous?.finishedAt || previous.archived);
   jobs.set(job.id, job);
-  const running = [...jobs.values()].filter((item) => ['queued', 'running', 'committing'].includes(item.status)).length;
-  const failed = [...jobs.values()].filter((item) => ['failed', 'unverified'].includes(item.status)).length;
-  $('queue-button').textContent = `⇄ 传输${running ? ` · ${running} 项进行中` : ''}${failed ? ` · ${failed} 项待处理` : ''}`;
   let row = jobRows.get(job.id);
   if (!row) {
-    if (jobRows.size === 0) $('queue').replaceChildren();
-    const name = node('span', 'job-description');
+    const name = node('strong');
+    const meta = node('small');
+    const source = node('code');
+    const target = node('code');
     const meter = node('progress');
     meter.setAttribute('aria-label', '传输进度');
-    const state = node('small');
-    const controls = node('span');
-    const error = node('span', 'job-error');
-    $('queue').prepend(node('div', 'job', name, meter, state, controls, error));
-    row = { name, meter, state, controls, error };
+    const state = node('span', 'job-state');
+    const controls = node('div', 'job-actions');
+    const error = node('div', 'job-error');
+    const element = node('article', 'job',
+      node('div', 'job-header', node('div', 'job-identity', name, meta), state),
+      node('div', 'job-paths', node('small', '', '来源'), source, node('small', '', '目标'), target),
+      meter, error, controls);
+    element.dataset.id = job.id;
+    row = { element, name, meta, source, target, meter, state, controls, error };
     jobRows.set(job.id, row);
   }
-  row.name.textContent = `${job.host} · ${job.direction === 'up' ? '上传' : '下载'} · ${job.remote} ${job.direction === 'up' ? '←' : '→'} ${job.local}`;
+  const upload = job.direction === 'up';
+  row.name.textContent = job.remote.split('/').pop() || job.remote;
+  row.meta.textContent = [upload ? '上传' : '下载', job.host,
+    finished ? new Date(job.finishedAt).toLocaleString() : ''].filter(Boolean).join(' · ');
+  row.source.textContent = upload ? job.local : job.remote;
+  row.target.textContent = upload ? job.remote : job.local;
   row.meter.max = Math.max(1, job.size);
   row.meter.value = job.status === 'done' ? row.meter.max : job.bytes;
+  row.meter.hidden = finished;
   row.state.textContent = `${jobLabels[job.status]} · ${bytes(job.bytes)} / ${bytes(job.size)}`;
+  row.state.dataset.status = job.status;
   row.error.textContent = job.message;
   row.error.hidden = !job.message;
-  if (row.lastStatus !== job.status) {
-    row.lastStatus = job.status;
-    row.controls.replaceChildren();
-    if (['queued', 'running'].includes(job.status)) row.controls.append(button('取消', () => api.files.cancel(job.id)));
-    if (['failed', 'canceled'].includes(job.status)) row.controls.append(button('重试', () => api.files.retry(job.id)));
-    const tab = tabs.get(job.sessionId);
-    if (tab) row.controls.append(button('转到会话', () => { if (tabs.has(tab.id)) selectTab(tab); }));
-    if (job.status === 'done' && job.direction === 'up' && tab?.files.directory && pathOf(tab, job.remote.split('/').pop()) === job.remote) void loadFiles(tab, tab.files.directory);
+  renderJobActions(job, row);
+  const list = $(finished ? 'transfer-history' : 'transfer-active');
+  if (row.element.parentNode !== list) {
+    if (finished) {
+      row.element.dataset.finishedAt = job.finishedAt;
+      const older = [...list.children].find((entry) => Number(entry.dataset.finishedAt) <= job.finishedAt);
+      list.insertBefore(row.element, older || null);
+      if (list.children.length > transferHistoryLimit) forgetJob(list.lastElementChild.dataset.id);
+    } else list.prepend(row.element);
   }
+  const tab = tabs.get(job.sessionId);
+  if (firstLiveCompletion && job.status === 'done' && upload && tab?.files.directory &&
+    pathOf(tab, job.remote.split('/').pop()) === job.remote) void loadFiles(tab, tab.files.directory);
+  if (!archived) renderTransferSummary();
+}
+
+function refreshTransferActions(sessionId) {
+  if (workspace.dataset.view !== 'transfers') return;
+  for (const job of jobs.values()) {
+    if (!sessionId || job.sessionId === sessionId) renderJobActions(job, jobRows.get(job.id));
+  }
+}
+
+function renderJobActions(job, row) {
+  const tab = tabs.get(job.sessionId);
+  const retry = !job.archived && readySession(tab) && ['failed', 'canceled'].includes(job.status);
+  const state = `${job.status}:${Boolean(tab)}:${retry}`;
+  if (row.actionState === state) return;
+  row.actionState = state;
+  const controls = [];
+  if (['queued', 'running'].includes(job.status)) controls.push(button('取消', () => api.files.cancel(job.id)));
+  if (retry) controls.push(button('重试', () => api.files.retry(job.id)));
+  if (tab) controls.push(button('转到会话', () => { if (tabs.has(tab.id)) selectTab(tab); }));
+  if (job.finishedAt && job.direction === 'down') {
+    controls.push(button('删除记录', () => removeDownloadHistory(job.id), '', `删除下载记录 ${job.remote}`));
+  }
+  row.controls.hidden = !controls.length;
+  row.controls.replaceChildren(...controls);
 }
 
 api.onEvent((event) => {
   if (event.type === 'vault') { applyVaultState(event.state); return; }
+  if (event.type === 'file-drag') { handleFileDrag(event); return; }
   const tab = tabs.get(event.id);
   if (event.type === 'output') {
     if (!tab) { api.ssh.ack(event.ack); return; }
     const pending = tab.pendingAcks ||= new Map();
     const acknowledge = () => { if (pending.delete(event.ack)) api.ssh.ack(event.ack); };
     pending.set(event.ack, acknowledge);
+    tab.paths.invalidate();
+    if (tab.terminal.buffer.active.viewportY < tab.terminal.buffer.active.baseY) tab.newOutput = true;
     tab.terminal.write(event.bytes, acknowledge);
   } else if (event.type === 'transfer') updateJob(event);
   else if (tab && event.type === 'trust') {
@@ -1304,8 +1850,17 @@ api.onEvent((event) => {
   }
 });
 
-new ResizeObserver(() => { if (active) active.fit.fit(); }).observe($('terminal-stage'));
-new ResizeObserver(revealActiveTab).observe(document.querySelector('.tabbar'));
+new ResizeObserver(() => active?.fit?.fit()).observe($('terminal-stage'));
+const tabStrip = $('tabs');
+new ResizeObserver(() => revealActiveTab()).observe(tabStrip);
+tabStrip.addEventListener('scroll', updateTabEdges, { passive: true });
+tabStrip.addEventListener('wheel', (event) => {
+  if (event.ctrlKey || event.metaKey || Math.abs(event.deltaY) <= Math.abs(event.deltaX) ||
+    tabStrip.scrollWidth <= tabStrip.clientWidth) return;
+  event.preventDefault();
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? tabStrip.clientWidth : 1;
+  tabStrip.scrollLeft += event.deltaY * unit;
+}, { passive: false });
 $('host-search').addEventListener('input', renderHosts);
 $('tag-filter').addEventListener('change', renderHosts);
 $('all-hosts').addEventListener('click', () => openGroup(''));
@@ -1395,18 +1950,87 @@ toggleNav.addEventListener('click', () => {
   setNavigationCollapsed(collapsed);
   try { localStorage.setItem('nav-collapsed', String(collapsed)); } catch { /* Use the in-memory choice. */ }
 });
-$('add-tab').addEventListener('click', () => openPalette('hosts').catch((error) => status(message(error))));
-$('palette-button').addEventListener('click', () => openPalette().catch((error) => status(message(error))));
-$('queue-button').addEventListener('click', () => setQueue($('queue').hidden));
-$('terminal-find').addEventListener('submit', (event) => { event.preventDefault(); const query = event.currentTarget.querySelector('input').value; if (query) active?.search.findNext(query); });
-$('close-find').addEventListener('click', () => { $('terminal-find').hidden = true; active?.terminal.focus(); });
-window.addEventListener('keydown', (event) => {
-  if (!event.metaKey || event.isComposing || dialog.open || $('key-dialog').open || vaultStatus.locked) return;
-  if (event.key.toLowerCase() === 'k') { event.preventDefault(); openPalette().catch((error) => status(message(error))); }
-  if (event.key.toLowerCase() === 'f' && active) { event.preventDefault(); $('terminal-find').hidden = false; $('terminal-find').querySelector('input').focus(); }
-  if (active && ['+', '=', '-', '0'].includes(event.key)) {
+function openGlobalSearch() {
+  if (active?.kind === 'new') $('quick-connect-search').focus();
+  else void openPalette().catch((error) => status(message(error)));
+}
+
+function wireTabSearch(formId, resultsId) {
+  const form = $(formId);
+  const search = form.querySelector('input');
+  const results = $(resultsId);
+  form.addEventListener('submit', (event) => {
     event.preventDefault();
-    active.terminal.options.fontSize = event.key === '0' ? 13 : Math.min(28, Math.max(9, active.terminal.options.fontSize + (event.key === '-' ? -1 : 1)));
+    results.querySelector('.tab-choice')?.click();
+  });
+  form.parentElement.addEventListener('keydown', (event) => {
+    if (event.isComposing || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+    const choices = [search, ...results.querySelectorAll('.tab-choice')];
+    const index = choices.indexOf(event.target);
+    if (index === -1 || choices.length < 2) return;
+    event.preventDefault();
+    const step = event.key === 'ArrowDown' ? 1 : -1;
+    choices[(index + step + choices.length) % choices.length].focus();
+  });
+}
+
+wireTabSearch('quick-connect-form', 'quick-connect-results');
+wireTabSearch('session-switcher-form', 'session-switcher-results');
+$('quick-connect-search').addEventListener('input', (event) => {
+  if (active?.kind !== 'new') return;
+  active.query = event.target.value;
+  renderQuickConnect(active);
+});
+$('quick-add-host').addEventListener('click', () => editHost(undefined, active).catch((error) => status(message(error))));
+$('add-tab').addEventListener('click', addNewTab);
+$('switch-tabs').addEventListener('click', chooseSession);
+$('session-switcher-search').addEventListener('input', renderSessionSwitcher);
+const sessionSwitcher = $('session-switcher');
+$('close-switcher').addEventListener('click', () => sessionSwitcher.close());
+sessionSwitcher.addEventListener('click', (event) => {
+  if (event.target !== sessionSwitcher) return;
+  const { left, right, top, bottom } = sessionSwitcher.getBoundingClientRect();
+  if (event.clientX < left || event.clientX > right || event.clientY < top || event.clientY > bottom) sessionSwitcher.close();
+});
+sessionSwitcher.addEventListener('close', () => {
+  $('switch-tabs').setAttribute('aria-expanded', 'false');
+  if (active?.kind === 'new' && !vaultStatus.locked) $('quick-connect-search').focus({ preventScroll: true });
+  else focusTerminal(active);
+});
+$('palette-button').addEventListener('click', openGlobalSearch);
+$('queue-button').addEventListener('click', () => {
+  selectTab(undefined, 'transfers');
+  $('transfers-title').focus();
+});
+$('clear-downloads').addEventListener('click', () => removeDownloadHistory().catch((error) => status(message(error))));
+for (const control of transferFilters) {
+  control.addEventListener('click', () => {
+    transferDirection = control.dataset.direction;
+    for (const filter of transferFilters) filter.setAttribute('aria-pressed', String(filter === control));
+    renderTransferSummary();
+  });
+}
+$('terminal-path').addEventListener('click', () => chooseTerminalPath().catch((error) => status(message(error))));
+$('terminal-bottom').addEventListener('click', () => { active?.terminal?.scrollToBottom(); focusTerminal(active); });
+$('terminal-find').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const query = event.currentTarget.querySelector('input').value;
+  if (query) active?.search?.findNext(query, searchOptions);
+  else active?.search?.clearDecorations();
+});
+$('close-find').addEventListener('click', () => {
+  $('terminal-find').hidden = true;
+  active?.search?.clearDecorations();
+  focusTerminal(active);
+});
+window.addEventListener('keydown', (event) => {
+  if (!event.metaKey || event.isComposing || dialog.open || $('key-dialog').open || sessionSwitcher.open || vaultStatus.locked) return;
+  if (event.key.toLowerCase() === 'k') { event.preventDefault(); openGlobalSearch(); }
+  if (event.key.toLowerCase() === 'j' && tabs.size > 1) { event.preventDefault(); chooseSession(); }
+  if (event.key.toLowerCase() === 'f' && active?.terminal) { event.preventDefault(); $('terminal-find').hidden = false; $('terminal-find').querySelector('input').focus(); }
+  if (active?.terminal && ['+', '=', '-', '0'].includes(event.key)) {
+    event.preventDefault();
+    active.terminal.options.fontSize = event.key === '0' ? terminalFontSize : Math.min(28, Math.max(9, active.terminal.options.fontSize + (event.key === '-' ? -1 : 1)));
     active.fit.fit();
   }
 });

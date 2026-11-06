@@ -1,6 +1,6 @@
 const { createHash, randomUUID } = require('node:crypto');
 const { readFile } = require('node:fs/promises');
-const { posix } = require('node:path');
+const { join, posix } = require('node:path');
 const { Client } = require('ssh2');
 
 function remotePath(value) {
@@ -206,6 +206,55 @@ class WorkspaceSSH {
 
   async mkdir(id, directory, name) {
     await call(await this.sftp(id), 'mkdir', posix.join(remotePath(directory), fileName(name)));
+  }
+
+  async createFile(id, directory, name) {
+    const sftp = await this.sftp(id);
+    const handle = await call(sftp, 'open', posix.join(remotePath(directory), fileName(name)), 'wx', { mode: 0o600 });
+    await call(sftp, 'close', handle);
+  }
+
+  async inspect(id, value) {
+    const path = remotePath(value);
+    const sftp = await this.sftp(id);
+    const attrs = await call(sftp, 'lstat', path);
+    const directory = attrs.isDirectory() || (attrs.isSymbolicLink() &&
+      await call(sftp, 'stat', path).then((target) => target.isDirectory(), () => false));
+    const kind = directory ? 'directory' : attrs.isFile() ? 'file' : 'other';
+    return { kind, path };
+  }
+
+  async directory(id) {
+    const { client } = this.connected(id);
+    const script = await readFile(join(__dirname, 'terminal-directory.sh'), 'utf8');
+    return new Promise((resolve) => {
+      let channel;
+      let output = Buffer.alloc(0);
+      let finished = false;
+      const finish = (path) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        resolve(path);
+        channel?.close();
+      };
+      const timeout = setTimeout(finish, 3000);
+      client.exec(`sh -c '${script.replaceAll("'", "'\\''")}'`, (error, stream) => {
+        if (error) { finish(); return; }
+        if (finished) { stream.close(); return; }
+        channel = stream;
+        stream.on('data', (data) => {
+          if (output.length + data.length > 4097) { finish(); return; }
+          output = Buffer.concat([output, data]);
+        });
+        stream.on('error', () => finish());
+        stream.on('close', (code) => {
+          if (code !== 0 || output.at(-1) !== 0) { finish(); return; }
+          try { finish(remotePath(output.subarray(0, -1).toString('utf8'))); }
+          catch { finish(); }
+        });
+      });
+    });
   }
 
   async command(id, sessionId, request) {

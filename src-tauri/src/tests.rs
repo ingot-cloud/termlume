@@ -143,7 +143,7 @@ async fn vault_and_host_requests_round_trip() {
 #[ignore = "requires an isolated localhost OpenSSH fixture and agent"]
 async fn macos_transport_migration_and_sync() {
     let fixture = PathBuf::from(std::env::var_os("TERMLUME_TEST_FIXTURE").unwrap());
-    let (_profile, ws) = make_workspace(&fixture, Some(fixture.join("legacy.json")));
+    let (profile, ws) = make_workspace(&fixture, Some(fixture.join("legacy.json")));
     assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
     call(
         &ws,
@@ -267,12 +267,46 @@ async fn macos_transport_migration_and_sync() {
     )
     .await;
     assert!(remote_dir.join(&folder).is_dir());
+    let new_file = json!({"id":second,"directory":remote_dir.join(&folder),"name":"new empty.txt"});
+    call(&ws, "files:create-file", new_file.clone()).await;
+    let created = remote_dir.join(&folder).join("new empty.txt");
+    assert_eq!(std::fs::metadata(&created).unwrap().len(), 0);
+    std::fs::write(&created, b"keep original").unwrap();
+    assert!(dispatch(&ws, "files:create-file", new_file).await.is_err());
+    assert_eq!(std::fs::read(&created).unwrap(), b"keep original");
+    for (path, kind) in [(&remote_dir, "directory"), (&log, "file")] {
+        assert_eq!(
+            call(&ws, "files:inspect", json!({"id":second,"path":path})).await["kind"],
+            kind
+        );
+    }
     let session = ws.connections.connected(second).unwrap();
     let source = fixture
         .join("local")
         .join(format!("input-{}.bin", Uuid::new_v4()));
     let data = vec![42; 1024 * 1024];
     std::fs::write(&source, &data).unwrap();
+    let drop_request = json!({
+        "id": second, "direction": "up", "directory": remote_dir.join(&folder),
+        "dropTicket": ws.transfers.capture_drop(vec![source.clone()])
+    });
+    let prepared = call(&ws, "files:prepare", drop_request.clone()).await;
+    assert!(dispatch(&ws, "files:prepare", drop_request).await.is_err());
+    call(
+        &ws,
+        "files:enqueue",
+        json!({"ticket":prepared["ticket"],"policy":"skip"}),
+    )
+    .await;
+    let result = until(&mut rx, |e| {
+        e["type"] == "transfer" && e["bytes"] == 1048576 && e["status"] == "done"
+    })
+    .await;
+    assert_eq!(result["sessionId"], second.to_string());
+    assert_eq!(
+        std::fs::read(remote_dir.join(&folder).join(source.file_name().unwrap())).unwrap(),
+        data
+    );
     let remote = remote_dir
         .join(&folder)
         .join("round trip.bin")
@@ -310,6 +344,84 @@ async fn macos_transport_migration_and_sync() {
         assert_eq!(result["bytes"], 1048576);
     }
     assert_eq!(std::fs::read(&output).unwrap(), data);
+    let tree = remote_dir.join("download-tree");
+    std::fs::create_dir_all(tree.join("nested/empty")).unwrap();
+    std::fs::write(tree.join("nested/with spaces.txt"), b"directory download").unwrap();
+    std::os::unix::fs::symlink(&log, tree.join("ignored-link")).unwrap();
+    let local_tree = fixture.join("local/download-tree");
+    std::fs::create_dir(&local_tree).unwrap();
+    std::fs::write(local_tree.join("keep"), b"original").unwrap();
+    let prepared = ws
+        .transfers
+        .stage(
+            session,
+            false,
+            vec![(tree.to_string_lossy().into_owned(), local_tree.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared["files"][0]["skipped"], 1);
+    assert_eq!(prepared["files"][0]["canReplace"], false);
+    call(
+        &ws,
+        "files:enqueue",
+        json!({"ticket":prepared["ticket"],"policy":"keep"}),
+    )
+    .await;
+    let result = until(&mut rx, |e| {
+        e["type"] == "transfer"
+            && matches!(e["status"].as_str(), Some("done" | "skipped" | "failed"))
+    })
+    .await;
+    assert_eq!(result["status"], "done", "{result}");
+    let downloaded = local_tree.with_file_name("download-tree (2)");
+    assert!(downloaded.join("nested/empty").is_dir());
+    assert_eq!(
+        std::fs::read(downloaded.join("nested/with spaces.txt")).unwrap(),
+        b"directory download"
+    );
+    assert!(!downloaded.join("ignored-link").exists());
+    assert_eq!(std::fs::read(local_tree.join("keep")).unwrap(), b"original");
+    let history = call(&ws, "files:history", Value::Null).await;
+    let records = history.as_array().unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["direction"] == "up")
+            .count(),
+        3
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["direction"] == "down")
+            .count(),
+        3
+    );
+    assert!(records
+        .iter()
+        .all(|record| record["finishedAt"].as_u64().is_some()));
+    let removed = call(&ws, "files:remove-history", result["id"].clone()).await;
+    assert_eq!(removed, json!([result["id"]]));
+    let cleared = call(&ws, "files:remove-history", Value::Null).await;
+    assert_eq!(cleared.as_array().unwrap().len(), 2);
+    assert!(downloaded.join("nested/with spaces.txt").is_file());
+    assert!(output.is_file());
+    let remaining = call(&ws, "files:history", Value::Null).await;
+    assert_eq!(remaining.as_array().unwrap().len(), 3);
+    assert!(remaining
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|record| record["direction"] == "up"));
+    let reopened = Store::open(profile.path(), None).unwrap();
+    assert!(reopened.data().is_err());
+    let persisted: Data = reopened
+        .envelope
+        .unwrap()
+        .decode(ws.store.lock().unwrap().key.as_ref().unwrap(), "local")
+        .unwrap();
+    assert_eq!(json!(persisted.transfer_history), remaining);
     let password_fixture: Value =
         serde_json::from_slice(&std::fs::read(fixture.join("password-server.json")).unwrap())
             .unwrap();
