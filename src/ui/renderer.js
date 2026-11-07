@@ -34,7 +34,7 @@ let draggingTab;
 let splitGrip;
 let uiPreferences={theme:"dark",terminalTheme:"dark",fontFamily:"SFMono-Regular, Menlo, monospace",fontSize:14,recordCommands:false};
 const recordingSessions=new Set();
-const {retryDelay,automaticCredential}=window.workspaceState;
+const {retryDelay,automaticCredential,filterCommands,pathBreadcrumbs}=window.workspaceState;
 const forwardRuns = new Map();
 const forwardVersions = new Map();
 let forwardVersion = 0;
@@ -1019,19 +1019,34 @@ async function manageLayouts() {
 }
 
 async function manageSnippets(session) {
+  const attempt = session?.attempts;
   while(!vaultStatus.locked) {
     const snippets=await api.snippets.list();let choice;const search=input('','search');search.placeholder='搜索名称、标签和命令';const list=node('div','forward-list');
     const render=()=>{const query=search.value.toLowerCase();list.replaceChildren(...snippets.filter(s=>`${s.name} ${s.command} ${s.tags.join(' ')}`.toLowerCase().includes(query)).map(s=>node('section','forward-rule',node('strong','',s.name),node('pre','operation-results',s.command),node('div','forward-actions',
-      ...((session?.status==='ready')?[button('粘贴',()=>{choice={paste:s};dialog.close();},'outlined'),button('执行…',()=>{choice={run:s};dialog.close();},'outlined')]:[]),button('编辑',()=>{choice={snippet:s};dialog.close();},'outlined'),button('删除',()=>{choice={remove:s};dialog.close();},'outlined danger')))));};
+      ...((session?.status==='ready')?[...(!/[\r\n]/.test(s.command) ? [button('粘贴',()=>{choice={paste:s};dialog.close();},'outlined')] : []),button('执行…',()=>{choice={run:s};dialog.close();},'outlined')]:[]),button('编辑',()=>{choice={snippet:s};dialog.close();},'outlined'),button('删除',()=>{choice={remove:s};dialog.close();},'outlined danger')))));};
     search.addEventListener('input',render);render();await prompt('命令库',[search,list],'关闭',()=>true,[button('新建命令',()=>{choice={create:true};dialog.close();},'outlined')]);if(!choice)break;
-    if(choice.paste){if(/[\r\n]/.test(choice.paste.command)){await confirm('多行命令', '粘贴仅支持单行命令，避免换行触发远端执行；多行命令请使用执行并预览。','知道了');continue;}if(session.status==='ready'){await api.ssh.input({id:session.id,data:choice.paste.command});selectTab(session);}return;}
-    if(choice.run){const s=choice.run;const attempt=session.attempts;if(await confirm('执行保存的命令',`${session.host.name} · ${endpoint(session.host)}\n以当前 SSH 用户在独立命令通道执行：\n${s.command}`,'执行')){
-      if(!readySession(session,attempt))throw new Error('SSH 会话已变化。');const tab={id:sessionId(),kind:'command',sessionId:session.id,host:session.host,action:'custom',status:'connecting'};attachTerminal(tab);tabs.set(tab.id,tab);selectTab(tab);try{await api.snippets.run({id:tab.id,sessionId:session.id,snippetId:s.id,expected:s});}catch(error){updateSession(tab,'failed',message(error));}
-    }return;}
+    if(choice.paste){await useSnippet(session,choice.paste,true,attempt);return;}
+    if(choice.run){await useSnippet(session,choice.run,false,attempt);return;}
     if(choice.remove){if(await confirm('删除命令',`删除「${choice.remove.name}」？`,'删除'))await api.snippets.remove({snippet:choice.remove,expected:choice.remove});continue;}
     const s=choice.snippet;const name=input(s?.name);const tags=input(s?.tags.join(', ')||'');const command=node('textarea');command.rows=8;command.value=s?.command||'';
     await prompt(s?'编辑命令':'新建命令',[field('名称',name),field('标签（逗号分隔）',tags),field('命令文本',command)],'保存命令',()=>api.snippets.save({snippet:{id:s?.id,name:name.value,command:command.value,tags:tags.value.split(/[,，]/).map(t=>t.trim()).filter(Boolean)},expected:s}));
   }
+}
+
+async function useSnippet(session, snippet, paste = false, attempt = session?.attempts) {
+  if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择目标。');
+  if (paste) {
+    if (/[\r\n]/.test(snippet.command)) throw new Error('多行命令请使用执行预览。');
+    await api.ssh.input({id: session.id, data: snippet.command});
+    selectTab(session);
+    return;
+  }
+  if (!await confirm('执行保存的命令', `${session.host.name} · ${endpoint(session.host)}\n以当前 SSH 用户在独立命令通道执行：\n${snippet.command}`, '执行')) return;
+  if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择目标。');
+  const tab = {id: sessionId(), kind: 'command', sessionId: session.id, host: session.host, action: 'custom', status: 'connecting'};
+  attachTerminal(tab); tabs.set(tab.id, tab); selectTab(tab);
+  try { await api.snippets.run({id: tab.id, sessionId: session.id, snippetId: snippet.id, expected: snippet}); }
+  catch (error) { updateSession(tab, 'failed', message(error)); }
 }
 
 async function manageGroups() {
@@ -1375,12 +1390,7 @@ function closeHostMenu(restoreFocus = false) {
 
 function openHostMenu(host, anchor, x, y) {
   if (vaultStatus.locked || dialog.open) return;
-  closeHostMenu();
-  closeDropdown();
   selectHost(host);
-  const panel = node('div', 'host-menu');
-  panel.setAttribute('role', 'menu');
-  panel.setAttribute('aria-label', `${host.name} 的操作`);
   const actions = [
     ['连接 / 切换已有会话', () => openHost(host)],
     ['在新标签连接', () => openHost(host, { force: true })],
@@ -1388,9 +1398,27 @@ function openHostMenu(host, anchor, x, y) {
     ...(api.identities ? [['共享身份…',()=>manageIdentities()],...(!host.identityId?[['保存为共享身份…',()=>editIdentity(undefined,host)]]:[])] : []),
     ...(api.forwards ? [['端口转发…', () => manageForwards(host)]] : [])
   ];
-  for (const [label, run] of actions) {
-    const action = button(label, () => { closeHostMenu(true); return run(); });
+  showActionMenu(`${host.name} 的操作`, anchor, actions.map(([label, run]) => button(label, run)), x, y);
+}
+
+function menuButton(label, actions) {
+  const anchor = button(label, () => showActionMenu(label, anchor, actions), 'outlined');
+  anchor.setAttribute('aria-haspopup', 'menu');
+  anchor.setAttribute('aria-expanded', 'false');
+  return anchor;
+}
+
+function showActionMenu(label, anchor, actions, x, y) {
+  if (vaultStatus.locked || dialog.open) return;
+  if (hostMenu?.anchor === anchor) { closeHostMenu(true); return; }
+  closeHostMenu();
+  closeDropdown();
+  const panel = node('div', 'host-menu');
+  panel.setAttribute('role', 'menu');
+  panel.setAttribute('aria-label', label);
+  for (const action of actions) {
     action.setAttribute('role', 'menuitem');
+    action.addEventListener('click', () => closeHostMenu(true), { capture: true, once: true });
     panel.append(action);
   }
   document.body.append(panel);
@@ -1399,12 +1427,14 @@ function openHostMenu(host, anchor, x, y) {
   panel.style.top = `${Math.max(8, Math.min(y ?? rect.bottom + 5, innerHeight - panel.offsetHeight - 8))}px`;
   hostMenu = { panel, anchor };
   anchor.setAttribute('aria-expanded', 'true');
-  panel.firstElementChild.focus();
+  panel.tabIndex = -1;
+  (panel.querySelector('button:not(:disabled)') || panel).focus();
   panel.addEventListener('keydown', (event) => {
-    const choices = [...panel.children];
+    const choices = [...panel.querySelectorAll('button:not(:disabled)')];
     const index = choices.indexOf(document.activeElement);
     if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
       event.preventDefault();
+      if (!choices.length) return;
       const next = event.key === 'Home' ? 0 : event.key === 'End' ? choices.length - 1
         : (index + (event.key === 'ArrowDown' ? 1 : -1) + choices.length) % choices.length;
       choices[next].focus();
@@ -1459,7 +1489,8 @@ function renderHosts() {
   const searching = Boolean(query || tag);
   const matching = scope.filter((host) => (!tag || host.tags?.includes(tag)) && hostMatches(host, query, target));
   const visibleHosts = currentGroup || searching ? matching : matching.filter((host) => !host.group);
-  if (!visibleHosts.some((host) => host.id === selectedHostId)) selectedHostId = '';
+  const recentHosts = !currentGroup && !searching ? [...hosts].filter(h => recent.has(h.id)).sort(recentFirst).slice(0, 4) : [];
+  if (![...visibleHosts, ...recentHosts].some((host) => host.id === selectedHostId)) selectedHostId = '';
   visibleHosts.sort(recentFirst);
   const matchingGroups = new Set(matching.map((host) => host.group));
   const visibleGroups = [...groups]
@@ -1477,9 +1508,11 @@ function renderHosts() {
   updateHostActions();
   const list = $('host-list');
   const sections = [];
+  if (recentHosts.length) sections.push(hostSection('最近连接', recentHosts.map(host => hostCard(host, true))));
   if (visibleGroups.length) sections.push(hostSection('分组', visibleGroups.map(([group, count]) => groupCard(group, count))));
-  if (visibleHosts.length) sections.push(hostSection(searching ? '匹配的主机' : '主机', visibleHosts.map((host) => hostCard(host, searching && !currentGroup))));
-  else if (!searching && visibleGroups.length) sections.push(hostSection('主机', [node('p', 'muted', '暂无未分组的主机')]));
+  const otherHosts = visibleHosts.filter(host => !recentHosts.includes(host));
+  if (otherHosts.length) sections.push(hostSection(searching ? '匹配的主机' : '主机', otherHosts.map((host) => hostCard(host, searching && !currentGroup))));
+  else if (!searching && visibleGroups.length && !recentHosts.length) sections.push(hostSection('主机', [node('p', 'muted', '暂无未分组的主机')]));
   if (!sections.length) {
     sections.push(searching
       ? node('div', 'empty-state', settingsIcon('server'), node('strong', '', draft ? '新 SSH 地址' : '没有匹配的结果'),
@@ -1488,6 +1521,7 @@ function renderHosts() {
         node('p', '', '保存连接信息后，可从这里打开 SSH 会话。'), button('新建主机', () => editHost(), 'primary')));
   }
   list.replaceChildren(...sections);
+  renderSidebar();
 }
 
 async function importHosts(csv=false) {
@@ -1574,9 +1608,11 @@ function attachTerminal(tab) {
 function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session' : 'hosts') {
   closeDropdown();
   closeHostMenu();
+  $('sidebar-tools').open = false;
   active = tab;
   if (tab) tab.unread = false;
   workspace.dataset.view = view;
+  updateNavigation();
   const library = $('library-button');
   library.dataset.active = String(!tab);
   if (view === 'hosts') library.setAttribute('aria-current', 'page');
@@ -1709,6 +1745,48 @@ function renderTabs() {
   }
   $('switch-tabs').hidden = tabs.size < 2;
   updateTabEdges();
+  renderSidebar();
+}
+
+function renderSidebar() {
+  const sessions = [...tabs.values()];
+  $('session-count').textContent = String(sessions.length);
+  const sessionList = $('sidebar-sessions');
+  for (const item of [...sessionList.children]) if (!sessions.some(tab => tab.sidebarRow === item)) item.remove();
+  for (const [index, tab] of sessions.entries()) {
+    if (!tab.sidebarRow) {
+      tab.sidebarRow = button('', () => selectTab(tab), 'sidebar-session');
+      tab.sidebarRow.append(node('span', 'tab-status'), node('span', 'sidebar-label text-ellipsis'), node('span', 'tab-unread', '新'));
+    }
+    const choice = tab.sidebarRow;
+    const state = sessionLabels[tab.status] || '选择主机';
+    const label = `${tabTitle(tab)} · ${state}${tab.unread ? ' · 有未读输出' : ''}`;
+    choice.setAttribute('aria-label', label); choice.title = label;
+    choice.dataset.status = tab.status || '';
+    choice.querySelector('.sidebar-label').textContent = tabTitle(tab);
+    choice.querySelector('.tab-unread').hidden = !tab.unread;
+    choice.setAttribute('aria-current', String(tab === active));
+    if (sessionList.children[index] !== choice) sessionList.insertBefore(choice, sessionList.children[index] || null);
+  }
+  if (!sessions.length && !sessionList.firstChild) sessionList.append(node('p', 'sidebar-empty', '从主机打开会话'));
+  const groups = [...new Set([...groupAssets.map(g => g.path), ...hosts.map(h => h.group)].filter(Boolean))].sort((a,b) => a.localeCompare(b, 'zh-CN'));
+  $('sidebar-groups').hidden = !groups.length;
+  const groupList = $('sidebar-group-list');
+  const groupKey = JSON.stringify(groups.map(group => [group, hosts.filter(h => h.group === group).length]));
+  if (groupList.dataset.key !== groupKey) {
+    groupList.dataset.key = groupKey;
+    groupList.replaceChildren(...groups.map(group => {
+      const choice = button('', () => { selectTab(undefined, 'hosts'); openGroup(group); }, 'sidebar-group', group);
+      choice.append(chromeIcon('folder'), summaryText('span', group), node('small', '', String(hosts.filter(h => h.group === group).length)));
+      choice.dataset.group = group;
+      return choice;
+    }));
+  }
+  for (const choice of groupList.children) choice.setAttribute('aria-current', String(workspace.dataset.view === 'hosts' && currentGroup === choice.dataset.group));
+  const sync = $('sidebar-sync');
+  const label = vaultStatus.gitMigration ? '继续 Git 迁移…' : vaultStatus.remote ? '立即同步保险库' : '保险库与 Git 同步';
+  if (sync.title !== label || !sync.querySelector('svg')) sync.replaceChildren(chromeIcon('sync'), node('span', 'sidebar-label text-ellipsis', label));
+  sync.title = label;
 }
 
 function tabChoice(tab) {
@@ -1940,7 +2018,7 @@ function renderContext() {
   const controls = $('session-actions');
   controls.replaceChildren();
   if(tab.reconnectTimer&&tab.status==='closed') controls.append(button('取消自动重连',()=>{clearTimeout(tab.reconnectTimer);tab.reconnectTimer=undefined;tab.reconnectCancelled=true;renderContext();}));
-  if (tab.kind === 'shell' && tab.status === 'closed') controls.append(button(tab.promptForPassword ? '重新输入密码' : tab.attempts ? '重连' : '连接', () => connect(tab)));
+  if (tab.kind === 'shell' && ['idle', 'closed', 'failed'].includes(tab.status)) controls.append(button(tab.promptForPassword ? '重新输入密码' : tab.attempts ? '重连' : '连接', () => connect(tab)));
   if (tab.kind === 'command') {
     if (session) controls.append(button('返回终端', () => selectTab(session), 'outlined'));
     if (tab.action === 'follow' && ['running', 'connecting'].includes(tab.status)) controls.append(button('停止跟踪', () => api.commands.stop(tab.id)));
@@ -1948,15 +2026,17 @@ function renderContext() {
     const output = [...tabs.values()].findLast((entry) => entry.kind === 'command' && entry.sessionId === tab.id);
     if (output) controls.append(button('查看输出', () => selectTab(output), 'outlined', `查看输出 · ${actionLabels[output.action]}`));
   }
+  const moreActions = [];
+  let runningForwards = 0;
   if (api.forwards && session) {
     const running = [...forwardRuns.values()].filter((job) => job.sessionId === session.id && ['running', 'stopping'].includes(job.status)).length;
-    controls.append(button(`端口转发${running ? ` · ${running}` : ''}`, () => manageForwards(session.host, session)));
+    runningForwards = running;
+    moreActions.push(button(`端口转发${running ? ` · ${running}` : ''}`, () => manageForwards(session.host, session)));
   }
-  if(api.logs&&session?.status==='ready') controls.append(button(recordingSessions.has(session.id)?'停止录制':'记录输出',()=>toggleRecording(session)));
-  if(api.history&&session) controls.append(button('历史',()=>commandHistory(session)));
+  if(api.logs&&session?.status==='ready') moreActions.push(button(recordingSessions.has(session.id)?'停止录制':'记录输出',()=>toggleRecording(session)));
+  if(api.history&&session) moreActions.push(button('历史',()=>commandHistory(session)));
   if(session?.kind==='shell') controls.append(button(splitLayout?.panes.includes(session.id)?'分屏设置':'分屏…',()=>configureSplit(session)));
-  if(api.layouts) controls.append(button('布局',()=>manageLayouts()));
-  if(api.snippets&&session) controls.append(button('命令库',()=>manageSnippets(session)));
+  if(api.layouts) moreActions.push(button('布局',()=>manageLayouts()));
   const shortcuts = button('快捷命令', () => openPalette('commands'));
   shortcuts.disabled = session?.status !== 'ready';
   controls.append(shortcuts);
@@ -1965,6 +2045,10 @@ function renderContext() {
   fileButton.setAttribute('aria-controls', 'files');
   fileButton.disabled = !session;
   controls.append(fileButton);
+  if (moreActions.length) {
+    const more = menuButton(`更多${runningForwards ? ` · 转发 ${runningForwards}` : ''}${recordingSessions.has(session?.id) ? ' · 录制中' : ''} ⋯`, moreActions);
+    controls.append(more);
+  }
 
   const notice = $('session-notice');
   if (tab.status === 'trust') {
@@ -2140,41 +2224,58 @@ function updateSession(tab, next, detail = '') {
 async function openPalette(scope = 'all') {
   const source = active;
   const session = origin();
+  const attempt = session?.attempts;
+  const snippets = api.snippets ? await api.snippets.list() : [];
+  if (vaultStatus.locked || active !== source || dialog.open) return;
   const search = input('', 'search');
-  const searchLabel = scope === 'commands' ? '搜索快捷命令' : '搜索主机或命令';
-  search.placeholder = `${searchLabel}…`;
+  const searchLabel = scope === 'commands' ? '搜索内置动作、命令名称、标签和内容' : '搜索主机、会话、命令或工具';
+  search.placeholder = searchLabel;
   search.setAttribute('aria-label', searchLabel);
   const choices = node('div', 'palette-list');
-  let selected;
-  let entries;
-  const choose = (run) => { selected = run; dialog.close(); };
+  let selected, entries;
+  const choose = run => { selected = run; dialog.close(); };
   const update = () => {
     const all = [];
+    const add = (group, label, detail, run, keywords = '') => all.push({group, label, detail, run, keywords});
     if (scope !== 'commands') {
-      for (const host of [...hosts].sort(recentFirst)) all.push([host.name, [endpoint(host), host.group, ...(host.tags || [])].filter(Boolean).join(' · '), () => openHost(host)]);
+      for (const tab of [...tabs.values()].sort((a,b) => (b.used || 0) - (a.used || 0)))
+        add('已打开的会话', tabTitle(tab), sessionLabels[tab.status] || '选择主机', () => selectTab(tab), tab.host ? endpoint(tab.host) : '');
+      for (const host of [...hosts].sort(recentFirst))
+        add('主机', host.name, [endpoint(host), host.group, ...(host.tags || [])].filter(Boolean).join(' · '), () => openHost(host), host.note);
     }
-    if (readySession(session)) {
-      for (const [action, label] of Object.entries(actionLabels)) all.push([label, session.host.name, () => configureCommand(session, action)]);
-      all.push(['在新标签连接', session.host.name, () => openHost(session.host, { force: true })]);
+    if (readySession(session, attempt)) {
+      for (const [action, label] of Object.entries(actionLabels).filter(([action]) => action !== 'custom'))
+        add('内置动作', label, session.host.name, () => { if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择命令。'); return configureCommand(session, action); });
+      for (const snippet of snippets) {
+        add('保存的命令', `执行 · ${snippet.name}`, session.host.name, () => useSnippet(session, snippet, false, attempt), `${snippet.command} ${snippet.tags.join(' ')}`);
+        if (!/[\r\n]/.test(snippet.command)) add('保存的命令', `粘贴 · ${snippet.name}`, `${session.host.name} · 不发送回车`, () => useSnippet(session, snippet, true, attempt), `${snippet.command} ${snippet.tags.join(' ')}`);
+      }
+      add('会话操作', '在新标签连接', session.host.name, () => openHost(session.host, {force: true}));
     }
-    const q = search.value.trim().toLowerCase();
-    entries = all.filter(([label, detail]) => `${label} ${detail}`.toLowerCase().includes(q));
-    choices.replaceChildren(...entries.map(([label, detail, run]) => {
+    if (api.snippets) add('工具', '管理命令库…', '新增、编辑与整理命令', () => manageSnippets(session));
+    if (scope !== 'commands') {
+      add('工具', '新建主机…', '保存连接信息', () => editHost());
+      if (api.layouts) add('工具', '布局模板…', '保存或恢复标签与分屏', manageLayouts);
+      if (api.logs) add('工具', '会话日志…', '查找本机输出记录', manageLogs);
+      if (api.preferences) add('工具', '偏好设置…', '主题、终端字体与字号', editPreferences);
+      add('工具', '保险库与 Git 同步', '加密、备份及同步状态', () => selectTab(undefined, 'vault'));
+    }
+    entries = filterCommands(all, search.value);
+    choices.replaceChildren();
+    let group;
+    for (const {group: section, label, detail, run} of entries) {
+      if (group !== section) { choices.append(node('h3', 'palette-group', section)); group = section; }
       const choice = button('', () => choose(run), 'palette-choice');
-      choice.replaceChildren(summaryText('span', label), summaryText('small', detail));
-      return choice;
-    }));
-    if (!entries.length) {
-      const hint = node('p', 'muted', '没有可用的结果。');
-      hint.setAttribute('role', 'status');
-      choices.append(hint);
+      choice.append(summaryText('span', label), summaryText('small', detail));
+      choices.append(choice);
     }
+    if (!entries.length) choices.append(node('p', 'muted', '没有匹配的结果。'));
     const submit = search.form?.querySelector('button[type="submit"]');
     if (submit) submit.disabled = !entries.length;
   };
   search.addEventListener('input', update);
-  const title = scope === 'commands' ? '快捷命令' : '主机与命令';
-  const selection = prompt(title, [search, choices], '打开首项', () => entries[0]?.[2]);
+  const target = session ? node('p', 'palette-target muted', `命令目标：${session.host.name} · ${endpoint(session.host)}${readySession(session, attempt) ? '' : ' · 连接后可执行命令'}`) : node('p', 'palette-target muted', '连接主机后可粘贴或执行保存的命令');
+  const selection = prompt(scope === 'commands' ? '快捷命令' : '快速查找', [search, target, choices], '打开首项', () => entries[0]?.run);
   wireSearchChoices(search.form, search, choices, '.palette-choice');
   update();
   const first = await selection;
@@ -2413,13 +2514,14 @@ function ensureFiles(tab) {
 
 async function loadFiles(tab, directory) {
   const files = tab.files;
+  const attempt = tab.attempts;
   const generation = files.generation = (files.generation || 0) + 1;
   files.loading = true;
   files.error = '';
   if (origin() === tab) renderFiles();
   try {
     const result = await api.files.list({ id: tab.id, directory });
-    if (files.generation !== generation) return;
+    if (files.generation !== generation || !readySession(tab, attempt)) return;
     if (files.directory !== result.directory) {
       files.selected.clear();
       files.scrollTop = 0;
@@ -2443,6 +2545,7 @@ function bytes(size) {
 
 function renderFiles() {
   const panel = $('files');
+  if (hostMenu && panel.contains(hostMenu.anchor)) closeHostMenu();
   const tab = origin();
   const open = filesOpen && Boolean(tab);
   panel.inert = !open;
@@ -2465,7 +2568,23 @@ function renderFiles() {
   form.addEventListener('submit', (event) => { event.preventDefault(); void loadFiles(tab, directory.value); });
   const parent = button('↑', () => loadFiles(tab, (files.directory || '').replace(/\/[^/]+\/?$/, '') || '/'), '', '上一级');
   parent.disabled = !files.directory || files.directory === '/';
+  const shellDirectory = button('终端目录', async () => {
+    const attempt = tab.attempts;
+    const path = await currentTerminalDirectory(tab);
+    if (origin() !== tab || !readySession(tab, attempt)) return;
+    if (!path) throw new Error('尚未识别终端目录，可直接输入远端路径。');
+    await loadFiles(tab, path);
+  }, '', '打开当前终端目录');
   panel.append(node('div', 'file-address', parent, form, button('↻', () => loadFiles(tab, files.directory), '', '刷新远端文件')));
+  const crumbs = node('nav', 'file-breadcrumbs');
+  crumbs.setAttribute('aria-label', '远端目录层级');
+  for (const {name, path} of pathBreadcrumbs(files.directory)) {
+    const crumb = button(name, () => loadFiles(tab, path));
+    crumb.title = path;
+    if (path === files.directory) crumb.setAttribute('aria-current', 'location');
+    crumbs.append(crumb);
+  }
+  panel.append(node('div', 'file-location', crumbs, shellDirectory));
   if (files.loading) { panel.append(node('p', 'inline-status muted', '正在读取目录…')); return; }
   if (files.error) panel.append(node('p', 'inline-status danger', files.error));
   if (!files.directory || !files.entries) return;
@@ -2513,9 +2632,10 @@ function renderFiles() {
       || a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
   const clear = button('清空选择', () => { files.selected.clear(); renderEntries(); });
   const selectedCount = node('small', 'muted');
+  const selectedActions = menuButton('所选项 ⋯', [follow, tail, ...(api.files.mutations ? [rename, remove] : []), ...(api.editors ? [edit] : [])]);
   const updateSelection = () => {
     const count = selection().length;
-    download.disabled = count === 0;
+    download.disabled = selectedActions.disabled = count === 0;
     edit.disabled=!logPath();
     rename.disabled=count!==1;remove.disabled=count===0;
     follow.disabled = tail.disabled = !logPath();
@@ -2529,8 +2649,9 @@ function renderFiles() {
     all.indeterminate = checked > 0 && checked < selectableEntries.length;
   };
   updateSelection();
-  panel.append(node('div', 'file-toolbar', node('div', 'file-tools', upload, ...(api.files.directoryUploads?[uploadFolder]:[]), download, follow, tail),
-    node('div', 'file-tools file-create', mkdir, touch, ...(api.files.mutations?[rename,remove]:[]), ...(api.editors?[edit,editTasks]:[]),operationResults, selectedCount, clear)));
+  panel.append(node('div', 'file-toolbar', node('div', 'file-tools', upload, download,
+    menuButton('新建 / 上传…', [mkdir, touch, ...(api.files.directoryUploads ? [uploadFolder] : [])]), selectedActions),
+    node('div', 'file-tools file-create', ...(api.editors ? [editTasks] : []), operationResults, selectedCount, clear)));
   panel.append(node('div', 'file-filters', filter, selectControl(sorting)),
     node('div', 'file-options', node('label', 'checkbox-row', all, '全选可见'), node('label', 'checkbox-row', hidden, '显示隐藏项')));
   panel.append(node('div', 'file-columns muted', node('span', '', '名称'), node('span', '', '大小 / 类型')));
@@ -2916,6 +3037,7 @@ for (const [id, run] of [
 });
 document.addEventListener('pointerdown', (event) => {
   if (hostMenu && !hostMenu.panel.contains(event.target) && !hostMenu.anchor.contains(event.target)) closeHostMenu();
+  if ($('sidebar-tools').open && !$('sidebar-tools').contains(event.target)) $('sidebar-tools').open = false;
 }, true);
 document.addEventListener('focusin', (event) => {
   if (hostMenu && !hostMenu.panel.contains(event.target) && event.target !== hostMenu.anchor) closeHostMenu();
@@ -3022,21 +3144,27 @@ hostLayout.addEventListener('change', () => {
   try { localStorage.setItem('host-layout', hostLayout.value); } catch { /* Use the in-memory choice. */ }
 });
 const toggleNav = $('toggle-nav');
+let navigationPreference;
+try { const saved = localStorage.getItem('nav-collapsed'); if (saved !== null) navigationPreference = saved === 'true'; } catch { /* Use adaptive navigation. */ }
 function setNavigationCollapsed(collapsed) {
   workspace.dataset.navCollapsed = String(collapsed);
   toggleNav.setAttribute('aria-expanded', String(!collapsed));
   toggleNav.title = collapsed ? '展开导航' : '收起导航';
   toggleNav.setAttribute('aria-label', toggleNav.title);
 }
-try { setNavigationCollapsed(localStorage.getItem('nav-collapsed') === 'true'); } catch { /* The sidebar starts expanded. */ }
+function updateNavigation() {
+  const compact = innerWidth <= 1100 && ['session', 'new-tab'].includes(workspace.dataset.view);
+  setNavigationCollapsed(navigationPreference ?? compact);
+}
+updateNavigation();
+window.addEventListener('resize', updateNavigation);
 toggleNav.addEventListener('click', () => {
-  const collapsed = workspace.dataset.navCollapsed !== 'true';
-  setNavigationCollapsed(collapsed);
-  try { localStorage.setItem('nav-collapsed', String(collapsed)); } catch { /* Use the in-memory choice. */ }
+  navigationPreference = workspace.dataset.navCollapsed !== 'true';
+  updateNavigation();
+  try { localStorage.setItem('nav-collapsed', String(navigationPreference)); } catch { /* Use the in-memory choice. */ }
 });
 function openGlobalSearch() {
-  if (active?.kind === 'new') $('quick-connect-search').focus();
-  else void openPalette().catch((error) => status(message(error)));
+  void openPalette().catch((error) => status(message(error)));
 }
 
 function wireSearchChoices(region, search, results, selector) {
@@ -3071,6 +3199,15 @@ $('quick-connect-search').addEventListener('input', (event) => {
 });
 $('quick-add-host').addEventListener('click', () => editHost(undefined, active).catch((error) => status(message(error))));
 $('add-tab').addEventListener('click', addNewTab);
+$('sidebar-new-session').addEventListener('click', addNewTab);
+$('sidebar-sync').addEventListener('click', async () => {
+  const control = $('sidebar-sync');
+  if (control.disabled || vaultStatus.locked) return;
+  if (!vaultStatus.remote || vaultStatus.gitMigration) { selectTab(undefined, 'vault'); return; }
+  control.disabled = true;
+  try { await syncVault(); } catch (error) { status(message(error)); }
+  finally { control.disabled = false; }
+});
 $('switch-tabs').addEventListener('click', chooseSession);
 $('session-switcher-search').addEventListener('input', renderSessionSwitcher);
 const sessionSwitcher = $('session-switcher');
@@ -3113,9 +3250,12 @@ $('close-find').addEventListener('click', () => {
 });
 window.addEventListener('keydown', (event) => {
   if (event.defaultPrevented || event.isComposing || dialog.open || $('key-dialog').open || sessionSwitcher.open || vaultStatus.locked || hostMenu) return;
+  if (event.key === 'Escape' && $('sidebar-tools').open) { event.preventDefault(); $('sidebar-tools').open = false; $('sidebar-tools').querySelector('summary').focus(); return; }
   if (event.key === 'Escape' && !$('terminal-find').hidden) { event.preventDefault(); $('close-find').click(); return; }
   if (!event.metaKey || event.ctrlKey || event.altKey) return;
   const key = event.key.toLowerCase();
+  if (key === 'b' && !event.shiftKey) { event.preventDefault(); toggleNav.click(); return; }
+  if (key === 'e' && !event.shiftKey && origin()) { event.preventDefault(); toggleFiles(); return; }
   if (key === 't' && !event.shiftKey) { event.preventDefault(); void addNewTab(); return; }
   if (key === 'w' && !event.shiftKey && active) { event.preventDefault(); void closeTab(active).catch((error) => status(message(error))); return; }
   if (!event.shiftKey && /^[1-9]$/.test(key)) {
@@ -3143,15 +3283,15 @@ window.addEventListener('keydown', (event) => {
 api.vault.state().then((state) => { applyVaultState(state); if (!state.locked) return refreshHosts(); }).catch((error) => status(message(error)));
 selectTab();
 
-if(api.groups) $('workspace-nav').append(sidebarAction('分组管理','group',()=>manageGroups()));
-if(api.identities) $('workspace-nav').append(sidebarAction('共享身份','key',()=>manageIdentities()));
+if(api.groups) $('workspace-tools').append(sidebarAction('分组管理','group',()=>manageGroups()));
+if(api.identities) $('workspace-tools').append(sidebarAction('共享身份','key',()=>manageIdentities()));
 
-if(api.snippets) $('workspace-nav').append(sidebarAction('命令库','terminal',()=>manageSnippets()));
+if(api.snippets) $('workspace-tools').append(sidebarAction('命令库','terminal',()=>manageSnippets(origin())));
 
-if(api.layouts) $('workspace-nav').append(sidebarAction('布局模板','new-tab',()=>manageLayouts()));
+if(api.layouts) $('workspace-tools').append(sidebarAction('布局模板','new-tab',()=>manageLayouts()));
 
-if(api.preferences){$('workspace-nav').append(sidebarAction('偏好设置','settings',()=>editPreferences()));matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{if(uiPreferences.theme==='system')applyPreferences();});}
-if(api.logs) $('workspace-nav').append(sidebarAction('会话日志','file',()=>manageLogs()));
+if(api.preferences){$('workspace-tools').append(sidebarAction('偏好设置','settings',()=>editPreferences()));matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{if(uiPreferences.theme==='system')applyPreferences();});}
+if(api.logs) $('workspace-tools').append(sidebarAction('会话日志','file',()=>manageLogs()));
 
-if(api.trust) $('workspace-nav').append(sidebarAction('Known Hosts','lock',()=>manageTrust()));
+if(api.trust) $('workspace-tools').append(sidebarAction('Known Hosts','lock',()=>manageTrust()));
 if(api.hosts.csvPreview) $('import-hosts').after(button('导入 CSV…',()=>importHosts(true),'outlined'));

@@ -28,9 +28,9 @@
       </button>
       <button id="switch-tabs" type="button" aria-haspopup="dialog" aria-controls="session-switcher" aria-expanded="false" aria-label="切换会话" title="切换会话 (⌘J)" hidden>⋯</button>
     </div>
-    <button id="palette-button" class="launcher" aria-label="查找主机或命令" title="查找主机或命令 (⌘K)">
+    <button id="palette-button" class="launcher" aria-label="查找主机、会话或命令" title="查找主机、会话或命令 (⌘K)">
       <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg>
-      <span>查找主机或命令</span><kbd>⌘ K</kbd>
+      <span>查找主机、会话或命令</span><kbd>⌘ K</kbd>
     </button>
   </header>
   <div id="workspace" data-view="hosts" data-host-layout="cards">
@@ -59,6 +59,21 @@
           <span class="sidebar-label">保险库</span>
         </button>
       </nav>
+      <div class="sidebar-resources">
+        <section class="sidebar-section" aria-labelledby="sidebar-sessions-title">
+          <header class="sidebar-section-heading"><span id="sidebar-sessions-title">会话 <span id="session-count">0</span></span><button id="sidebar-new-session" type="button" aria-label="新建会话" title="新建会话 (⌘T)">＋</button></header>
+          <nav id="sidebar-sessions" aria-label="已打开的会话"></nav>
+        </section>
+        <details id="sidebar-groups" class="sidebar-section" open>
+          <summary>主机分组</summary>
+          <nav id="sidebar-group-list" aria-label="主机分组"></nav>
+        </details>
+      </div>
+      <details id="sidebar-tools" class="sidebar-section">
+        <summary title="工具与设置"><span class="sidebar-label">工具与设置</span><span class="sidebar-tools-icon" aria-hidden="true">⋯</span></summary>
+        <nav id="workspace-tools" aria-label="工具与设置"></nav>
+      </details>
+      <button id="sidebar-sync" type="button" title="保险库与 Git 同步"><span class="sidebar-label">保险库与 Git 同步</span></button>
     </aside>
     <main id="workspace-content">
       <section id="hosts" aria-label="主机列表">
