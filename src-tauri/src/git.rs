@@ -1,7 +1,9 @@
 use crate::{
-    error, keys, now,
-    store::{portable_rows, Binding, Row},
-    vault::{self, Envelope, MAX_DOCUMENT},
+    error,
+    git_https::HttpsRepo,
+    keys, now,
+    store::{portable_rows, Binding, GitMigration, Row},
+    vault::{self, GitEnvelope, Key, MAX_GIT_DOCUMENT},
     Workspace,
 };
 use regex::Regex;
@@ -19,8 +21,38 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
-const BRANCH: &str = "refs/heads/termlume-vault";
+const DEFAULT_BRANCH: &str = "termlume-vault";
+
+pub fn default_branch() -> String {
+    DEFAULT_BRANCH.into()
+}
+
+pub fn branch_name(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Ok(default_branch());
+    }
+    // Validate a short branch name without Git's @{-n} checkout expansion.
+    if name.len() > 240
+        || matches!(name, "HEAD" | "@")
+        || name.starts_with('-')
+        || name.starts_with("refs/heads/")
+        || name.ends_with('.')
+        || name.contains("..")
+        || name.contains("@{")
+        || name
+            .bytes()
+            .any(|b| b <= b' ' || b == 127 || b"~^:?*[\\".contains(&b))
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+    {
+        return Err("请输入有效的 Git 分支名称，例如 termlume-vault 或 vault/personal。".into());
+    }
+    Ok(name.into())
+}
 
 pub fn remote_url(value: &str) -> Result<String, String> {
     static SCP: LazyLock<Regex> = LazyLock::new(|| {
@@ -31,6 +63,23 @@ pub fn remote_url(value: &str) -> Result<String, String> {
     });
     let value = value.trim();
     if value.len() <= 1024 {
+        if let Ok(url) = url::Url::parse(value) {
+            if url.scheme() == "https"
+                && url.host().is_some()
+                && value
+                    .get(..8)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+                && !value.chars().any(char::is_whitespace)
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && !url.path().trim_matches('/').is_empty()
+                && !value.contains('\\')
+            {
+                return Ok(url.into());
+            }
+        }
         if SCP.is_match(value) {
             return Ok(value.into());
         }
@@ -40,18 +89,65 @@ pub fn remote_url(value: &str) -> Result<String, String> {
             }
         }
     }
-    Err("请输入 Git 仓库的 SSH 地址，例如 git@github.com:owner/repo.git。".into())
+    Err("请输入 SSH 或 HTTPS 仓库地址，地址中请勿包含用户名、密码或 Token。".into())
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct GitAuth {
+    pub username: String,
+    pub token: String,
+}
+
+impl Drop for GitAuth {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
+}
+
+pub fn resolve_auth(
+    remote: &str,
+    input: Option<GitAuth>,
+    saved: Option<GitAuth>,
+) -> Result<Option<GitAuth>, String> {
+    if !remote.starts_with("https://") {
+        return Ok(None);
+    }
+    let mut auth = input
+        .or(saved)
+        .ok_or("请输入 HTTPS 仓库的用户名和访问 Token。")?;
+    auth.username = auth.username.trim().into();
+    auth.token = auth.token.trim().into();
+    if auth.username.is_empty()
+        || auth.username.len() > 256
+        || auth.username.contains(':')
+        || auth.username.chars().any(char::is_control)
+        || auth.token.is_empty()
+        || auth.token.len() > 4096
+        || auth
+            .token
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("HTTPS 仓库的用户名或访问 Token 格式无效。".into());
+    }
+    Ok(Some(auth))
+}
+
+enum Transport {
+    System(tempfile::TempDir),
+    Https(HttpsRepo),
 }
 
 pub struct Repo {
-    dir: tempfile::TempDir,
+    transport: Transport,
     remote: String,
+    reference: String,
     cancel: CancellationToken,
 }
 pub struct Tip {
     pub commit: String,
     pub parent: Option<String>,
-    pub envelope: Envelope,
+    pub envelope: GitEnvelope,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,10 +156,11 @@ pub struct Snapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_commit: Option<String>,
 }
-struct GitError {
+#[derive(Clone)]
+pub struct GitError {
     code: Option<i32>,
     detail: String,
-    concurrent: bool,
+    pub(crate) concurrent: bool,
 }
 impl From<GitError> for String {
     fn from(e: GitError) -> Self {
@@ -71,7 +168,7 @@ impl From<GitError> for String {
     }
 }
 impl GitError {
-    fn message(detail: impl Into<String>) -> Self {
+    pub(crate) fn message(detail: impl Into<String>) -> Self {
         Self {
             code: None,
             detail: detail.into(),
@@ -81,21 +178,44 @@ impl GitError {
 }
 
 impl Repo {
-    pub async fn open(remote: String, cancel: CancellationToken) -> Result<Self, String> {
+    pub async fn open(
+        remote: String,
+        branch: &str,
+        auth: Option<GitAuth>,
+        cancel: CancellationToken,
+    ) -> Result<Self, String> {
+        let transport = if remote.starts_with("https://") {
+            let auth = resolve_auth(&remote, auth, None)?.unwrap();
+            Transport::Https(HttpsRepo::open(remote.clone(), auth, cancel.clone()).await?)
+        } else {
+            if cfg!(mobile) {
+                return Err("手机端请使用 HTTPS 仓库地址和访问 Token。".into());
+            }
+            Transport::System(tempfile::tempdir().map_err(error)?)
+        };
         let repo = Self {
-            dir: tempfile::tempdir().map_err(error)?,
+            transport,
             remote,
+            reference: format!("refs/heads/{branch}"),
             cancel,
         };
-        repo.run(&["init", "--bare", "--quiet", "--template="], None)
-            .await?;
+        if matches!(&repo.transport, Transport::System(_)) {
+            repo.run(&["init", "--bare", "--quiet", "--template="], None)
+                .await?;
+        }
         Ok(repo)
     }
     async fn run(&self, args: &[&str], input: Option<&[u8]>) -> Result<String, GitError> {
+        if self.cancel.is_cancelled() {
+            return Err(GitError::message("同步已取消。"));
+        }
+        let Transport::System(dir) = &self.transport else {
+            return Err(GitError::message("系统 Git 仅用于 SSH 连接。"));
+        };
         let mut cmd = Command::new("/usr/bin/git");
         cmd.args(["-c", "core.hooksPath=/dev/null"])
             .args(args)
-            .current_dir(self.dir.path())
+            .current_dir(dir.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -133,8 +253,8 @@ impl Repo {
         let io = async {
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let mut stdout = stdout.take(MAX_DOCUMENT + 4097);
-            let mut stderr = stderr.take(MAX_DOCUMENT + 4097);
+            let mut stdout = stdout.take(MAX_GIT_DOCUMENT + 4097);
+            let mut stderr = stderr.take(MAX_GIT_DOCUMENT + 4097);
             let ((), _, _, status) = tokio::try_join!(
                 async move {
                     if let Some(bytes) = input {
@@ -148,7 +268,9 @@ impl Repo {
                 child.wait()
             )
             .map_err(|e| GitError::message(error(e)))?;
-            if out.len() as u64 > MAX_DOCUMENT + 4096 || err.len() as u64 > MAX_DOCUMENT + 4096 {
+            if out.len() as u64 > MAX_GIT_DOCUMENT + 4096
+                || err.len() as u64 > MAX_GIT_DOCUMENT + 4096
+            {
                 return Err(GitError::message("Git 输出超出限制。"));
             }
             if status.success() {
@@ -180,21 +302,58 @@ impl Repo {
             result = tokio::time::timeout(Duration::from_secs(45), io) => result.map_err(|_| GitError::message("Git 操作超时。"))?
         }
     }
+    async fn refs(&self) -> Result<String, String> {
+        if let Transport::Https(repo) = &self.transport {
+            return Ok(repo.refs().await?);
+        }
+        Ok(self
+            .run(&["ls-remote", "--refs", "--", &self.remote], None)
+            .await?)
+    }
+
+    fn advertised_commit<'a>(&self, refs: &'a str) -> Option<&'a str> {
+        refs.lines()
+            .filter_map(|line| line.split_once('\t'))
+            .find_map(|(commit, name)| (name == self.reference).then_some(commit))
+    }
+
     pub async fn fetch(&self) -> Result<Option<Tip>, String> {
-        if let Err(e) = self
+        if let Transport::Https(repo) = &self.transport {
+            if self.advertised_commit(&repo.refs().await?).is_none() {
+                return Ok(None);
+            }
+            return Ok(Some(repo.fetch(&self.reference).await?));
+        }
+        let refs = match self
             .run(
-                &["ls-remote", "--refs", "--exit-code", &self.remote, BRANCH],
+                &[
+                    "ls-remote",
+                    "--refs",
+                    "--exit-code",
+                    "--",
+                    &self.remote,
+                    &self.reference,
+                ],
                 None,
             )
             .await
         {
-            if e.code == Some(2) {
-                return Ok(None);
-            }
-            return Err(e.into());
+            Ok(refs) => refs,
+            Err(e) if e.code == Some(2) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if self.advertised_commit(&refs).is_none() {
+            return Ok(None);
         }
         self.run(
-            &["fetch", "--quiet", "--no-tags", "--", &self.remote, BRANCH],
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--",
+                &self.remote,
+                &self.reference,
+            ],
             None,
         )
         .await?;
@@ -212,7 +371,7 @@ impl Repo {
             .trim()
             .parse::<u64>()
             .map_err(error)?;
-        if size == 0 || size > MAX_DOCUMENT {
+        if size == 0 || size > MAX_GIT_DOCUMENT {
             return Err("仓库中的保险库大小无效。".into());
         }
         let json = self.run(&["cat-file", "blob", &spec], None).await?;
@@ -226,6 +385,9 @@ impl Repo {
         if !valid_commit(base) || !valid_commit(tip) {
             return Err("同步提交标识无效。".into());
         }
+        if let Transport::Https(repo) = &self.transport {
+            return Ok(repo.descendant(base.into(), tip.into()).await?);
+        }
         match self
             .run(&["merge-base", "--is-ancestor", base, tip], None)
             .await
@@ -235,7 +397,14 @@ impl Repo {
             Err(e) => Err(e.into()),
         }
     }
-    async fn push(&self, envelope: &Envelope, parent: Option<&str>) -> Result<String, GitError> {
+    async fn create_commit(
+        &self,
+        envelope: &GitEnvelope,
+        parent: Option<&str>,
+    ) -> Result<String, GitError> {
+        if let Transport::Https(repo) = &self.transport {
+            return repo.create_commit(envelope, parent).await;
+        }
         let bytes = serde_json::to_vec(envelope).map_err(|e| GitError::message(error(e)))?;
         let blob = self
             .run(&["hash-object", "-w", "--stdin"], Some(&bytes))
@@ -247,18 +416,27 @@ impl Repo {
             args.extend(["-p", parent]);
         }
         args.extend(["-m", "Update encrypted Termlume vault"]);
-        let commit = self.run(&args, None).await?.trim().to_string();
-        self.run(
-            &[
-                "push",
-                "--porcelain",
-                "--",
-                &self.remote,
-                &format!("{commit}:{BRANCH}"),
-            ],
-            None,
-        )
-        .await?;
+        Ok(self.run(&args, None).await?.trim().to_string())
+    }
+
+    async fn push_commit(&self, commit: &str, create_only: bool) -> Result<(), GitError> {
+        if let Transport::Https(repo) = &self.transport {
+            return repo.push(commit, &self.reference, create_only).await;
+        }
+        let lease = format!("--force-with-lease={}:", self.reference);
+        let refspec = format!("{commit}:{}", self.reference);
+        let mut args = vec!["push", "--porcelain"];
+        if create_only {
+            args.push(&lease);
+        }
+        args.extend(["--", &self.remote, &refspec]);
+        self.run(&args, None).await?;
+        Ok(())
+    }
+
+    async fn push(&self, envelope: &GitEnvelope, parent: Option<&str>) -> Result<String, GitError> {
+        let commit = self.create_commit(envelope, parent).await?;
+        self.push_commit(&commit, false).await?;
         Ok(commit)
     }
 }
@@ -269,16 +447,49 @@ fn valid_commit(s: &str) -> bool {
 pub struct Conflict {
     ticket: Uuid,
     remote: String,
+    branch: String,
     commit: Option<String>,
     local: Vec<Row>,
+    migration: Option<(String, String)>,
 }
 #[derive(Deserialize)]
 pub struct SyncRequest {
     #[serde(default)]
     address: String,
+    branch: Option<String>,
+    #[serde(rename = "syncKey")]
+    sync_key: Option<String>,
+    auth: Option<GitAuth>,
+    #[serde(default, rename = "changeConnection")]
+    change_connection: bool,
     ticket: Option<Uuid>,
     #[serde(default)]
     choices: BTreeMap<Uuid, String>,
+}
+
+#[derive(Deserialize)]
+pub struct MigrationRequest {
+    #[serde(flatten)]
+    target: SyncRequest,
+    #[serde(default)]
+    abandon: bool,
+}
+
+fn snapshot_at(
+    tip: &Tip,
+    key: &Key,
+    vault_id: Uuid,
+    sync_key: Option<&Key>,
+) -> Result<Vec<Row>, String> {
+    let envelope = tip.envelope.open(sync_key)?;
+    if envelope.header.id != vault_id {
+        return Err("仓库中是另一套保险库。".into());
+    }
+    let data: Snapshot = envelope.decode(key, "portable")?;
+    if data.parent_commit != tip.parent {
+        return Err("快照与仓库提交历史不一致。".into());
+    }
+    portable_rows(data.hosts)
 }
 
 fn merge(
@@ -339,18 +550,46 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
         .try_lock()
         .map_err(|_| "已有同步任务正在运行。")?;
     let cancel = CancellationToken::new();
-    let (remote, key, header, epoch) = {
+    let (remote, branch, auth, sync_secret, key, header, epoch) = {
         let store = ws.store.lock().unwrap();
         let data = store.data()?;
+        if data.git_migration.is_some() {
+            return Err("请先继续或放弃待完成的 Git 迁移。".into());
+        }
         let saved = data.sync.as_ref().map(|s| s.remote.as_str()).unwrap_or("");
         let remote = remote_url(if input.address.trim().is_empty() {
             saved
         } else {
             &input.address
         })?;
-        if !saved.is_empty() && saved != remote {
-            return Err("此保险库已绑定另一仓库。".into());
+        if !saved.is_empty() && saved != remote && !input.change_connection {
+            return Err("请在同步设置中更改仓库连接。".into());
         }
+        let prior = data.sync.as_ref();
+        let branch = branch_name(
+            input
+                .branch
+                .as_deref()
+                .or(prior.map(|s| s.branch.as_str()))
+                .unwrap_or(""),
+        )?;
+        if prior.is_some_and(|s| (s.branch != branch || s.remote != remote) && s.commit.is_none()) {
+            return Err("请先完成当前分支的首次同步。".into());
+        }
+        let saved_key = prior.and_then(|s| s.sync_key.as_deref());
+        let entered_key = input
+            .sync_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let auth = resolve_auth(
+            &remote,
+            input.auth.clone(),
+            prior
+                .filter(|p| p.remote == remote)
+                .and_then(|p| p.auth.clone()),
+        )?;
+        let sync_secret = entered_key.or(saved_key).map(str::to_owned);
         let key = store.key.clone().ok_or("请先启用并解锁保险库。")?;
         let header = store
             .envelope
@@ -359,10 +598,10 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
             .header
             .clone();
         *ws.sync_cancel.lock().unwrap() = Some(cancel.clone());
-        (remote, key, header, store.epoch)
+        (remote, branch, auth, sync_secret, key, header, store.epoch)
     };
     let result = async {
-        let repo = Repo::open(remote.clone(), cancel).await?;
+        let repo = Repo::open(remote.clone(), &branch, auth.clone(), cancel).await?;
         for attempt in 0..3 {
             let tip = repo.fetch().await?;
             let prior = {
@@ -379,18 +618,24 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
                     None => false,
                 };
                 if !ok {
+                    if prior.as_ref().is_some_and(|s| s.remote != remote) {
+                        return Err("新地址必须指向包含上次同步提交的仓库。换到空仓库请用「迁移到新仓库」。".into());
+                    }
+                    if prior.as_ref().is_some_and(|s| s.branch != branch) {
+                        return Err(
+                            "目标分支必须包含上次同步的提交。请先在 Git 服务上创建或重命名分支。"
+                                .into(),
+                        );
+                    }
                     return Err("远端同步分支已删除或历史已重写，同步已暂停。".into());
                 }
             }
+            let old_format = tip.as_ref().is_some_and(|t| t.envelope.is_protected());
+            let sync_key = if old_format {
+                sync_secret.as_deref().map(vault::git_key).transpose()?
+            } else { None };
             let theirs = if let Some(tip) = &tip {
-                if tip.envelope.header.id != header.id {
-                    return Err("仓库中是另一套保险库。".into());
-                }
-                let data: Snapshot = tip.envelope.decode(&key, "portable")?;
-                if data.parent_commit != tip.parent {
-                    return Err("快照与仓库提交历史不一致。".into());
-                }
-                portable_rows(data.hosts)?
+                snapshot_at(tip, &key, header.id, sync_key.as_ref())?
             } else {
                 vec![]
             };
@@ -402,6 +647,9 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
                 if data.sync.is_none() {
                     data.sync = Some(Binding {
                         remote: remote.clone(),
+                        branch: branch.clone(),
+                        sync_key: None,
+                        auth: auth.clone(),
                         commit: None,
                         base: vec![],
                         last_synced: None,
@@ -413,8 +661,10 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
                 let choices = if pending.as_ref().is_some_and(|c| {
                     Some(c.ticket) == input.ticket
                         && c.remote == remote
+                        && c.branch == branch
                         && c.commit == tip_commit
                         && c.local == ours
+                        && c.migration.is_none()
                 }) {
                     input.choices.clone()
                 } else {
@@ -427,21 +677,23 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
                     *pending = Some(Conflict {
                         ticket,
                         remote: remote.clone(),
+                        branch: branch.clone(),
                         commit: tip_commit.clone(),
                         local: ours,
+                        migration: None,
                     });
                     return Ok(json!({"ticket": ticket, "conflicts": conflicts}));
                 }
                 (ours, records)
             };
-            let commit = if tip_commit.is_none() || records != theirs {
+            let commit = if tip_commit.is_none() || old_format || records != theirs {
                 let envelope = vault::encode(
                     &key,
                     &header,
                     "portable",
                     &json!({"hosts": records, "parentCommit": tip_commit}),
                 )?;
-                match repo.push(&envelope, tip_commit.as_deref()).await {
+                match repo.push(&GitEnvelope::Legacy(envelope), tip_commit.as_deref()).await {
                     Ok(commit) => Some(commit),
                     Err(e) if e.concurrent && attempt < 2 => continue,
                     Err(e) => return Err(e.into()),
@@ -464,6 +716,9 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
                 local,
                 Some(Binding {
                     remote: remote.clone(),
+                    branch: branch.clone(),
+                    sync_key: None,
+                    auth: auth.clone(),
                     commit,
                     base: records,
                     last_synced: Some(now()),
@@ -474,6 +729,225 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
             return Ok(json!({"state": store.status(), "pending": pending}));
         }
         Err("远端同步分支持续更新，请稍后重试。".into())
+    }
+    .await;
+    ws.sync_cancel.lock().unwrap().take();
+    result
+}
+
+pub async fn migrate(ws: &Workspace, input: MigrationRequest) -> Result<Value, String> {
+    let _permit = ws
+        .sync_gate
+        .try_lock()
+        .map_err(|_| "已有同步任务正在运行。")?;
+    let cancel = CancellationToken::new();
+    let (prior, target, pending, key, header, epoch) = {
+        let mut store = ws.store.lock().unwrap();
+        let data = store.data()?;
+        if input.abandon {
+            if data.git_migration.is_some() {
+                let mut data = data.clone();
+                data.git_migration = None;
+                store.update(data)?;
+                *ws.conflict.lock().unwrap() = None;
+            }
+            return Ok(json!({"state": store.status()}));
+        }
+        let prior = data.sync.clone().ok_or("请先绑定旧 Git 仓库。")?;
+        if prior.commit.is_none() {
+            return Err("请先完成旧仓库的首次同步。".into());
+        }
+        let pending = data.git_migration.clone();
+        let remote = remote_url(if input.target.address.trim().is_empty() {
+            pending.as_ref().map(|m| m.remote.as_str()).unwrap_or("")
+        } else {
+            &input.target.address
+        })?;
+        let branch = branch_name(
+            input
+                .target
+                .branch
+                .as_deref()
+                .or(pending.as_ref().map(|m| m.branch.as_str()))
+                .unwrap_or(""),
+        )?;
+        if remote == prior.remote {
+            return Err("请选择一个新的空仓库。".into());
+        }
+        if pending
+            .as_ref()
+            .is_some_and(|m| m.remote != remote || m.branch != branch)
+        {
+            return Err("请继续或放弃待完成的 Git 迁移后，再更改目标。".into());
+        }
+        let auth = resolve_auth(
+            &remote,
+            input.target.auth.clone(),
+            pending.as_ref().and_then(|m| m.auth.clone()),
+        )?;
+        let target = GitMigration {
+            remote,
+            branch,
+            sync_key: pending.as_ref().and_then(|m| m.sync_key.clone()),
+            auth,
+            commit: String::new(),
+        };
+        let key = store.key.clone().ok_or("请先启用并解锁保险库。")?;
+        let header = store
+            .envelope
+            .as_ref()
+            .ok_or("请先启用并解锁保险库。")?
+            .header
+            .clone();
+        *ws.sync_cancel.lock().unwrap() = Some(cancel.clone());
+        (prior, target, pending, key, header, store.epoch)
+    };
+    let result = async {
+        let mut target = target;
+        let destination = Repo::open(
+            target.remote.clone(),
+            &target.branch,
+            target.auth.clone(),
+            cancel.clone(),
+        )
+        .await?;
+        let refs = destination.refs().await?;
+        let records = if let Some(saved) =
+            pending.filter(|m| destination.advertised_commit(&refs) == Some(m.commit.as_str()))
+        {
+            // The push succeeded before the local binding could be committed.
+            let tip = destination
+                .fetch()
+                .await?
+                .filter(|tip| tip.commit == saved.commit && tip.parent.is_none())
+                .ok_or("新仓库刚有更新，请核对目标仓库。")?;
+            target.commit = saved.commit;
+            let target_key = target.sync_key.as_deref().map(vault::git_key).transpose()?;
+            snapshot_at(&tip, &key, header.id, target_key.as_ref())?
+        } else {
+            if !refs.is_empty() {
+                return Err("目标仓库必须为空，请创建不含分支或标签的新仓库。".into());
+            }
+            let source = Repo::open(
+                prior.remote.clone(),
+                &prior.branch,
+                prior.auth.clone(),
+                cancel,
+            )
+            .await?;
+            let tip = source.fetch().await?.ok_or("旧同步分支已删除。")?;
+            if !source
+                .descendant(prior.commit.as_deref().unwrap(), &tip.commit)
+                .await?
+            {
+                return Err("旧同步分支的历史已重写，迁移已暂停。".into());
+            }
+            let source_key = if tip.envelope.is_protected() {
+                input
+                    .target
+                    .sync_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .or(prior.sync_key.as_deref())
+                    .map(vault::git_key)
+                    .transpose()?
+            } else {
+                None
+            };
+            let theirs = snapshot_at(&tip, &key, header.id, source_key.as_ref())?;
+            let migration = Some((target.remote.clone(), target.branch.clone()));
+            let (ours, records) = {
+                let store = ws.store.lock().unwrap();
+                crate::ensure_epoch(&store, epoch)?;
+                let ours = store.data()?.snapshot();
+                let mut pending = ws.conflict.lock().unwrap();
+                let choices = if pending.as_ref().is_some_and(|c| {
+                    Some(c.ticket) == input.target.ticket
+                        && c.remote == prior.remote
+                        && c.branch == prior.branch
+                        && c.commit.as_deref() == Some(&tip.commit)
+                        && c.local == ours
+                        && c.migration == migration
+                }) {
+                    input.target.choices
+                } else {
+                    BTreeMap::new()
+                };
+                let (records, conflicts) = merge(&prior.base, &ours, &theirs, &choices);
+                if !conflicts.is_empty() {
+                    let ticket = Uuid::new_v4();
+                    *pending = Some(Conflict {
+                        ticket,
+                        remote: prior.remote.clone(),
+                        branch: prior.branch.clone(),
+                        commit: Some(tip.commit),
+                        local: ours,
+                        migration,
+                    });
+                    return Ok(json!({"ticket": ticket, "conflicts": conflicts}));
+                }
+                (ours, records)
+            };
+            let envelope = vault::encode(
+                &key,
+                &header,
+                "portable",
+                &json!({"hosts": records, "parentCommit": null}),
+            )?;
+            target.sync_key = None;
+            target.commit = destination
+                .create_commit(&GitEnvelope::Legacy(envelope), None)
+                .await?;
+            if source.advertised_commit(&source.refs().await?) != Some(&tip.commit) {
+                return Err("旧仓库刚有更新，请重试迁移。".into());
+            }
+            if !destination.refs().await?.is_empty() {
+                return Err("目标仓库已出现提交，请更换空仓库。".into());
+            }
+            {
+                let mut store = ws.store.lock().unwrap();
+                crate::ensure_epoch(&store, epoch)?;
+                let mut data = store.data()?.clone();
+                let latest = data.snapshot();
+                let prefer_newer = ours
+                    .iter()
+                    .chain(&latest)
+                    .map(|r| (r.host.id, "local".into()))
+                    .collect();
+                let (local, _) = merge(&ours, &latest, &records, &prefer_newer);
+                // Persist the integrated rows and expected root before any remote write.
+                data.apply(
+                    local,
+                    Some(Binding {
+                        commit: Some(tip.commit),
+                        base: theirs,
+                        ..prior
+                    }),
+                );
+                data.git_migration = Some(target.clone());
+                store.update(data)?;
+            }
+            destination.push_commit(&target.commit, true).await?;
+            records
+        };
+        let mut store = ws.store.lock().unwrap();
+        crate::ensure_epoch(&store, epoch)?;
+        let mut data = store.data()?.clone();
+        let pending = data.snapshot() != records;
+        data.sync = Some(Binding {
+            remote: target.remote,
+            branch: target.branch,
+            sync_key: target.sync_key,
+            auth: target.auth,
+            commit: Some(target.commit),
+            base: records,
+            last_synced: Some(now()),
+        });
+        data.git_migration = None;
+        store.update(data)?;
+        *ws.conflict.lock().unwrap() = None;
+        Ok(json!({"state": store.status(), "pending": pending}))
     }
     .await;
     ws.sync_cancel.lock().unwrap().take();

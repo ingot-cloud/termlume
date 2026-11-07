@@ -2,6 +2,36 @@ use super::*;
 use tauri::ipc::InvokeResponseBody;
 use tokio::sync::mpsc;
 
+#[test]
+fn git_envelope_hides_password_material_and_reads_legacy_snapshots() {
+    let password = "vault fixture password";
+    let recovery = vault::recovery_code();
+    let sync_key = vault::git_key(&vault::recovery_code()).unwrap();
+    let wrong_key = vault::git_key(&vault::recovery_code()).unwrap();
+    let (key, header) = vault::create(password, &recovery).unwrap();
+    let rows =
+        json!({"hosts": [{"address": "private.example.test", "password": "server password"}]});
+    let legacy = vault::encode(&key, &header, "portable", &rows).unwrap();
+    let legacy_copy: vault::GitEnvelope =
+        serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+    assert!(!legacy_copy.is_protected());
+    assert!(legacy_copy.open(None).is_ok());
+
+    let protected = vault::GitEnvelope::protect(&legacy, &sync_key).unwrap();
+    let document = serde_json::to_value(&protected).unwrap();
+    assert!(document.get("header").is_none());
+    let restored: vault::GitEnvelope = serde_json::from_value(document).unwrap();
+    assert!(restored.is_protected());
+    assert!(restored.open(None).is_err());
+    assert!(restored.open(Some(&wrong_key)).is_err());
+    let inner = restored.open(Some(&sync_key)).unwrap();
+    assert!(inner
+        .unlock::<Value>("wrong password", false, "portable")
+        .is_err());
+    let (_, decoded) = inner.unlock::<Value>(password, false, "portable").unwrap();
+    assert_eq!(decoded, rows);
+}
+
 fn make_workspace(
     home: &std::path::Path,
     legacy: Option<PathBuf>,
@@ -502,13 +532,26 @@ async fn macos_transport_migration_and_sync() {
         "ssh://{user}@127.0.0.1:{openssh_port}{}/repo.git",
         fixture.display()
     );
-    let synced = call(&ws, "vault:sync", json!({"address":remote})).await;
+    let branch = "vault/test";
+    let synced = call(
+        &ws,
+        "vault:sync",
+        json!({"address": remote, "branch": branch}),
+    )
+    .await;
     assert_eq!(synced["state"]["remote"], remote);
+    assert_eq!(synced["state"]["branch"], branch);
+    assert!(synced["state"].get("syncKey").is_none());
     let (_other, other) = make_workspace(&fixture, None);
+    let wrong_password = json!({"address":remote,"branch":branch,"secret":"wrong vault password"});
+    assert!(dispatch(&other, "vault:restore-git", wrong_password)
+        .await
+        .unwrap_err()
+        .contains("无法解锁"));
     call(
         &other,
         "vault:restore-git",
-        json!({"address":remote,"secret":"fixture passphrase 测试"}),
+        json!({"address":remote,"branch":branch,"secret":"fixture passphrase 测试"}),
     )
     .await;
     let on_other = call(&other, "hosts:list", Value::Null).await;
@@ -542,5 +585,225 @@ async fn macos_transport_migration_and_sync() {
         .unwrap()
         .iter()
         .any(|h| h["id"] == host1["id"] && h["note"] == "仓库修改"));
+    let new_branch = "vault/renamed";
+    let result = dispatch(&ws, "vault:sync", json!({"branch":new_branch})).await;
+    assert!(result.unwrap_err().contains("目标分支"));
+    let status = std::process::Command::new("/usr/bin/git")
+        .arg("--git-dir")
+        .arg(fixture.join("repo.git"))
+        .args(["branch", "-m", branch, new_branch])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let switched = call(&ws, "vault:sync", json!({"branch":new_branch})).await;
+    assert_eq!(switched["state"]["branch"], new_branch);
+    assert_eq!(
+        call(&other, "vault:sync", json!({"branch":new_branch})).await["state"]["branch"],
+        new_branch
+    );
+    let port = std::fs::read_to_string(fixture.join("https-port")).unwrap();
+    let https = format!("https://127.0.0.1:{port}/repo.git");
+    let auth = json!({"username":"fixture","token":"test-repository-token"});
+    let switched = call(
+        &ws,
+        "vault:sync",
+        json!({
+            "address":https,"changeConnection":true,"auth":auth
+        }),
+    )
+    .await;
+    assert_eq!(switched["state"]["remote"], https);
+    assert!(switched["state"].get("auth").is_none());
+    let mut modified = resolved
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|host| host["id"] == host1["id"])
+        .unwrap()
+        .clone();
+    modified["note"] = json!("HTTPS 设备更新");
+    call(&ws, "hosts:save", modified).await;
+    call(&ws, "vault:sync", json!({})).await;
+    call(&other, "vault:sync", json!({})).await;
+    assert!(call(&other, "hosts:list", Value::Null)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|host| host["id"] == host1["id"] && host["note"] == "HTTPS 设备更新"));
+
+    let (_third, third) = make_workspace(&fixture, None);
+    let mut request =
+        json!({"address":https,"branch":new_branch,"secret":"fixture passphrase 测试","auth":auth});
+    request["auth"]["token"] = json!("wrong-token");
+    assert!(dispatch(&third, "vault:restore-git", request.clone())
+        .await
+        .is_err());
+    request["auth"] = auth;
+    assert_eq!(
+        call(&third, "vault:restore-git", request).await["remote"],
+        https
+    );
     ws.connections.close_all();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires an isolated localhost OpenSSH fixture and agent"]
+async fn macos_migrates_legacy_git_snapshot_and_resumes_after_push() {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    let fixture = PathBuf::from(std::env::var_os("TERMLUME_TEST_FIXTURE").unwrap());
+    let user = std::env::var("USER").unwrap();
+    let port = std::fs::read_to_string(fixture.join("openssh-port")).unwrap();
+    let address = |repo: &str| {
+        format!(
+            "ssh://{user}@127.0.0.1:{}{}/{repo}",
+            port.trim(),
+            fixture.display()
+        )
+    };
+    let old = address("legacy-migrate.git");
+    let new = address("migrated.git");
+    let old_ref = "refs/heads/termlume-vault";
+    let branch = "vault/fresh";
+    let new_ref = "refs/heads/vault/fresh";
+    let password = "fixture passphrase 测试";
+    let (profile, ws) = make_workspace(&fixture, None);
+    call(
+        &ws,
+        "vault:restore-git",
+        json!({"address":old,"secret":password}),
+    )
+    .await;
+    let mut host = call(&ws, "hosts:list", Value::Null).await[0].clone();
+    host["note"] = json!("本机的修改");
+    call(&ws, "hosts:save", host.clone()).await;
+    let added = call(
+        &ws,
+        "hosts:save",
+        json!({
+            "name":"本机新增", "address":"local-only.example.test",
+            "username":"fixture", "port":22, "auth":"password"
+        }),
+    )
+    .await
+    .as_array()
+    .unwrap()
+    .last()
+    .unwrap()
+    .clone();
+
+    let git = |repo: &str, args: &[&str]| {
+        Command::new("/usr/bin/git")
+            .arg("--git-dir")
+            .arg(fixture.join(repo))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let ids: Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("legacy-migration-refs.json")).unwrap())
+            .unwrap();
+    let latest = ids["latest"].as_str().unwrap();
+    let base = ids["base"].as_str().unwrap();
+    assert!(
+        git("legacy-migrate.git", &["update-ref", old_ref, latest, base])
+            .status
+            .success()
+    );
+    let occupied = dispatch(
+        &ws,
+        "vault:migrate-git",
+        json!({
+            "address":address("legacy-migrate.git/"), "branch":branch
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(occupied.contains("目标仓库必须为空"), "{occupied}");
+
+    let migration = json!({"address":new,"branch":branch});
+    let conflict = call(&ws, "vault:migrate-git", migration.clone()).await;
+    assert_eq!(conflict["conflicts"][0]["id"], host["id"]);
+    assert!(git("migrated.git", &["for-each-ref"]).stdout.is_empty());
+    let mut request = migration;
+    request["ticket"] = conflict["ticket"].clone();
+    let mut choices = serde_json::Map::new();
+    choices.insert(host["id"].as_str().unwrap().into(), json!("remote"));
+    request["choices"] = Value::Object(choices);
+
+    // Lock the local vault after receive-pack wrote the ref but before it returned.
+    let hook = fixture.join("migrated.git/hooks/post-receive");
+    std::fs::write(&hook, "#!/bin/sh\n: > migration-received\nsleep 4\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let received = fixture.join("migrated.git/migration-received");
+    let interrupt = async {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !received.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("destination never received the new root");
+        assert_eq!(call(&ws, "vault:lock", Value::Null).await["locked"], true);
+    };
+    let (attempt, ()) = tokio::join!(dispatch(&ws, "vault:migrate-git", request), interrupt);
+    assert!(attempt.is_err());
+    drop(ws);
+    let ws = Workspace::new(profile.path().to_path_buf(), fixture.clone(), None).unwrap();
+    let state = call(&ws, "vault:unlock", json!({"secret":password})).await;
+    assert_eq!(state["remote"], old);
+    assert_eq!(state["gitMigration"]["remote"], new);
+    assert!(state["gitMigration"].get("syncKey").is_none());
+
+    let resumed = call(&ws, "vault:migrate-git", json!({})).await;
+    assert_eq!(resumed["state"]["remote"], new);
+    assert_eq!(resumed["state"]["branch"], branch);
+    assert!(resumed["state"]["gitMigration"].is_null());
+    assert_eq!(
+        git("migrated.git", &["rev-list", "--count", "--all"]).stdout,
+        b"1\n"
+    );
+    assert!(!git("migrated.git", &["cat-file", "-e", latest])
+        .status
+        .success());
+    assert_eq!(
+        String::from_utf8_lossy(&git("legacy-migrate.git", &["rev-parse", old_ref]).stdout).trim(),
+        latest
+    );
+    let commit = git("migrated.git", &["rev-list", "--parents", new_ref]);
+    assert_eq!(
+        String::from_utf8_lossy(&commit.stdout)
+            .split_whitespace()
+            .count(),
+        1
+    );
+
+    let (_other, other) = make_workspace(&fixture, None);
+    call(
+        &other,
+        "vault:restore-git",
+        json!({"address":new,"branch":branch,"secret":password}),
+    )
+    .await;
+    let hosts = call(&other, "hosts:list", Value::Null).await;
+    let hosts = hosts.as_array().unwrap();
+    assert!(hosts
+        .iter()
+        .any(|h| h["id"] == host["id"] && h["note"] == "旧仓库的更新"));
+    assert!(hosts.iter().any(|h| h["id"] == added["id"]));
+
+    let (_legacy, legacy) = make_workspace(&fixture, None);
+    let mut restore = json!({"address":old,"branch":"legacy/protected","secret":password});
+    assert!(dispatch(&legacy, "vault:restore-git", restore.clone())
+        .await
+        .unwrap_err()
+        .contains("旧版同步密钥"));
+    restore["syncKey"] = json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([23; 32]));
+    call(&legacy, "vault:restore-git", restore.clone()).await;
+    call(&legacy, "vault:sync", json!({})).await;
+    restore.as_object_mut().unwrap().remove("syncKey");
+    let (_updated, updated) = make_workspace(&fixture, None);
+    call(&updated, "vault:restore-git", restore).await;
 }

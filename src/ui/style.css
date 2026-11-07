@@ -22,6 +22,7 @@ body { display: flex; flex-direction: column; background: var(--bg); color: var(
 button, input, select { font: inherit; color: inherit; }
 button { border: 1px solid transparent; background: transparent; padding: 5px 8px; border-radius: 6px; min-width: 0; max-width: 100%; white-space: normal; }
 button, dialog, #hosts, #toolbar, #files, #status, #vault-lock { overflow-wrap: anywhere; }
+.text-ellipsis { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 button:not(:disabled) { cursor: pointer; }
 button:not(:disabled):hover, button[aria-pressed="true"] { background: var(--selected); }
 button:disabled { opacity: .45; }
@@ -337,8 +338,15 @@ dialog .actions button { flex: none; white-space: nowrap; }
 .vault-card { display: flex; flex-direction: column; align-items: start; padding: 14px; }
 .vault-card h3 { margin: 8px 0 0; font-size: 15px; }
 .vault-card p { flex: 1; }
-.vault-card > button { margin-top: 12px; }
-.vault-remote { display: block; margin-top: 5px; max-width: 100%; color: var(--muted); }
+.vault-card > :is(button, .vault-git-controls) { margin-top: 12px; }
+.vault-card button { min-height: 32px; white-space: normal; overflow-wrap: anywhere; }
+.vault-remote, .vault-git-controls { width: 100%; min-width: 0; }
+.vault-remote { display: grid; gap: 2px; margin-top: 5px; color: var(--muted); }
+.vault-git-settings { display: grid; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+.vault-git-setting { display: grid; grid-template-columns: minmax(0, 1fr); justify-items: start; gap: 3px; }
+.vault-git-controls button[aria-expanded="true"] { background: var(--selected); }
+.git-credential-fields { display: grid; grid-template-columns: minmax(0, 1fr); gap: 9px; }
+.git-connection-methods { justify-self: start; max-width: 100%; }
 .step-label { color: var(--accent); font-size: 12px; }
 .step-back { margin-right: auto; }
 .recovery-box { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--terminal); }

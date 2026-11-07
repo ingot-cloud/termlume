@@ -174,9 +174,27 @@ pub enum LocalPassword {
 #[serde(rename_all = "camelCase")]
 pub struct Binding {
     pub remote: String,
+    #[serde(default = "crate::git::default_branch")]
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::git::GitAuth>,
     pub commit: Option<String>,
     pub base: Vec<Row>,
     pub last_synced: Option<u64>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitMigration {
+    pub remote: String,
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::git::GitAuth>,
+    pub commit: String,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -190,6 +208,8 @@ pub struct Data {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub transfer_history: Vec<Value>,
     pub sync: Option<Binding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_migration: Option<GitMigration>,
 }
 impl Data {
     pub fn host(&self, id: Uuid) -> Result<&Host, String> {
@@ -325,7 +345,20 @@ impl Store {
     }
     pub fn status(&self) -> Value {
         let sync = self.data.as_ref().and_then(|data| data.sync.as_ref());
-        json!({"enabled": self.envelope.is_some(), "locked": self.data.is_none(), "remote": sync.map(|s| s.remote.as_str()).unwrap_or(""), "lastSynced": sync.and_then(|s| s.last_synced), "fileTransfers": cfg!(desktop)})
+        let migration = self
+            .data
+            .as_ref()
+            .and_then(|data| data.git_migration.as_ref());
+        json!({
+            "enabled": self.envelope.is_some(),
+            "locked": self.data.is_none(),
+            "remote": sync.map(|s| s.remote.as_str()).unwrap_or(""),
+            "branch": sync.map(|s| s.branch.as_str()),
+            "gitSsh": cfg!(desktop),
+            "gitMigration": migration.map(|m| json!({"remote": m.remote, "branch": m.branch})),
+            "lastSynced": sync.and_then(|s| s.last_synced),
+            "fileTransfers": cfg!(desktop)
+        })
     }
     fn write(&self, bytes: &[u8]) -> Result<(), String> {
         if bytes.len() as u64 > MAX_DOCUMENT {

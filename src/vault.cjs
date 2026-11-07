@@ -3,6 +3,9 @@ const sodium = require('libsodium-wrappers-sumo');
 
 const format = 'termlume-vault';
 const maxDocumentSize = 8 * 1024 * 1024;
+const maxGitDocumentSize = 12 * 1024 * 1024;
+const gitFormat = 'termlume-git-vault';
+const gitContext = 'termlume-git-vault:v1';
 const scopes = ['local', 'portable'];
 const wrapContext = (id, slot) => `termlume:v1:${id}:${slot}`;
 const dataContext = (header, scope) => JSON.stringify([
@@ -48,6 +51,36 @@ function validateEnvelope(envelope, scope) {
 }
 
 function recoveryCode() { return encode(randomBytes(32)); }
+
+function gitKey(secret) {
+  try { return decode(secret?.trim(), 32); }
+  catch { throw new Error('Git 同步密钥格式无效。'); }
+}
+
+function protectGitEnvelope(envelope, key) {
+  const contents = JSON.stringify(envelope);
+  if (Buffer.byteLength(contents) > maxDocumentSize) throw new Error('保险库数据超过大小上限。');
+  return { format: gitFormat, version: 1, payload: seal(key, contents, gitContext) };
+}
+
+function isProtectedGitEnvelope(envelope) { return envelope?.format === gitFormat; }
+
+function openGitEnvelope(envelope, key) {
+  if (!isProtectedGitEnvelope(envelope)) return validateEnvelope(envelope, 'portable');
+  if (envelope.version !== 1) throw new Error('保险库格式或版本无效。');
+  if (!key) throw new Error('请输入这套保险库的旧版同步密钥。');
+  let bytes;
+  try {
+    if (typeof envelope.payload?.ciphertext !== 'string' || envelope.payload.ciphertext.length > maxGitDocumentSize) {
+      throw new Error('保险库数据大小无效。');
+    }
+    bytes = open(key, envelope.payload, gitContext);
+    if (bytes.length > maxDocumentSize) throw new Error('保险库数据大小无效。');
+    return validateEnvelope(JSON.parse(Buffer.from(bytes).toString('utf8')), 'portable');
+  } catch {
+    throw new Error('无法解开旧 Git 快照，请核对旧版同步密钥。');
+  } finally { bytes?.fill(0); }
+}
 
 async function createVault(password, recovery) {
   if (typeof password !== 'string' || password.length < 12) throw new Error('主密码至少需要 12 个字符。');
@@ -103,4 +136,7 @@ async function unlockVault(envelope, secret, useRecovery = false) {
   } finally { wrappingKey?.fill(0); }
 }
 
-module.exports = { isVault, validateEnvelope, recoveryCode, createVault, encodeVault, decodeVault, unlockVault, maxDocumentSize };
+module.exports = {
+  isVault, validateEnvelope, recoveryCode, createVault, encodeVault, decodeVault, unlockVault, maxDocumentSize,
+  gitKey, protectGitEnvelope, isProtectedGitEnvelope, openGitEnvelope, maxGitDocumentSize
+};

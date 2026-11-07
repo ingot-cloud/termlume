@@ -2,11 +2,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const test = require('node:test');
 const { generateKey, scanKeys } = require('../src/keys.cjs');
-const { mergeSnapshots, remoteURL } = require('../src/git-vault.cjs');
+const { branchName, mergeSnapshots, remoteURL, resolveAuth, useRepository } = require('../src/git-vault.cjs');
 const { importSSHConfig } = require('../src/ssh-config.cjs');
-const { createVault, decodeVault, encodeVault, recoveryCode, unlockVault } = require('../src/vault.cjs');
+const { createVault, decodeVault, encodeVault, gitKey, openGitEnvelope, protectGitEnvelope, recoveryCode, unlockVault } = require('../src/vault.cjs');
 
 test('encrypted OpenSSH keys can be found and existing files survive generation conflicts', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'termlume-keys-'));
@@ -47,6 +48,47 @@ test('portable vaults reject invalid credentials and altered ciphertext', async 
   } finally { key.fill(0); }
 });
 
+test('a custom Git branch keeps the password envelope behind a separate key', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'termlume-sync-test-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  execFileSync('/usr/bin/git', ['init', '--bare', '--quiet', directory]);
+  const password = 'fixture password for Git';
+  const { key, header } = await createVault(password, recoveryCode());
+  const syncKey = gitKey(recoveryCode());
+  const wrongKey = gitKey(recoveryCode());
+  t.after(() => { key.fill(0); syncKey.fill(0); wrongKey.fill(0); });
+  const data = { hosts: [{ address: 'private.example.test', password: 'server password' }], parentCommit: null };
+  const legacy = encodeVault(key, header, 'portable', data);
+  assert.deepEqual(openGitEnvelope(legacy), legacy);
+
+  const branch = branchName('vault/personal');
+  const commit = await useRepository(directory, branch, undefined, ({ push }) =>
+    push(protectGitEnvelope(legacy, syncKey)));
+  const tip = await useRepository(directory, branch, undefined, ({ fetch }) => fetch());
+  assert.equal(tip.commit, commit);
+  assert.equal(tip.envelope.header, undefined);
+  assert.doesNotMatch(JSON.stringify(tip.envelope), /private\.example\.test|server password/);
+  assert.throws(() => openGitEnvelope(tip.envelope), /同步密钥/);
+  assert.throws(() => openGitEnvelope(tip.envelope, wrongKey), /同步密钥/);
+  const inner = openGitEnvelope(tip.envelope, syncKey);
+  await assert.rejects(unlockVault(inner, 'wrong password'), /无法解锁/);
+  const restored = await unlockVault(inner, password);
+  assert.deepEqual(restored.data, data);
+  restored.key.fill(0);
+
+  await useRepository(directory, branch, undefined, async ({ createCommit, pushCommit }) => {
+    const candidate = await createCommit(protectGitEnvelope(legacy, syncKey));
+    await assert.rejects(pushCommit(candidate, true));
+  });
+  assert.equal(execFileSync('/usr/bin/git', ['--git-dir', directory, 'rev-list', '--parents', `refs/heads/${branch}`], {
+    encoding: 'utf8'
+  }).trim(), commit);
+
+  const empty = await useRepository(directory, branchName(), undefined, ({ fetch }) => fetch());
+  assert.equal(empty, null);
+  assert.throws(() => branchName('@{-1}'), /分支名称/);
+});
+
 test('three-way merge keeps independent changes and explicitly resolves delete versus edit', () => {
   const a = { id: 'a', name: 'A' };
   const b = { id: 'b', name: 'B' };
@@ -58,7 +100,16 @@ test('three-way merge keeps independent changes and explicitly resolves delete v
   assert.deepEqual(conflict.conflicts, [{ id: a.id, local: undefined, remote: editedA }]);
   assert.deepEqual(mergeSnapshots(base, [b], [editedA, b], { a: 'local' }).records, [b]);
   assert.deepEqual(mergeSnapshots(base, [b], [editedA, b], { a: 'remote' }).records, [editedA, b]);
-  assert.throws(() => remoteURL('ext::sh -c unwanted'), /SSH 地址/);
+  assert.throws(() => remoteURL('ext::sh -c unwanted'), /仓库地址/);
+});
+
+test('HTTPS Git accepts separate credentials and rejects embedded tokens and insecure URLs', () => {
+  const remote = remoteURL('https://git.example.test/team/vault.git');
+  assert.equal(remote, 'https://git.example.test/team/vault.git');
+  assert.deepEqual(resolveAuth(remote, { username: 'fixture', token: ' token ' }), { username: 'fixture', token: 'token' });
+  assert.throws(() => resolveAuth(remote), /Token/);
+  assert.throws(() => remoteURL('https://fixture:secret@git.example.test/team/vault.git'), /仓库地址/);
+  assert.throws(() => remoteURL('http://git.example.test/team/vault.git'), /仓库地址/);
 });
 
 test('OpenSSH import flags routes that cannot be replayed and excludes negated aliases', () => {

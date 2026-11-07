@@ -42,6 +42,12 @@ function node(tag, className, ...children) {
   return element;
 }
 
+function summaryText(tag, text) {
+  const element = node(tag, 'text-ellipsis', text);
+  element.title = text;
+  return element;
+}
+
 function message(error) { return String(error.message || error).replace(/^Error invoking remote method '[^']+': Error: /, ''); }
 function sessionId() {
   if (crypto.randomUUID) return crypto.randomUUID();
@@ -226,21 +232,130 @@ function unlockMethod() {
   return select;
 }
 
+const defaultSyncBranch = 'termlume-vault';
+
+function gitAddressMethod(value) {
+  if (/^https:\/\//i.test(value)) return 'https';
+  if (/^(ssh:\/\/|[^@\s]+@[^:\s]+:)/i.test(value)) return 'ssh';
+}
+
+function githubHttpsAddress(value) {
+  const match = /^(?:git@github\.com:|ssh:\/\/git@github\.com(?::22)?\/)([\w.-]+\/[\w.-]+)\/?$/i.exec(value);
+  if (!match) return '';
+  return 'https://github.com/' + match[1] + (/\.git$/i.test(match[1]) ? '' : '.git');
+}
+
+function gitConnection(remote = '', { allowSaved = false, fixedAddress = false } = {}) {
+  const sshAvailable = vaultStatus.gitSsh !== false;
+  const savedMethod = gitAddressMethod(remote);
+  let method = savedMethod === 'ssh' && (sshAvailable || fixedAddress) ? 'ssh' : 'https';
+  const address = input(method === savedMethod || fixedAddress ? remote : githubHttpsAddress(remote));
+  address.required = true;
+  address.autocomplete = 'off';
+  address.readOnly = fixedAddress;
+  const username = input();
+  username.autocomplete = 'off';
+  const token = input('', 'password');
+  token.autocomplete = 'off';
+  const credentials = node('div', 'git-credential-fields',
+    field('Git 用户名', username), field('仓库访问 Token', token),
+    node('small', '', 'Token 用来读写仓库。应用会将它保存在本机加密保险库中。'));
+  const hint = node('p', 'muted');
+  const methods = node('div', 'settings-switcher git-connection-methods');
+  methods.setAttribute('role', 'group');
+  methods.setAttribute('aria-label', '连接方式');
+  const drafts = { [method]: address.value };
+  const controls = new Map();
+  for (const [value, label] of [['https', 'HTTPS + Token'], ['ssh', 'SSH']]) {
+    const control = button(label, () => {
+      if (value === method) return;
+      drafts[method] = address.value;
+      const nextAddress = drafts[value] ?? (value === 'https' ? githubHttpsAddress(address.value.trim()) : '');
+      method = value;
+      address.value = nextAddress;
+      refresh();
+    });
+    controls.set(value, control);
+    methods.append(control);
+  }
+  const refresh = () => {
+    const https = method === 'https';
+    for (const [value, control] of controls) control.setAttribute('aria-pressed', String(value === method));
+    credentials.hidden = !https;
+    address.placeholder = https ? 'https://github.com/owner/repo.git' : 'git@github.com:owner/repo.git';
+    hint.textContent = https
+      ? '填写 HTTPS 地址。仓库访问 Token 在下方单独填写。'
+      : 'SSH 使用本机已有的 SSH 配置。没有配置 SSH 时，请选择 HTTPS + Token。';
+    const canReuse = allowSaved && address.value.trim() === remote;
+    username.required = token.required = https && (!canReuse || Boolean(username.value || token.value));
+  };
+  address.addEventListener('input', () => {
+    const detected = gitAddressMethod(address.value.trim());
+    if (detected === 'https' || (detected === 'ssh' && sshAvailable)) method = detected;
+    drafts[method] = address.value;
+    token.value = '';
+    refresh();
+  });
+  for (const control of [username, token]) control.addEventListener('input', refresh);
+  refresh();
+  return {
+    token,
+    fields: [...(sshAvailable && !fixedAddress ? [methods] : []), hint, field('Git 仓库地址', address), credentials],
+    request() {
+      const remoteAddress = address.value.trim();
+      if (gitAddressMethod(remoteAddress) !== method) {
+        throw new Error(method === 'https' ? '请填写以 https:// 开头的仓库地址。' : '请填写仓库的 SSH 地址。');
+      }
+      return {
+        address: remoteAddress,
+        ...(method === 'https' && (username.value || token.value) ? { auth: { username: username.value, token: token.value } } : {})
+      };
+    }
+  };
+}
+
+function legacyGitKey() {
+  const secret = input('', 'password');
+  secret.autocomplete = 'off';
+  const fieldView = field('旧版同步密钥', secret);
+  fieldView.hidden = true;
+  return {
+    fieldView, secret,
+    async submit(action, request) {
+      try { return await action({ ...request, ...(secret.value ? { syncKey: secret.value } : {}) }); }
+      catch (error) {
+        if (message(error).includes('旧版同步密钥')) {
+          fieldView.hidden = false;
+          secret.required = true;
+        }
+        throw error;
+      }
+    }
+  };
+}
+
 async function restoreVault(fromGit) {
-  const address = input();
-  address.required = fromGit;
+  const connection = fromGit ? gitConnection() : null;
+  const branch = input(defaultSyncBranch);
+  const legacy = legacyGitKey();
   const secret = input('', 'password');
   secret.required = true;
   const mode = unlockMethod();
   const fields = [node('p', 'muted', '恢复需要空工作区。')];
-  if (fromGit) fields.push(field('Git 仓库 SSH 地址', address));
+  if (fromGit) fields.push(...connection.fields, field('同步分支', branch), legacy.fieldView);
   fields.push(field('解锁方式', selectControl(mode, '解锁方式')), field('解锁凭据', secret));
-  const state = await prompt(fromGit ? '从 Git 恢复' : '从加密备份恢复', fields, fromGit ? '恢复' : '选择备份并恢复', () => {
-    const request = { address: address.value, secret: secret.value, useRecovery: mode.value === 'recovery' };
-    return fromGit ? api.vault.restoreGit(request) : api.vault.restoreFile(request);
-  });
-  secret.value = '';
-  if (state) { applyVaultState(state); await refreshHosts(); status('保险库已恢复。'); }
+  try {
+    const state = await prompt(fromGit ? '从 Git 恢复' : '从加密备份恢复', fields, fromGit ? '恢复' : '选择备份并恢复', () => {
+      const request = { secret: secret.value, useRecovery: mode.value === 'recovery' };
+      return fromGit
+        ? legacy.submit(api.vault.restoreGit, { ...request, ...connection.request(), branch: branch.value })
+        : api.vault.restoreFile(request);
+    });
+    if (state) { applyVaultState(state); await refreshHosts(); status('保险库已恢复。'); }
+  } finally {
+    secret.value = legacy.secret.value = '';
+    if (connection) connection.token.value = '';
+  }
 }
 
 function conflictDescription(host) {
@@ -248,21 +363,81 @@ function conflictDescription(host) {
   return `${host.name} · ${endpoint(host)} · ${host.auth}${host.group ? ` · ${host.group}` : ''}${host.passwordSaved ? ' · 含已保存密码' : ''}`;
 }
 
-async function syncVault() {
-  let address = vaultStatus.remote;
+async function syncVault(mode) {
+  const { remote, branch: currentBranch } = vaultStatus;
+  const changeBranch = mode === 'branch';
+  const changeConnection = mode === 'connection';
+  const connection = !remote || changeConnection ? gitConnection(remote, { allowSaved: Boolean(remote) }) : null;
+  const legacy = legacyGitKey();
+  let request = {};
   let result;
-  if (!address) {
-    const fieldInput = input();
-    fieldInput.placeholder = 'git@github.com:owner/repo.git';
-    fieldInput.required = true;
-    result = await prompt('绑定 Git 同步仓库', [node('p', 'muted', '使用专用私有仓库和已授权的本机 SSH 身份。同步分支为 termlume-vault。'), field('Git 仓库 SSH 地址', fieldInput)], '绑定并同步', async () => {
-      address = fieldInput.value;
-      return api.vault.sync({ address });
-    });
-  } else {
-    status('正在同步保险库…');
-    result = await api.vault.sync({ address });
+  try {
+    if (connection || changeBranch) {
+      const branch = input(currentBranch || defaultSyncBranch);
+      const fields = connection ? [...connection.fields] : [];
+      if (changeBranch) fields.push(node('p', 'muted', '请先在 Git 服务上创建包含上次同步提交的目标分支，或重命名原分支。'));
+      if (!remote || changeBranch) fields.push(field('同步分支', branch));
+      const title = changeBranch ? '更改同步分支' : changeConnection ? '更改仓库连接' : '绑定 Git 同步仓库';
+      result = await prompt(title, [...fields, legacy.fieldView], remote ? '保存并同步' : '绑定并同步', () => {
+        request = { ...connection?.request(), ...(changeConnection ? { changeConnection: true } : {}) };
+        if (!remote || changeBranch) request.branch = branch.value;
+        return legacy.submit(api.vault.sync, request);
+      });
+      if (!result && !remote) applyVaultState(await api.vault.state());
+    } else {
+      status('正在同步保险库…');
+      try { result = await legacy.submit(api.vault.sync, request); }
+      catch (error) {
+        if (legacy.fieldView.hidden) throw error;
+        result = await prompt('兼容旧 Git 快照', [
+          node('p', 'muted', '这份快照使用了旧版独立密钥。输入一次后，应用会改用保险库主密码保护后续快照。'),
+          legacy.fieldView
+        ], '解开并同步', () => legacy.submit(api.vault.sync, request));
+      }
+    }
+    await finishGitOperation(result, request, (value) => legacy.submit(api.vault.sync, value), '应用选择并同步', '保险库已同步。');
+  } finally {
+    legacy.secret.value = '';
+    if (connection) connection.token.value = '';
   }
+}
+
+async function migrateVault() {
+  const pending = vaultStatus.gitMigration;
+  const connection = gitConnection(pending?.remote || '', { allowSaved: Boolean(pending), fixedAddress: Boolean(pending) });
+  const branch = input(pending?.branch || vaultStatus.branch || defaultSyncBranch);
+  branch.readOnly = Boolean(pending);
+  const legacy = legacyGitKey();
+  const fields = [
+    node('p', 'muted', '请使用新的空私有仓库。应用会在新仓库写入一份由保险库主密码保护的快照。其他设备请先同步，再暂停写入旧仓库。'),
+    ...connection.fields, field('新同步分支', branch), legacy.fieldView
+  ];
+  let request = {};
+  try {
+    const result = await prompt(pending ? '继续迁移 Git 仓库' : '迁移到新仓库', fields, pending ? '继续迁移' : '开始迁移', () => {
+      request = { ...connection.request(), branch: branch.value };
+      return legacy.submit(api.vault.migrateGit, request);
+    });
+    await finishGitOperation(result, request, (value) => legacy.submit(api.vault.migrateGit, value), '应用选择并迁移', '保险库已迁移到新仓库。');
+  } finally {
+    legacy.secret.value = connection.token.value = '';
+    const state = await api.vault.state();
+    if (state.gitMigration) {
+      if (!pending) applyVaultState(state);
+      await refreshHosts();
+    }
+  }
+}
+
+async function abandonGitMigration() {
+  if (!await confirm('放弃 Git 迁移', '本机将继续使用旧仓库。若新仓库已经收到快照，该快照会保留。', '放弃迁移')) return;
+  const result = await api.vault.migrateGit({ abandon: true });
+  applyVaultState(result.state);
+  await refreshHosts();
+  status('已放弃 Git 迁移。');
+}
+
+async function finishGitOperation(result, request, submit, label, success) {
   while (result?.conflicts) {
     const { ticket } = result;
     const rows = result.conflicts.map((conflict) => {
@@ -275,15 +450,15 @@ async function syncVault() {
         node('p', '', `仓库 · ${conflictDescription(conflict.remote)}`), selectControl(select, '冲突处理方式'));
       return { id: conflict.id, select, view };
     });
-    result = await prompt('解决同步冲突', [node('p', 'muted', '逐条选择保留的版本，密码内容已隐藏。'), node('div', 'key-list', ...rows.map((row) => row.view))], '应用选择并同步', () => {
-      return api.vault.sync({ address, ticket, choices: Object.fromEntries(rows.map(({ id, select }) => [id, select.value])) });
+    result = await prompt('解决同步冲突', [node('p', 'muted', '逐条选择保留的版本，密码内容已隐藏。'), node('div', 'key-list', ...rows.map((row) => row.view))], label, () => {
+      return submit({ ...request, ticket, choices: Object.fromEntries(rows.map(({ id, select }) => [id, select.value])) });
     });
     if (!result) status('同步冲突待处理。');
   }
   if (result?.state) {
     applyVaultState(result.state);
     await refreshHosts();
-    status(result.pending ? '同步完成，还有较新的本机修改待同步。' : '保险库已同步。');
+    status(result.pending ? `${success}还有较新的本机修改待同步。` : success);
   }
 }
 
@@ -292,7 +467,7 @@ function settingsHeading(title, subtitle, actions) {
 }
 
 function renderVaultPage() {
-  const { enabled, remote, lastSynced, locked } = vaultStatus;
+  const { enabled, remote, branch, fileTransfers, gitMigration, lastSynced, locked } = vaultStatus;
   const page = $('vault-page');
   if (locked) { page.replaceChildren(); return; }
   if (typeof enabled !== 'boolean') {
@@ -306,18 +481,58 @@ function renderVaultPage() {
     enabled ? button('锁定保险库', async () => applyVaultState(await api.vault.lock()), 'outlined') : button('启用保险库', enableVault, 'primary'));
   const card = (icon, title, text, action, detail) => node('section', 'vault-card',
     settingsIcon(icon), node('h3', '', title), node('p', 'muted', text), ...(detail ? [detail] : []), action);
-  const cards = enabled ? [
-    card('file', '加密备份', '把保险库导出为本地加密文件。', button('导出加密备份…', async () => {
-      if (await api.vault.export()) status('加密备份已导出。');
-    }, 'outlined')),
-    card('sync', 'Git 同步', remote ? (lastSynced ? `最近同步 · ${new Date(lastSynced).toLocaleString()}` : '尚未完成首次同步') : '通过专用私有 Git 仓库同步加密资料。',
-      button(remote ? '立即同步' : '绑定 Git 仓库…', async () => {
-        const action = page.querySelector('.vault-sync');
-        action.disabled = true;
-        try { await syncVault(); } finally { action.disabled = false; }
-      }, 'outlined vault-sync'), remote ? node('code', 'vault-remote', remote) : null)
+  const runGitAction = (action) => async () => {
+    const actions = [...page.querySelectorAll('.vault-sync')];
+    actions.forEach((action) => { action.disabled = true; });
+    try { await action(); } finally {
+      actions.forEach((action) => { action.disabled = false; });
+    }
+  };
+  const gitActions = gitMigration ? [
+    button('继续迁移', runGitAction(migrateVault), 'primary vault-sync'),
+    button('放弃迁移', runGitAction(abandonGitMigration), 'outlined vault-sync')
   ] : [
-    card('file', '本地备份', '使用备份文件和原有凭据恢复。', button('从加密备份恢复…', () => restoreVault(false), 'outlined')),
+    button(remote ? '立即同步' : '绑定 Git 仓库', runGitAction(() => syncVault()), 'primary vault-sync')
+  ];
+  const gitControls = node('div', 'vault-git-controls');
+  const gitActionRow = node('div', 'settings-actions', ...gitActions);
+  gitControls.append(gitActionRow);
+  if (!gitMigration && remote) {
+    const settings = node('div', 'vault-git-settings',
+      node('div', 'vault-git-setting',
+        button('更改仓库连接', runGitAction(() => syncVault('connection')), 'outlined vault-sync'),
+        node('small', '', '更新仓库访问 Token，或切换同一仓库的连接方式。')));
+    if (lastSynced) settings.append(
+      node('div', 'vault-git-setting',
+        button('更改同步分支', runGitAction(() => syncVault('branch')), 'outlined vault-sync'),
+        node('small', '', '在当前仓库切换分支，沿用已有提交。')),
+      node('div', 'vault-git-setting',
+        button('迁移到新仓库', runGitAction(migrateVault), 'outlined vault-sync'),
+        node('small', '', '在空仓库创建加密快照，旧提交留在原仓库。')));
+    settings.id = 'vault-git-settings';
+    settings.hidden = true;
+    const toggle = button('同步设置', () => {
+      settings.hidden = !settings.hidden;
+      toggle.setAttribute('aria-expanded', String(!settings.hidden));
+    }, 'outlined vault-sync');
+    toggle.setAttribute('aria-controls', settings.id);
+    toggle.setAttribute('aria-expanded', 'false');
+    gitActionRow.append(toggle);
+    gitControls.append(settings);
+  }
+  const gitStatus = gitMigration ? '迁移尚未完成' : remote
+    ? (lastSynced ? `最近同步 · ${new Date(lastSynced).toLocaleString()}` : '尚未完成首次同步')
+    : '通过专用私有 Git 仓库同步加密资料。';
+  const gitDetails = remote ? node('div', 'vault-remote',
+    summaryText('code', remote),
+    summaryText('code', `分支 · ${branch || defaultSyncBranch}`)) : null;
+  const cards = enabled ? [
+    ...(fileTransfers === false ? [] : [card('file', '加密备份', '把保险库导出为本地加密文件。', button('导出加密备份', async () => {
+      if (await api.vault.export()) status('加密备份已导出。');
+    }, 'outlined'))]),
+    card('sync', 'Git 同步', gitStatus, gitControls, gitDetails)
+  ] : [
+    ...(fileTransfers === false ? [] : [card('file', '本地备份', '使用备份文件和原有凭据恢复。', button('从加密备份恢复…', () => restoreVault(false), 'outlined'))]),
     card('sync', 'Git 仓库', '从已同步的私有 Git 仓库恢复。', button('从 Git 恢复…', () => restoreVault(true), 'outlined'))
   ];
   page.replaceChildren(settingsHeading('保险库', '管理主机资料的加密、备份和同步。'), hero,

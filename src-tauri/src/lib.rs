@@ -14,6 +14,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 mod git;
+mod git_https;
 mod keys;
 mod ssh;
 mod store;
@@ -233,9 +234,9 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         "vault:export" => return export(ws).await,
         #[cfg(desktop)]
         "vault:restore-file" => return restore(ws, value, false).await,
-        #[cfg(desktop)]
         "vault:restore-git" => return restore(ws, value, true).await,
         "vault:sync" => return git::synchronize(ws, parse(value)?).await,
+        "vault:migrate-git" => return git::migrate(ws, parse(value)?).await,
         "hosts:save" => {
             let ws = ws.clone();
             return blocking(move || save_host(&ws, value)).await;
@@ -633,7 +634,6 @@ async fn export(ws: &Workspace) -> Result<Value, String> {
     .map_err(error)?;
     Ok(json!(true))
 }
-#[cfg(desktop)]
 async fn restore(ws: &Workspace, value: Value, from_git: bool) -> Result<Value, String> {
     let revision = {
         let store = ws.store.lock().unwrap();
@@ -642,27 +642,53 @@ async fn restore(ws: &Workspace, value: Value, from_git: bool) -> Result<Value, 
     };
     let (envelope, sync) = if from_git {
         let remote = git::remote_url(string(&value["address"])?)?;
-        let repo = git::Repo::open(remote.clone(), CancellationToken::new()).await?;
+        let branch = git::branch_name(value.get("branch").map(string).transpose()?.unwrap_or(""))?;
+        let auth = git::resolve_auth(&remote, parse(value["auth"].clone())?, None)?;
+        let repo = git::Repo::open(
+            remote.clone(),
+            &branch,
+            auth.clone(),
+            CancellationToken::new(),
+        )
+        .await?;
         let tip = repo
             .fetch()
             .await?
-            .ok_or("仓库的 termlume-vault 分支尚无备份。")?;
-        (tip.envelope, Some((remote, tip.commit, tip.parent)))
+            .ok_or_else(|| format!("仓库的 {branch} 分支尚无备份。"))?;
+        let secret = value
+            .get("syncKey")
+            .map(string)
+            .transpose()?
+            .unwrap_or("")
+            .trim();
+        let sync_secret =
+            (tip.envelope.is_protected() && !secret.is_empty()).then(|| secret.to_owned());
+        let sync_key = sync_secret.as_deref().map(vault::git_key).transpose()?;
+        (
+            tip.envelope.open(sync_key.as_ref())?,
+            Some((remote, branch, sync_secret, auth, tip.commit, tip.parent)),
+        )
     } else {
-        let Some(file) = rfd::AsyncFileDialog::new()
-            .set_title("选择加密备份")
-            .add_filter("保险库", &["json"])
-            .pick_file()
-            .await
-        else {
-            return Ok(Value::Null);
-        };
-        let path = file.path().to_path_buf();
-        let envelope = blocking(move || {
-            serde_json::from_slice(&vault::bounded_read(&path, vault::MAX_DOCUMENT)?).map_err(error)
-        })
-        .await?;
-        (envelope, None)
+        #[cfg(mobile)]
+        return Err("请使用「从 Git 恢复」。".into());
+        #[cfg(desktop)]
+        {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .set_title("选择加密备份")
+                .add_filter("保险库", &["json"])
+                .pick_file()
+                .await
+            else {
+                return Ok(Value::Null);
+            };
+            let path = file.path().to_path_buf();
+            let envelope = blocking(move || {
+                serde_json::from_slice(&vault::bounded_read(&path, vault::MAX_DOCUMENT)?)
+                    .map_err(error)
+            })
+            .await?;
+            (envelope, None)
+        }
     };
     let secret = Zeroizing::new(string(&value["secret"])?.to_owned());
     let recovery = flag(&value, "useRecovery");
@@ -670,12 +696,15 @@ async fn restore(ws: &Workspace, value: Value, from_git: bool) -> Result<Value, 
     let (key, snapshot) =
         blocking(move || envelope.unlock::<git::Snapshot>(&secret, recovery, "portable")).await?;
     let rows = store::portable_rows(snapshot.hosts)?;
-    let binding = if let Some((remote, commit, parent)) = sync {
+    let binding = if let Some((remote, branch, sync_key, auth, commit, parent)) = sync {
         if snapshot.parent_commit != parent {
             return Err("快照与仓库提交历史不一致。".into());
         }
         Some(Binding {
             remote,
+            branch,
+            sync_key,
+            auth,
             commit: Some(commit),
             base: rows.clone(),
             last_synced: Some(now()),

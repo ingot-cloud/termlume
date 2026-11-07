@@ -9,7 +9,7 @@ const { Transfers } = require('./transfers.cjs');
 const { scanKeys, generateKey, agentKeys } = require('./keys.cjs');
 const { importSSHConfig } = require('./ssh-config.cjs');
 const vault = require('./vault.cjs');
-const { remoteURL, useRepository, mergeSnapshots, sameRecord } = require('./git-vault.cjs');
+const { branchName, defaultBranch, remoteURL, resolveAuth, useRepository, mergeSnapshots, sameRecord } = require('./git-vault.cjs');
 
 const pageURL = 'termlume://workspace/index.html';
 protocol.registerSchemesAsPrivileged([{ scheme: 'termlume', privileges: { standard: true, secure: true } }]);
@@ -325,7 +325,14 @@ function checkId(id) {
 }
 
 function vaultState() {
-  return { enabled: Boolean(store.envelope), locked: !store.data, remote: store.data?.sync?.remote || '', lastSynced: store.data?.sync?.lastSynced };
+  const sync = store.data?.sync;
+  const migration = store.data?.gitMigration;
+  return {
+    enabled: Boolean(store.envelope), locked: !store.data, remote: sync?.remote || '',
+    branch: sync ? sync.branch ?? defaultBranch : undefined,
+    lastSynced: sync?.lastSynced,
+    gitMigration: migration ? { remote: migration.remote, branch: migration.branch } : undefined
+  };
 }
 
 function lockVault() {
@@ -398,7 +405,10 @@ async function restoreEnvelope(envelope, secret, useRecovery, original, sync) {
     if (requireEmptyProfile() !== original) throw new Error('工作区已变化，请重试恢复。');
     if (sync && data.parentCommit !== sync.parent) throw new Error('快照与仓库提交历史不一致。');
     const rows = portableRows(data.hosts);
-    const binding = sync ? { remote: sync.remote, commit: sync.commit, base: rows, lastSynced: sync.lastSynced } : undefined;
+    const binding = sync ? {
+      remote: sync.remote, branch: sync.branch, syncKey: sync.syncKey, auth: sync.auth,
+      commit: sync.commit, base: rows, lastSynced: sync.lastSynced
+    } : undefined;
     store.installVault(key, envelope.header, applySnapshot({ hosts: [], fingerprints: [] }, rows, binding));
   } catch (error) { key.fill(0); throw error; }
   return vaultState();
@@ -410,42 +420,64 @@ function summarized(row) {
   return { ...host, passwordSaved: Boolean(password) };
 }
 
-async function synchronize({ address, ticket, choices }) {
+function snapshotAt(tip, key, vaultId, gitKey) {
+  const envelope = vault.openGitEnvelope(tip.envelope, gitKey);
+  if (envelope.header.id !== vaultId) throw new Error('仓库中是另一套保险库。');
+  const data = vault.decodeVault(key, envelope, 'portable');
+  if ((data.parentCommit ?? null) !== tip.parent) throw new Error('快照与仓库提交历史不一致。');
+  return portableRows(data.hosts);
+}
+
+async function synchronize({ address, branch: requestedBranch, auth: enteredAuth, changeConnection, syncKey: enteredKey, ticket, choices } = {}) {
   if (!store.key) throw new Error('请先启用并解锁保险库。');
   if (syncTask) throw new Error('已有同步任务正在运行。');
-  const remote = remoteURL(address || store.data.sync?.remote);
-  if (store.data.sync?.remote && store.data.sync.remote !== remote) throw new Error('此保险库已绑定另一仓库。');
+  if (store.data.gitMigration) throw new Error('请先继续或放弃待完成的 Git 迁移。');
+  const binding = store.data.sync;
+  const remote = remoteURL(address || binding?.remote);
+  if (binding?.remote && binding.remote !== remote && !changeConnection) throw new Error('请在同步设置中更改仓库连接。');
+  const currentBranch = binding?.branch ?? defaultBranch;
+  const branch = branchName(requestedBranch ?? currentBranch);
+  const switching = binding && currentBranch !== branch;
+  const changingRemote = binding && binding.remote !== remote;
+  if ((switching || changingRemote) && !binding.commit) throw new Error('请先完成当前分支的首次同步。');
+  const auth = resolveAuth(remote, enteredAuth, binding?.remote === remote ? binding.auth : undefined);
+  const syncKey = enteredKey?.trim() || binding?.syncKey;
   const key = store.key;
   const header = store.envelope.header;
   const controller = syncTask = new AbortController();
   try {
-    return await useRepository(remote, controller.signal, async ({ fetch, descendant, push }) => {
+    return await useRepository(remote, branch, controller.signal, async ({ fetch, descendant, push }) => {
       for (let attempt = 0; attempt < 3; attempt++) {
         const tip = await fetch();
         unchangedVault(key);
         let prior = store.data.sync;
         if (!prior && tip) throw new Error('仓库的同步分支已有保险库，请用「从 Git 恢复」。');
-        if (prior?.commit && (!tip || !await descendant(prior.commit, tip.commit))) throw new Error('远端同步分支已删除或历史已重写，同步已暂停。');
+        if (prior?.commit && (!tip || !await descendant(prior.commit, tip.commit))) {
+          if (changingRemote) throw new Error('新地址必须指向包含上次同步提交的仓库。换到空仓库请用「迁移到新仓库」。');
+          if (switching) throw new Error('目标分支必须包含上次同步的提交。请先在 Git 服务上创建或重命名分支。');
+          throw new Error('远端同步分支已删除或历史已重写，同步已暂停。');
+        }
         unchangedVault(key);
         if (!prior) {
-          prior = { remote, commit: null, base: [] };
+          prior = { remote, branch, auth, commit: null, base: [] };
           store.update({ ...store.data, sync: prior });
         }
-        if (tip && tip.envelope.header?.id !== header.id) throw new Error('仓库中是另一套保险库，同步已暂停。');
-        const remoteData = tip ? vault.decodeVault(key, tip.envelope, 'portable') : null;
-        if (tip && remoteData.parentCommit !== tip.parent) throw new Error('快照与仓库提交历史不一致，同步已暂停。');
-        const theirs = remoteData ? portableRows(remoteData.hosts) : [];
+        const oldFormat = tip && vault.isProtectedGitEnvelope(tip.envelope);
+        const gitKey = oldFormat && syncKey ? vault.gitKey(syncKey) : undefined;
+        let theirs;
+        try { theirs = tip ? snapshotAt(tip, key, header.id, gitKey) : []; } finally { gitKey?.fill(0); }
         const ours = snapshot();
-        const decision = pendingConflict && pendingConflict.ticket === ticket && pendingConflict.remote === remote
-          && pendingConflict.commit === tip?.commit && sameRecord(pendingConflict.local, ours) ? choices : undefined;
+        const decision = pendingConflict && pendingConflict.ticket === ticket && pendingConflict.remote === remote && pendingConflict.branch === branch
+          && pendingConflict.commit === tip?.commit && !pendingConflict.migration
+          && sameRecord(pendingConflict.local, ours) ? choices : undefined;
         const { records, conflicts } = mergeSnapshots(prior.base, ours, theirs, decision);
         if (conflicts.length) {
           const conflictTicket = randomUUID();
-          pendingConflict = { ticket: conflictTicket, remote, commit: tip?.commit, local: ours };
+          pendingConflict = { ticket: conflictTicket, remote, branch, commit: tip?.commit, local: ours };
           return { ticket: conflictTicket, conflicts: conflicts.map((item) => ({ id: item.id, local: summarized(item.local), remote: summarized(item.remote) })) };
         }
         let commit = tip?.commit;
-        if (!tip || !sameRecord(records, theirs)) {
+        if (!tip || oldFormat || !sameRecord(records, theirs)) {
           try {
             const envelope = vault.encodeVault(key, header, 'portable', { hosts: records, parentCommit: tip?.commit || null });
             commit = await push(envelope, tip?.commit);
@@ -457,11 +489,91 @@ async function synchronize({ address, ticket, choices }) {
         // Edits made while the network operation ran stay pending on top of the accepted commit.
         const keepNewer = Object.fromEntries(ours.concat(latest).map((row) => [row.id, 'local']));
         const local = mergeSnapshots(ours, latest, records, keepNewer).records;
-        store.update(applySnapshot(store.data, local, { remote, commit, base: records, lastSynced: Date.now() }));
+        store.update(applySnapshot(store.data, local, { remote, branch, auth, commit, base: records, lastSynced: Date.now() }));
         pendingConflict = undefined;
         return { state: vaultState(), pending: !sameRecord(local, records) };
       }
-    });
+    }, auth);
+  } finally { syncTask = undefined; }
+}
+
+async function migrateGit({ address, branch: requestedBranch, auth: enteredAuth, syncKey: enteredKey, ticket, choices, abandon } = {}) {
+  if (!store.key) throw new Error('请先启用并解锁保险库。');
+  if (syncTask) throw new Error('已有同步任务正在运行。');
+  const pending = store.data.gitMigration;
+  if (abandon) {
+    if (pending) {
+      store.update({ ...store.data, gitMigration: undefined });
+      pendingConflict = undefined;
+    }
+    return { state: vaultState() };
+  }
+  const prior = store.data.sync;
+  if (!prior?.commit) throw new Error('请先完成旧仓库的首次同步。');
+  const remote = remoteURL(address || pending?.remote);
+  const branch = branchName(requestedBranch ?? pending?.branch);
+  if (remote === prior.remote) throw new Error('请选择一个新的空仓库。');
+  if (pending && (pending.remote !== remote || pending.branch !== branch)) {
+    throw new Error('请继续或放弃待完成的 Git 迁移后，再更改目标。');
+  }
+  const auth = resolveAuth(remote, enteredAuth, pending?.auth);
+  const key = store.key;
+  const header = store.envelope.header;
+  const controller = syncTask = new AbortController();
+  try {
+    return await useRepository(remote, branch, controller.signal, async (destination) => {
+      const refs = await destination.refs();
+      let commit, records, syncKey;
+      if (pending && destination.advertisedCommit(refs) === pending.commit) {
+        const tip = await destination.fetch();
+        if (tip?.commit !== pending.commit || tip.parent !== null) throw new Error('新仓库刚有更新，请核对目标仓库。');
+        commit = tip.commit;
+        syncKey = pending.syncKey;
+        const legacyKey = syncKey ? vault.gitKey(syncKey) : undefined;
+        try { records = snapshotAt(tip, key, header.id, legacyKey); } finally { legacyKey?.fill(0); }
+      } else {
+        if (refs) throw new Error('目标仓库必须为空，请创建不含分支或标签的新仓库。');
+        const staged = await useRepository(prior.remote, prior.branch ?? defaultBranch, controller.signal, async (source) => {
+          const tip = await source.fetch();
+          if (!tip) throw new Error('旧同步分支已删除。');
+          if (!await source.descendant(prior.commit, tip.commit)) throw new Error('旧同步分支的历史已重写，迁移已暂停。');
+          const sourceSecret = enteredKey?.trim() || prior.syncKey;
+          const sourceKey = sourceSecret && vault.isProtectedGitEnvelope(tip.envelope) ? vault.gitKey(sourceSecret) : undefined;
+          let theirs;
+          try { theirs = snapshotAt(tip, key, header.id, sourceKey); } finally { sourceKey?.fill(0); }
+          unchangedVault(key);
+          const ours = snapshot();
+          const migration = { remote, branch };
+          const decision = pendingConflict?.ticket === ticket && pendingConflict?.commit === tip.commit
+            && sameRecord(pendingConflict.migration, migration) && sameRecord(pendingConflict.local, ours) ? choices : undefined;
+          const { records, conflicts } = mergeSnapshots(prior.base, ours, theirs, decision);
+          if (conflicts.length) {
+            const conflictTicket = randomUUID();
+            pendingConflict = { ticket: conflictTicket, commit: tip.commit, local: ours, migration };
+            return { ticket: conflictTicket, conflicts: conflicts.map((item) => ({ id: item.id, local: summarized(item.local), remote: summarized(item.remote) })) };
+          }
+          const envelope = vault.encodeVault(key, header, 'portable', { hosts: records, parentCommit: null });
+          const commit = await destination.createCommit(envelope);
+          if (source.advertisedCommit(await source.refs()) !== tip.commit) throw new Error('旧仓库刚有更新，请重试迁移。');
+          if (await destination.refs()) throw new Error('目标仓库已出现提交，请更换空仓库。');
+          unchangedVault(key);
+          const latest = snapshot();
+          const keepNewer = Object.fromEntries(ours.concat(latest).map((row) => [row.id, 'local']));
+          const local = mergeSnapshots(ours, latest, records, keepNewer).records;
+          const data = applySnapshot(store.data, local, { ...prior, commit: tip.commit, base: theirs });
+          store.update({ ...data, gitMigration: { remote, branch, auth, commit } });
+          await destination.pushCommit(commit, true);
+          return { commit, records };
+        }, prior.auth);
+        if (staged.conflicts) return staged;
+        ({ commit, records } = staged);
+      }
+      unchangedVault(key);
+      const sync = { remote, branch, syncKey, auth, commit, base: records, lastSynced: Date.now() };
+      store.update({ ...store.data, sync, gitMigration: undefined });
+      pendingConflict = undefined;
+      return { state: vaultState(), pending: !sameRecord(snapshot(), records) };
+    }, auth);
   } finally { syncTask = undefined; }
 }
 
@@ -511,16 +623,26 @@ function registerVaultHandlers() {
     if (!stat.isFile() || stat.size > vault.maxDocumentSize) throw new Error('保险库备份大小无效。');
     return restoreEnvelope(JSON.parse(await fs.promises.readFile(filePaths[0], 'utf8')), secret, useRecovery === true, original);
   });
-  handle('vault:restore-git', async ({ address, secret, useRecovery }) => {
+  handle('vault:restore-git', async ({ address, branch: requestedBranch, auth: enteredAuth, syncKey, secret, useRecovery }) => {
     const original = requireEmptyProfile();
     const remote = remoteURL(address);
-    return useRepository(remote, undefined, async ({ fetch }) => {
+    const branch = branchName(requestedBranch);
+    const auth = resolveAuth(remote, enteredAuth);
+    return useRepository(remote, branch, undefined, async ({ fetch }) => {
       const tip = await fetch();
-      if (!tip) throw new Error('仓库的 termlume-vault 分支尚无备份。');
-      return restoreEnvelope(tip.envelope, secret, useRecovery === true, original, { remote, commit: tip.commit, parent: tip.parent, lastSynced: Date.now() });
-    });
+      if (!tip) throw new Error('所选分支尚无备份。');
+      const enteredKey = vault.isProtectedGitEnvelope(tip.envelope) ? syncKey?.trim() : undefined;
+      const gitKey = enteredKey ? vault.gitKey(enteredKey) : undefined;
+      try {
+        const envelope = vault.openGitEnvelope(tip.envelope, gitKey);
+        return restoreEnvelope(envelope, secret, useRecovery === true, original, {
+          remote, branch, auth, syncKey: enteredKey || undefined, commit: tip.commit, parent: tip.parent, lastSynced: Date.now()
+        });
+      } finally { gitKey?.fill(0); }
+    }, auth);
   });
   handle('vault:sync', synchronize);
+  handle('vault:migrate-git', migrateGit);
 }
 
 function registerHandlers() {

@@ -25,6 +25,72 @@ pub struct Envelope {
     payload: Sealed,
 }
 
+const GIT_FORMAT: &str = "termlume-git-vault";
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum GitEnvelope {
+    Legacy(Envelope),
+    Protected(ProtectedGitEnvelope),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedGitEnvelope {
+    format: String,
+    version: u32,
+    payload: Sealed,
+}
+
+// The inner envelope is base64-encoded before the outer layer is sealed.
+pub const MAX_GIT_DOCUMENT: u64 = 12 * 1024 * 1024;
+
+pub fn git_key(secret: &str) -> Result<Key, String> {
+    recovery_key(secret).map_err(|_| "Git 同步密钥格式无效。".into())
+}
+
+impl GitEnvelope {
+    #[cfg(test)]
+    pub fn protect(envelope: &Envelope, key: &Key) -> Result<Self, String> {
+        let bytes = serde_json::to_vec(envelope).map_err(crate::error)?;
+        if bytes.len() as u64 > MAX_DOCUMENT {
+            return Err("保险库数据超过大小上限。".into());
+        }
+        Ok(Self::Protected(ProtectedGitEnvelope {
+            format: GIT_FORMAT.into(),
+            version: 1,
+            payload: seal(key, &bytes, b"termlume-git-vault:v1")?,
+        }))
+    }
+
+    pub fn is_protected(&self) -> bool {
+        matches!(self, Self::Protected(_))
+    }
+
+    pub fn open(&self, key: Option<&Key>) -> Result<Envelope, String> {
+        match self {
+            Self::Legacy(envelope) => Ok(envelope.clone()),
+            Self::Protected(envelope) => {
+                if envelope.format != GIT_FORMAT || envelope.version != 1 {
+                    return Err(INVALID.into());
+                }
+                let key = key.ok_or("请输入这套保险库的旧版同步密钥。")?;
+                let bytes = open_with_limit(
+                    key,
+                    &envelope.payload,
+                    b"termlume-git-vault:v1",
+                    MAX_GIT_DOCUMENT,
+                )
+                .map_err(|_| "无法解开旧 Git 快照，请核对旧版同步密钥。")?;
+                if bytes.len() as u64 > MAX_DOCUMENT {
+                    return Err(INVALID.into());
+                }
+                serde_json::from_slice(&bytes).map_err(crate::error)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Header {
     pub id: Uuid,
@@ -205,8 +271,17 @@ fn seal(key: &Key, plaintext: &[u8], aad: &[u8]) -> Result<Sealed, String> {
 }
 
 fn open(key: &Key, sealed: &Sealed, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    open_with_limit(key, sealed, aad, MAX_DOCUMENT)
+}
+
+fn open_with_limit(
+    key: &Key,
+    sealed: &Sealed,
+    aad: &[u8],
+    limit: u64,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let nonce = B64.decode(&sealed.nonce).map_err(crate::error)?;
-    if nonce.len() != 24 || sealed.ciphertext.len() as u64 > MAX_DOCUMENT {
+    if nonce.len() != 24 || sealed.ciphertext.len() as u64 > limit {
         return Err(INVALID.into());
     }
     let data = B64.decode(&sealed.ciphertext).map_err(crate::error)?;
