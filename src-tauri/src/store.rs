@@ -1,5 +1,7 @@
 use crate::{
-    error, ssh, startup_unlock,
+    error,
+    forwarding::LocalForward,
+    ssh, startup_unlock,
     vault::{self, Envelope, Header, Key, MAX_DOCUMENT},
 };
 use serde::{Deserialize, Serialize};
@@ -27,6 +29,8 @@ pub struct Host {
     pub key_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jump_host_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub local_forwards: Vec<LocalForward>,
     pub group: String,
     pub tags: Vec<String>,
     pub note: String,
@@ -44,6 +48,7 @@ impl Default for Host {
             auth: "agent".into(),
             key_path: None,
             jump_host_id: None,
+            local_forwards: vec![],
             group: String::new(),
             tags: vec![],
             note: String::new(),
@@ -83,6 +88,7 @@ impl Host {
         Ok(Some(jump))
     }
     pub fn normalized(mut self, allow_missing_key: bool) -> Result<Self, String> {
+        crate::forwarding::normalize_rules(&mut self.local_forwards)?;
         self.address = checked(&self.address, "主机地址", 255)?
             .trim_start_matches('[')
             .trim_end_matches(']')

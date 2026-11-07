@@ -1428,3 +1428,329 @@ async fn macos_jump_routes_gate_both_hosts_and_carry_all_channels() {
     call(&ws, "hosts:clear-password", jump["id"].clone()).await;
     ws.connections.close_all();
 }
+
+#[tokio::test]
+async fn local_forward_rules_validate_persist_and_compare_changes() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let host = call(
+        &ws,
+        "hosts:save",
+        json!({"address":"forward.test","port":22,"username":"ops","auth":"agent"}),
+    )
+    .await[0]
+        .clone();
+    assert!(host.get("localForwards").is_none());
+    let valid =
+        json!({"name":"数据库","localPort":15432,"remoteAddress":"[::1]","remotePort":5432});
+    for field in [
+        json!({"localPort":0}),
+        json!({"remotePort":65536}),
+        json!({"remoteAddress":"user@service"}),
+        json!({"remoteAddress":"[]"}),
+        json!({"name":""}),
+    ] {
+        let mut bad = valid.clone();
+        for (k, v) in field.as_object().unwrap() {
+            bad[k] = v.clone();
+        }
+        assert!(dispatch(
+            &ws,
+            "forwards:save",
+            json!({"hostId":host["id"],"rule":bad})
+        )
+        .await
+        .is_err());
+    }
+    let saved = call(
+        &ws,
+        "forwards:save",
+        json!({"hostId":host["id"],"rule":valid}),
+    )
+    .await[0]
+        .clone();
+    let rule = saved["localForwards"][0].clone();
+    let mut renamed = host.clone();
+    renamed["name"] = json!("renamed host");
+    let preserved = call(&ws, "hosts:save", renamed).await;
+    assert_eq!(preserved[0]["localForwards"][0], rule);
+    assert_eq!(rule["remoteAddress"], "::1");
+    assert!(dispatch(
+        &ws,
+        "forwards:save",
+        json!({"hostId":host["id"],"rule":valid})
+    )
+    .await
+    .is_err());
+    let mut edited = rule.clone();
+    edited["name"] = json!("主库");
+    assert!(dispatch(
+        &ws,
+        "forwards:save",
+        json!({"hostId":host["id"],"rule":edited})
+    )
+    .await
+    .is_err());
+    call(
+        &ws,
+        "forwards:save",
+        json!({"hostId":host["id"],"rule":edited,"expected":rule}),
+    )
+    .await;
+    assert!(dispatch(
+        &ws,
+        "forwards:delete",
+        json!({"hostId":host["id"],"rule":rule,"expected":rule})
+    )
+    .await
+    .is_err());
+    let data = ws.store.lock().unwrap().data().unwrap().clone();
+    let rows = data.snapshot();
+    assert_eq!(json!(rows)[0]["localForwards"][0], edited);
+    let recovery = vault::recovery_code();
+    let (key, header) = vault::create("forward fixture password", &recovery).unwrap();
+    let envelope = vault::encode(&key, &header, "portable", &rows).unwrap();
+    let (_, decoded) = envelope
+        .unlock::<Vec<store::Row>>("forward fixture password", false, "portable")
+        .unwrap();
+    assert!(rows == decoded);
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(
+        call(&ws, "hosts:list", Value::Null).await[0]["localForwards"][0],
+        edited
+    );
+    call(
+        &ws,
+        "forwards:delete",
+        json!({"hostId":host["id"],"rule":edited,"expected":edited}),
+    )
+    .await;
+    assert!(call(&ws, "hosts:list", Value::Null).await[0]
+        .get("localForwards")
+        .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated localhost SSH, jump, and TCP echo fixtures"]
+async fn macos_local_forward_relays_and_releases_resources() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+    async fn free_port() -> u16 {
+        TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+    async fn echo(port: u16, bytes: Vec<u8>) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (mut read, mut write) = stream.split();
+        let expected = bytes.clone();
+        let send = async {
+            write.write_all(&bytes).await.unwrap();
+            write.shutdown().await.unwrap();
+        };
+        let receive = async {
+            let mut data = Vec::new();
+            read.read_to_end(&mut data).await.unwrap();
+            assert_eq!(data, expected);
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(send, receive);
+        })
+        .await
+        .unwrap();
+    }
+    let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(), None);
+    let ssh_port: u16 = std::fs::read_to_string(fixture.join("openssh-port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let echo_port: u16 = std::fs::read_to_string(fixture.join("echo-port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let jump_port: Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("jump-server.json")).unwrap()).unwrap();
+    let jump = call(
+        &ws,
+        "hosts:save",
+        json!({"address":"127.0.0.1","port":jump_port["port"],"username":"jump","auth":"password"}),
+    )
+    .await[0]
+        .clone();
+    let mut rx = events(&ws);
+    for routed in [false, true] {
+        let mut draft = json!({"address":if routed {"target.internal.test"} else {"127.0.0.1"},"port":ssh_port,"username":std::env::var("USER").unwrap(),"auth":"agent"});
+        if routed {
+            draft["jumpHostId"] = jump["id"].clone();
+        }
+        let host = call(&ws, "hosts:save", draft)
+            .await
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let tab = if !routed {
+            connect_tab(&ws, &mut rx, &host, "", false, false).await
+        } else {
+            let tab = Uuid::new_v4();
+            call(&ws,"ssh:connect",json!({"id":tab,"expected":host,"secret":"","jump":{"expected":jump,"secret":"jump-only-secret"}})).await;
+            loop {
+                let event = until(&mut rx, |e| {
+                    e["id"] == tab.to_string()
+                        && matches!(e["type"].as_str(), Some("trust" | "session"))
+                })
+                .await;
+                if event["type"] == "trust" {
+                    call(
+                        &ws,
+                        "ssh:trust",
+                        json!({"id":tab,"accepted":true,"challenge":event["challenge"]}),
+                    )
+                    .await;
+                } else {
+                    assert_eq!(event["status"], "ready", "{event}");
+                    break;
+                }
+            }
+            tab
+        };
+        let port = free_port().await;
+        let rules = call(&ws,"forwards:save",json!({"hostId":host["id"],"rule":{"name":"echo","localPort":port,"remoteAddress":"127.0.0.1","remotePort":echo_port}})).await;
+        let rule = rules
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == host["id"])
+            .unwrap()["localForwards"][0]
+            .clone();
+        let request = json!({"sessionId":tab,"ruleId":rule["id"],"expected":rule});
+        let occupied = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        assert!(dispatch(&ws, "forwards:start", request.clone())
+            .await
+            .unwrap_err()
+            .contains("无法监听"));
+        drop(occupied);
+        let run = call(&ws, "forwards:start", request.clone()).await;
+        assert_eq!(run["status"], "running");
+        assert!(dispatch(&ws, "forwards:start", request.clone())
+            .await
+            .is_err());
+        assert!(dispatch(
+            &ws,
+            "forwards:delete",
+            json!({"hostId":host["id"],"rule":rule,"expected":rule})
+        )
+        .await
+        .is_err());
+        let bytes: Vec<_> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        tokio::join!(echo(port, bytes.clone()), echo(port, bytes));
+        // Stop closes established sockets, then the same port is immediately reusable.
+        let mut held = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        held.write_all(b"held").await.unwrap();
+        let mut response = [0; 4];
+        held.read_exact(&mut response).await.unwrap();
+        call(&ws, "forwards:stop", run["id"].clone()).await;
+        let mut byte = [0];
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), held.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        ));
+        let bind = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        drop(bind);
+        // A target-channel failure is reported without closing the SSH session or listener.
+        let unavailable = free_port().await;
+        let mut broken = rule.clone();
+        broken["remotePort"] = json!(unavailable);
+        let changed = call(
+            &ws,
+            "forwards:save",
+            json!({"hostId":host["id"],"rule":broken,"expected":rule}),
+        )
+        .await;
+        let broken = changed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == host["id"])
+            .unwrap()["localForwards"][0]
+            .clone();
+        let run = call(
+            &ws,
+            "forwards:start",
+            json!({"sessionId":tab,"ruleId":rule["id"],"expected":broken}),
+        )
+        .await;
+        let _connection = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let failed = until(&mut rx, |e| {
+            e["type"] == "forward"
+                && e["id"] == run["id"]
+                && e["error"].as_str().is_some_and(|s| !s.is_empty())
+        })
+        .await;
+        assert_eq!(failed["status"], "running");
+        assert!(ws.connections.connected(tab).is_ok());
+        call(&ws, "forwards:stop", run["id"].clone()).await;
+        call(
+            &ws,
+            "forwards:save",
+            json!({"hostId":host["id"],"rule":rule,"expected":broken}),
+        )
+        .await;
+        if !routed {
+            let locking = call(&ws, "forwards:start", request.clone()).await;
+            call(
+                &ws,
+                "vault:enable",
+                json!({"password":"forward vault password","recovery":vault::recovery_code()}),
+            )
+            .await;
+            call(&ws, "vault:lock", Value::Null).await;
+            until(&mut rx, |e| {
+                e["type"] == "forward" && e["id"] == locking["id"] && e["status"] == "stopped"
+            })
+            .await;
+            assert!(ws.connections.connected(tab).is_ok());
+            assert!(dispatch(&ws, "forwards:start", request.clone())
+                .await
+                .is_err());
+            call(
+                &ws,
+                "vault:unlock",
+                json!({"secret":"forward vault password"}),
+            )
+            .await;
+            assert_eq!(call(&ws, "forwards:list", Value::Null).await, json!([]));
+        }
+        let restarted = call(&ws, "forwards:start", request.clone()).await;
+        if routed {
+            std::fs::write(fixture.join("jump-disconnect"), b"close").unwrap();
+        } else {
+            call(&ws, "ssh:close", json!(tab)).await;
+        }
+        until(&mut rx, |e| {
+            e["type"] == "forward" && e["id"] == restarted["id"] && e["status"] == "stopped"
+        })
+        .await;
+        let bind = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        drop(bind);
+        assert!(dispatch(&ws, "forwards:start", request.clone())
+            .await
+            .is_err());
+        if routed {
+            std::fs::remove_file(fixture.join("jump-disconnect")).unwrap();
+        }
+    }
+    assert_eq!(call(&ws, "forwards:list", Value::Null).await, json!([]));
+    ws.connections.close_all();
+}

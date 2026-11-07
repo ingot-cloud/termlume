@@ -52,7 +52,7 @@ export SSH_AUTH_SOCK="$fixture/agent.sock"
 pids+=("$!")
 node - "$fixture" <<'NODE' &
 const { appendFileSync, readFileSync, writeFileSync, existsSync } = require('node:fs');
-const { connect } = require('node:net');
+const { connect, createServer: createTcpServer } = require('node:net');
 const { execFileSync, spawn } = require('node:child_process');
 const { createServer } = require('node:https');
 const { join } = require('node:path');
@@ -133,6 +133,8 @@ const fixture = process.argv[2];
     }));
   });
   server.listen(0, '127.0.0.1', () => writeFileSync(join(fixture, 'password-server.json'), JSON.stringify(server.address())));
+  const echo = createTcpServer((socket) => { socket.on('error', () => {}); socket.pipe(socket); });
+  echo.listen(0, '127.0.0.1', () => writeFileSync(join(fixture, 'echo-port'), String(echo.address().port)));
   const jumpClients = new Set();
   const jump = new Server({ hostKeys: [readFileSync(join(fixture, 'jump-host'))] }, (client) => {
     jumpClients.add(client);
@@ -167,7 +169,7 @@ const fixture = process.argv[2];
 NODE
 pids+=("$!")
 for attempt in {1..100}; do
-  if [ -S "$SSH_AUTH_SOCK" ] && [ -s "$fixture/password-server.json" ] && [ -s "$fixture/jump-server.json" ] && [ -s "$fixture/https-port" ] && /usr/bin/grep -q 'Server listening' "$fixture/sshd.log"; then break; fi
+  if [ -S "$SSH_AUTH_SOCK" ] && [ -s "$fixture/password-server.json" ] && [ -s "$fixture/jump-server.json" ] && [ -s "$fixture/echo-port" ] && [ -s "$fixture/https-port" ] && /usr/bin/grep -q 'Server listening' "$fixture/sshd.log"; then break; fi
   sleep 0.05
 done
 /usr/bin/ssh-add "$fixture/client"

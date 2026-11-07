@@ -485,3 +485,13 @@ body.vault-locked > :not(#vault-lock, .titlebar), body.vault-locked .titlebar > 
   .tab-close { padding-inline: 4px; }
   #context { flex-basis: 120px; }
 }
+
+.forward-list { display: grid; gap: 10px; }
+.forward-rule, .forward-editor { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bar); }
+.forward-rule code, .forward-status { overflow-wrap: anywhere; }
+.forward-rule code { font-size: 12px; }
+.forward-status { color: var(--muted); font-size: 12px; }
+.forward-status p { margin: 6px 0 0; }
+.forward-run, .forward-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+.forward-actions { justify-content: flex-end; }
+.forward-editor[hidden] { display: none; }

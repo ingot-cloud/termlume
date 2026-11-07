@@ -36,6 +36,19 @@ function normalizeHost(input, id, { portable = false, allowMissingKey = false } 
     logPath: input.logPath?.trim() ? checkedText(input.logPath, '日志路径', 4096) : '',
     service: input.service?.trim() ? checkedText(input.service, '服务名', 255) : ''
   };
+  if (input.localForwards !== undefined) {
+    if (!Array.isArray(input.localForwards) || input.localForwards.length > 32) throw new Error('本地转发规则无效。');
+    host.localForwards = input.localForwards.map((rule) => {
+      const localPort = Number(rule.localPort), remotePort = Number(rule.remotePort);
+      const remoteAddress = checkedText(rule.remoteAddress, '目标地址', 255).replace(/^\[(.*)\]$/, '$1');
+      if (!remoteAddress || /[\s/@\\]/.test(remoteAddress) || (remoteAddress.includes(':') && isIP(remoteAddress) !== 6) ||
+          ![localPort, remotePort].every((port) => Number.isInteger(port) && port > 0 && port < 65536)) throw new Error('本地转发规则无效。');
+      return { id: checkId(rule.id), name: checkedText(rule.name, '规则名称'), localPort, remoteAddress, remotePort };
+    });
+    if (new Set(host.localForwards.map((r) => r.id)).size !== host.localForwards.length ||
+        new Set(host.localForwards.map((r) => r.localPort)).size !== host.localForwards.length) throw new Error('转发规则标识和本地端口不能重复。');
+    if (!host.localForwards.length) delete host.localForwards;
+  }
   if (input.jumpHostId) host.jumpHostId = checkId(input.jumpHostId);
   if (host.logPath) commandFor({ action: 'tail', argument: host.logPath });
   if (host.service) commandFor({ action: 'journal', argument: host.service });
@@ -108,6 +121,7 @@ class HostStore {
     const previous = input.id ? this.host(input.id) : undefined;
     const id = previous?.id ?? randomUUID();
     const host = normalizeHost(input, id, { allowMissingKey: previous?.auth === 'key' && !previous.keyPath });
+    if (previous?.localForwards?.length) host.localForwards = previous.localForwards;
     const hosts = this.data.hosts.filter((entry) => entry.id !== id);
     if (host.jumpHostId) {
       const jump = hosts.find((item) => item.id === host.jumpHostId);

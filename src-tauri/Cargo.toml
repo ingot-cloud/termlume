@@ -21,7 +21,7 @@ russh-sftp = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "sync", "time", "process"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "sync", "time", "process", "net"] }
 zeroize = "1"
 rand = "0.10"
 regex = "1"

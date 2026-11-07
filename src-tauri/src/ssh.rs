@@ -93,7 +93,7 @@ pub struct Session {
     input: OnceLock<mpsc::Sender<TerminalControl>>,
 }
 impl Session {
-    fn check_route(&self, data: &Data) -> Result<(), String> {
+    pub(crate) fn check_route(&self, data: &Data) -> Result<(), String> {
         if !data.host(self.host.id)?.same_connection(&self.host) {
             return Err("目标主机配置已变更，请重新连接。".into());
         }

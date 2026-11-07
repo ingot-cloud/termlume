@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod forwarding;
 mod git;
 mod git_https;
 mod keys;
@@ -42,6 +43,7 @@ struct Inner {
     events: Mutex<Option<Channel<Value>>>,
     acks: Mutex<HashMap<Uuid, oneshot::Sender<()>>>,
     connections: ssh::Connections,
+    forwards: forwarding::Forwards,
     #[cfg(desktop)]
     transfers: transfer::Transfers,
     sync_gate: tokio::sync::Mutex<()>,
@@ -70,6 +72,7 @@ impl Workspace {
             events: Mutex::default(),
             acks: Mutex::default(),
             connections: Default::default(),
+            forwards: Default::default(),
             #[cfg(desktop)]
             transfers: Default::default(),
             sync_gate: Default::default(),
@@ -131,6 +134,7 @@ impl Workspace {
             }
             self.conflict.lock().unwrap().take();
             self.connections.close_pending();
+            self.forwards.stop_all();
             self.emit(json!({"type":"vault","state":store.status()}));
         }
         store.status()
@@ -363,6 +367,13 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             blocking(move || keys::copy(&key)).await?;
         }
         "ssh:connect" => ssh::connect(ws, parse(value)?)?,
+        "forwards:list" => {
+            ws.store.lock().unwrap().data()?;
+            return Ok(ws.forwards.list());
+        }
+        "forwards:save" | "forwards:delete" => return forwarding::save_rule(ws, name, value),
+        "forwards:start" => return forwarding::start(ws, parse(value)?).await,
+        "forwards:stop" => ws.forwards.stop(id(&value)?).await?,
         "ssh:trust" => ws.connections.trust(
             id(&value["id"])?,
             flag(&value, "accepted"),
@@ -572,6 +583,10 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
     } else {
         Some(data.host(host.id)?)
     };
+    // Rules have their own versioned editor; saving general host fields must preserve them.
+    if let Some(previous) = previous {
+        host.local_forwards.clone_from(&previous.local_forwards);
+    }
     let host =
         host.normalized(previous.is_some_and(|p| p.auth == "key" && p.key_path.is_none()))?;
     let mut routed_hosts = data.hosts.clone();
@@ -944,6 +959,7 @@ pub fn run() {
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 let ws = window.state::<Workspace>();
                 ws.connections.close_all();
+                ws.forwards.stop_all();
                 window.app_handle().exit(0);
             }
         })

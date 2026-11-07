@@ -29,6 +29,11 @@ let selectedGroup = '';
 let selectedHostId = '';
 let hostMenu;
 let active;
+const forwardRuns = new Map();
+const forwardVersions = new Map();
+let forwardVersion = 0;
+let renderForwardPanel;
+let forwardPanelOpen = false;
 let filesOpen = false;
 let vaultStatus = {};
 let touchIdAvailable = false;
@@ -136,7 +141,7 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
     const error = node('p', 'dialog-error');
     error.setAttribute('role', 'alert');
     const canClose = () => !busy && (!options.canClose || options.canClose());
-    const cancel = button('取消', () => { if (canClose()) dialog.close(); });
+    const cancel = button(options.cancelLabel || '取消', () => { if (canClose()) dialog.close(); });
     const confirm = node('button', 'primary', submit);
     confirm.type = 'submit';
     confirm.value = options.submitValue || '';
@@ -161,7 +166,11 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
       error.textContent = '';
       try {
         result = await onSubmit(event.submitter?.value);
-        dialog.close();
+        if (options.closeOnSubmit === false) {
+          form.removeAttribute('aria-busy');
+          enabled.forEach((control) => { control.disabled = false; });
+          busy = false;
+        } else dialog.close();
       } catch (failure) {
         error.textContent = message(failure);
         error.scrollIntoView({ block: 'nearest' });
@@ -212,6 +221,7 @@ function applyVaultState(state) {
   $('vault-lock').hidden = !state.locked;
   $('library-button').disabled = Boolean(state.locked);
   if (state.locked) {
+    forwardRuns.clear(); forwardVersions.clear();
     historyReady = false;
     $('terminal-drop').hidden = true;
     closeDropdown();
@@ -1161,7 +1171,8 @@ function openHostMenu(host, anchor, x, y) {
   const actions = [
     ['连接 / 切换已有会话', () => openHost(host)],
     ['在新标签连接', () => openHost(host, { force: true })],
-    ['编辑主机…', () => editHost(host)]
+    ['编辑主机…', () => editHost(host)],
+    ...(api.forwards ? [['本地端口转发…', () => manageForwards(host)]] : [])
   ];
   for (const [label, run] of actions) {
     const action = button(label, () => { closeHostMenu(true); return run(); });
@@ -1560,6 +1571,130 @@ async function addNewTab() {
   }
 }
 
+async function manageForwards(host, session) {
+  if (forwardPanelOpen || dialog.open || vaultStatus.locked) return;
+  forwardPanelOpen = true;
+  try { await openForwardPanel(host, session); }
+  finally { forwardPanelOpen = false; }
+}
+
+async function openForwardPanel(host, session) {
+  const version = forwardVersion;
+  const live = await api.forwards.list();
+  if (vaultStatus.locked) return;
+  for (const [id, run] of forwardRuns) if ((forwardVersions.get(id) || 0) <= version && run.status !== 'stopped' && !live.some((item) => item.id === id)) forwardRuns.delete(id);
+  for (const run of live) if ((forwardVersions.get(run.id) || 0) <= version) forwardRuns.set(run.id, run);
+  const list = node('div', 'forward-list');
+  const feedback = node('p', 'dialog-error');
+  feedback.setAttribute('role', 'alert');
+  const name = input('');
+  const localPort = input('', 'number');
+  const address = input('127.0.0.1');
+  const remotePort = input('', 'number');
+  for (const port of [localPort, remotePort]) { port.min = 1; port.max = 65535; }
+  const editor = node('section', 'forward-editor', node('h3', '', '规则设置'), field('规则名称', name),
+    field('本地端口（127.0.0.1）', localPort), field('目标服务地址（由 SSH 主机访问）', address), field('目标服务端口', remotePort));
+  editor.hidden = true;
+  let editing, original = '', pending = new Set();
+  const draft = () => ({ id: editing?.id, name: name.value, localPort: Number(localPort.value), remoteAddress: address.value, remotePort: Number(remotePort.value) });
+  const openEditor = (rule) => {
+    editing = rule || null;
+    name.value = rule?.name || ''; localPort.value = rule?.localPort || ''; address.value = rule?.remoteAddress || '127.0.0.1'; remotePort.value = rule?.remotePort || '';
+    editor.hidden = false;
+    for (const field of [name, localPort, address, remotePort]) field.required = true;
+    original = JSON.stringify(draft());
+    render();
+    name.focus();
+  };
+  const cancelEdit = button('取消编辑', () => {
+    if (JSON.stringify(draft()) !== original && !window.confirm('放弃尚未保存的转发规则？')) return;
+    editor.hidden = true;
+    for (const field of [name, localPort, address, remotePort]) field.required = false;
+    render();
+  }, 'outlined');
+  editor.append(cancelEdit);
+  const currentHost = () => hosts.find((item) => item.id === host.id);
+  const activeRuns = () => [...forwardRuns.values()].filter((job) => job.hostId === host.id && job.status !== 'stopped');
+  const perform = async (key, action) => {
+    if (pending.has(key)) return;
+    pending.add(key); feedback.textContent = ''; render();
+    try { await action(); } catch (error) { feedback.textContent = message(error); }
+    finally { pending.delete(key); render(); }
+  };
+  const render = () => {
+    if (!dialog.open || !list.isConnected) return;
+    const rules = currentHost()?.localForwards || [];
+    const runs = activeRuns();
+    const savedIds = new Set(rules.map((rule) => rule.id));
+    const ruleIds = new Set(savedIds);
+    const displayed = [...rules, ...runs.filter((run) => !ruleIds.has(run.rule.id) && ruleIds.add(run.rule.id)).map((run) => run.rule)];
+    const rows = displayed.map((rule) => {
+      const running = runs.filter((job) => job.rule.id === rule.id);
+      const last = [...forwardRuns.values()].findLast((job) => job.hostId === host.id && job.rule.id === rule.id);
+      const detail = node('div', 'forward-status', running.length ? '' : last ? '已停止' : '未启动');
+      if (!running.length && last?.error) detail.append(node('p', 'dialog-error', last.error));
+      for (const run of running) {
+        const label = run.sessionId === session?.id ? '此会话' : `会话 ${tabs.get(run.sessionId)?.number || run.sessionId.slice(0, 8)}`;
+        const stop = button('停止', () => perform(rule.id, () => api.forwards.stop(run.id)), 'outlined');
+        stop.disabled = pending.has(rule.id) || run.status === 'stopping';
+        detail.append(node('div', 'forward-run', node('span', '', `${label} · ${run.status === 'stopping' ? '停止中' : '监听中'} · ${run.activeConnections} 个连接`), stop));
+        if (run.error) detail.append(node('p', 'dialog-error', run.error));
+        if (JSON.stringify(run.rule) !== JSON.stringify(rule)) detail.append(node('p', 'muted', `使用启动时规则：127.0.0.1:${run.rule.localPort} → ${run.rule.remoteAddress}:${run.rule.remotePort}`));
+      }
+      const actions = node('div', 'forward-actions');
+      const start = button('启动', () => perform(rule.id, async () => {
+        const run = await api.forwards.start({ sessionId: session.id, ruleId: rule.id, expected: rule });
+        if (!forwardRuns.has(run.id)) forwardRuns.set(run.id, run);
+      }), 'outlined');
+      start.disabled = !session || session.status !== 'ready' || running.some((run) => run.sessionId === session?.id) || pending.has(rule.id) || !savedIds.has(rule.id) || !currentHost();
+      const edit = button('编辑', () => openEditor(rule), 'outlined');
+      const remove = button('删除', () => perform(rule.id, async () => {
+        if (!window.confirm(`删除「${rule.name}」的转发规则？`)) return;
+        const saved = await api.forwards.remove({ hostId: host.id, rule, expected: rule });
+        if (vaultStatus.locked) return;
+        hosts = saved; renderHosts();
+      }), 'outlined danger');
+      edit.disabled = remove.disabled = Boolean(running.length || pending.has(rule.id) || !currentHost());
+      actions.append(start, edit, remove);
+      const row = node('section', 'forward-rule', node('strong', '', rule.name),
+        node('code', '', `127.0.0.1:${rule.localPort} → ${rule.remoteAddress.includes(':') ? `[${rule.remoteAddress}]` : rule.remoteAddress}:${rule.remotePort}`), detail, actions);
+      row.setAttribute('aria-label', `转发规则 ${rule.name}`);
+      return row;
+    });
+    list.replaceChildren(...(rows.length ? rows : [node('p', 'muted', '还没有本地转发规则。')]));
+    const save = dialog.querySelector('button[type="submit"]');
+    save.hidden = editor.hidden;
+  };
+  renderForwardPanel = render;
+  const add = button('新增规则', () => openEditor(), 'outlined');
+  const reload = button('刷新', () => perform('reload', async () => {
+    const version = forwardVersion;
+    const [saved, live] = await Promise.all([api.hosts.list(), api.forwards.list()]);
+    if (vaultStatus.locked) return;
+    hosts = saved;
+    for (const [id, run] of forwardRuns) if ((forwardVersions.get(id) || 0) <= version && run.status !== 'stopped' && !live.some((item) => item.id === id)) forwardRuns.delete(id);
+    for (const run of live) if ((forwardVersions.get(run.id) || 0) <= version) forwardRuns.set(run.id, run);
+    renderHosts();
+  }), 'outlined');
+  add.disabled = !currentHost();
+  try {
+    const task = prompt(`${host.name} · 本地端口转发`, [
+      node('p', 'muted', `${endpoint(host)}${session?.jumpHost ? ` · 经 ${session.jumpHost.name}` : ''}`),
+      node('p', 'muted', '本地仅监听 127.0.0.1；目标地址由 SSH 主机访问。保存后手动启动，停止会关闭已有连接。'),
+      ...(!session ? [node('p', 'muted', '连接主机后，从会话工具栏启动规则。')] : []), node('div', 'forward-actions', add, reload), list, feedback, editor
+    ], '保存规则', async () => {
+      const saved = await api.forwards.save({ hostId: host.id, rule: draft(), expected: editing || undefined });
+      if (vaultStatus.locked) return;
+      hosts = saved;
+      editor.hidden = true;
+      for (const field of [name, localPort, address, remotePort]) field.required = false;
+      renderHosts(); render();
+    }, [], { closeOnSubmit: false, cancelLabel: '关闭', canClose: () => editor.hidden || JSON.stringify(draft()) === original || window.confirm('放弃尚未保存的转发规则？') });
+    render();
+    await task;
+  } finally { renderForwardPanel = undefined; }
+}
+
 function renderContext() {
   const tab = active;
   const session = origin(tab);
@@ -1579,6 +1714,10 @@ function renderContext() {
   } else {
     const output = [...tabs.values()].findLast((entry) => entry.kind === 'command' && entry.sessionId === tab.id);
     if (output) controls.append(button('查看输出', () => selectTab(output), 'outlined', `查看输出 · ${actionLabels[output.action]}`));
+  }
+  if (api.forwards && session) {
+    const running = [...forwardRuns.values()].filter((job) => job.sessionId === session.id && ['running', 'stopping'].includes(job.status)).length;
+    controls.append(button(`端口转发${running ? ` · ${running}` : ''}`, () => manageForwards(session.host, session)));
   }
   const shortcuts = button('快捷命令', () => openPalette('commands'));
   shortcuts.disabled = session?.status !== 'ready';
@@ -1726,6 +1865,7 @@ async function closeTab(tab) {
 
 function updateSession(tab, next, detail = '') {
   tab.status = next;
+  renderForwardPanel?.();
   tab.message = detail;
   if (next === 'ready') {
     recent.set(tab.host.id, Date.now());
@@ -2397,6 +2537,15 @@ function renderJobActions(job, row) {
 
 api.onEvent((event) => {
   if (event.type === 'vault') { applyVaultState(event.state); return; }
+  if (event.type === 'forward') {
+    if (vaultStatus.locked) return;
+    forwardVersions.set(event.id, ++forwardVersion);
+    forwardRuns.set(event.id, event);
+    if (forwardRuns.size > 256) for (const [id, run] of forwardRuns) { if (run.status === 'stopped') { forwardRuns.delete(id); forwardVersions.delete(id); } if (forwardRuns.size <= 256) break; }
+    renderForwardPanel?.();
+    if (origin()?.id === event.sessionId) renderContext();
+    return;
+  }
   if (event.type === 'file-drag') { handleFileDrag(event); return; }
   const tab = tabs.get(event.id);
   if (event.type === 'output') {
