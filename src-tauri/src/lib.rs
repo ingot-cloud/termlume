@@ -13,10 +13,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod assets;
 mod forwarding;
 mod git;
 mod git_https;
+mod imports;
 mod keys;
+mod session_logs;
 mod ssh;
 mod startup_unlock;
 mod store;
@@ -43,9 +46,12 @@ struct Inner {
     events: Mutex<Option<Channel<Value>>>,
     acks: Mutex<HashMap<Uuid, oneshot::Sender<()>>>,
     connections: ssh::Connections,
+    logs: session_logs::Logs,
     forwards: forwarding::Forwards,
     #[cfg(desktop)]
     transfers: transfer::Transfers,
+    #[cfg(desktop)]
+    editors: transfer::Editors,
     sync_gate: tokio::sync::Mutex<()>,
     unlock_gate: tokio::sync::Mutex<()>,
     sync_cancel: Mutex<Option<CancellationToken>>,
@@ -71,10 +77,13 @@ impl Workspace {
             store: Mutex::new(store),
             events: Mutex::default(),
             acks: Mutex::default(),
+            logs: session_logs::Logs::new(directory.join("session-logs"))?,
             connections: Default::default(),
             forwards: Default::default(),
             #[cfg(desktop)]
             transfers: Default::default(),
+            #[cfg(desktop)]
+            editors: Default::default(),
             sync_gate: Default::default(),
             unlock_gate: Default::default(),
             sync_cancel: Mutex::default(),
@@ -93,6 +102,9 @@ impl Workspace {
             .is_some_and(|channel| channel.send(event).is_ok())
     }
     async fn output(&self, id: Uuid, bytes: &[u8]) -> bool {
+        if let Some((session, message)) = self.logs.record(id, bytes) {
+            self.emit(json!({"type":"log","id":session,"active":false,"message":message}));
+        }
         let ack = Uuid::new_v4();
         let (send, recv) = oneshot::channel();
         self.acks.lock().unwrap().insert(ack, send);
@@ -135,6 +147,7 @@ impl Workspace {
             self.conflict.lock().unwrap().take();
             self.connections.close_pending();
             self.forwards.stop_all();
+            self.logs.stop_all();
             self.emit(json!({"type":"vault","state":store.status()}));
         }
         store.status()
@@ -274,6 +287,167 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         "vault:restore-git" => return restore(ws, value, true).await,
         "vault:sync" => return git::synchronize(ws, parse(value)?).await,
         "vault:migrate-git" => return git::migrate(ws, parse(value)?).await,
+        "trust:list" => {
+            let store = ws.store.lock().unwrap();
+            let data = store.data()?;
+            let hosts = data.connection_hosts();
+            return Ok(json!(data.fingerprints.iter().map(|f|json!({"address":f.address,"port":f.port,"fingerprint":f.fingerprint,"hosts":hosts.iter().filter(|h|h.port==f.port&&h.address.eq_ignore_ascii_case(&f.address)).map(|h|h.name.clone()).collect::<Vec<_>>()})).collect::<Vec<_>>()));
+        }
+        "trust:forget" => {
+            let mut store = ws.store.lock().unwrap();
+            let mut data = store.data()?.clone();
+            let address = string(&value["address"])?;
+            let port = value["port"].as_u64().ok_or("端口无效。")?;
+            let expected = string(&value["fingerprint"])?;
+            let f = data
+                .fingerprints
+                .iter()
+                .find(|f| f.address == address && u64::from(f.port) == port)
+                .ok_or("信任记录已移除。")?;
+            if f.fingerprint != expected {
+                return Err("信任记录已变化，请刷新。".into());
+            }
+            data.fingerprints
+                .retain(|f| !(f.address == address && u64::from(f.port) == port));
+            store.update(data)?;
+        }
+        "trust:import" => {
+            let rows: Vec<store::Fingerprint> = parse(value)?;
+            if rows.len() > 5000 {
+                return Err("记录过多。".into());
+            }
+            let mut store = ws.store.lock().unwrap();
+            let mut data = store.data()?.clone();
+            for f in rows {
+                Host {
+                    address: f.address.clone(),
+                    port: f.port,
+                    username: "validation".into(),
+                    ..Default::default()
+                }
+                .normalized(true)?;
+                if !ssh::valid_fingerprint(&f.fingerprint) {
+                    return Err("指纹无效。".into());
+                }
+                if let Some(existing) = data
+                    .fingerprints
+                    .iter()
+                    .find(|e| e.address.eq_ignore_ascii_case(&f.address) && e.port == f.port)
+                {
+                    if existing.fingerprint != f.fingerprint {
+                        return Err("已有不同指纹，请先独立核验并移除旧记录。".into());
+                    }
+                } else {
+                    data.fingerprints.push(f);
+                }
+            }
+            store.update(data)?;
+        }
+        #[cfg(desktop)]
+        "trust:import-preview" | "hosts:csv-preview" => {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .set_title(if name == "trust:import-preview" {
+                    "选择 known_hosts"
+                } else {
+                    "选择主机 CSV"
+                })
+                .pick_file()
+                .await
+            else {
+                return Ok(Value::Null);
+            };
+            let path = file.path().to_path_buf();
+            let text = blocking(move || {
+                String::from_utf8(vault::bounded_read(&path, 1024 * 1024)?).map_err(error)
+            })
+            .await?;
+            return if name == "trust:import-preview" {
+                imports::known_preview(&text)
+            } else {
+                imports::csv_preview(&text)
+            };
+        }
+        "preferences:get" => return assets::preferences_request(ws, Value::Null),
+        "preferences:save" => return assets::preferences_request(ws, value),
+        "history:list" => return Ok(json!(ws.store.lock().unwrap().data()?.command_history)),
+        "history:clear" => {
+            let mut store = ws.store.lock().unwrap();
+            let mut data = store.data()?.clone();
+            data.command_history.clear();
+            store.update(data)?;
+        }
+        "logs:list" => {
+            ws.store.lock().unwrap().data()?;
+            return Ok(ws.logs.list());
+        }
+        "logs:start" => {
+            ws.store.lock().unwrap().data()?;
+            let session = ws.connections.connected(id(&value)?)?;
+            return ws.logs.start(&session);
+        }
+        "logs:stop" => ws.logs.stop(id(&value)?),
+        "logs:read" => {
+            ws.store.lock().unwrap().data()?;
+            return Ok(json!(ws.logs.read(id(&value)?)?));
+        }
+        "logs:delete" => {
+            ws.store.lock().unwrap().data()?;
+            ws.logs.remove(id(&value)?)?;
+        }
+        #[cfg(desktop)]
+        "logs:export" => {
+            ws.store.lock().unwrap().data()?;
+            let data = ws.logs.read(id(&value)?)?;
+            if let Some(file) = rfd::AsyncFileDialog::new()
+                .set_title("导出会话日志")
+                .set_file_name("termlume-session.txt")
+                .save_file()
+                .await
+            {
+                tokio::fs::write(file.path(), data).await.map_err(error)?;
+            }
+        }
+        "layouts:list" | "layouts:save" | "layouts:delete" => {
+            return assets::layout_request(ws, name, value)
+        }
+        "snippets:list" | "snippets:save" | "snippets:delete" => {
+            return assets::snippet_request(ws, name, value)
+        }
+        "snippets:run" => {
+            let request = {
+                let store = ws.store.lock().unwrap();
+                let data = store.data()?;
+                let sid = id(&value["snippetId"])?;
+                let snippet = data
+                    .snippets
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .ok_or("命令已删除。")?;
+                if json!(snippet) != value["expected"] {
+                    return Err("命令已变化，请重新预览。".into());
+                }
+                ssh::CommandRequest {
+                    action: "custom".into(),
+                    argument: snippet.command.clone(),
+                    lines: 100,
+                }
+            };
+            ssh::command(ws, id(&value["id"])?, id(&value["sessionId"])?, request)?;
+        }
+        "groups:list" | "groups:save" | "groups:delete" => {
+            return assets::group_request(ws, name, value)
+        }
+        "identities:list" => return Ok(assets::list(ws.store.lock().unwrap().data()?)),
+        "identities:save" => {
+            let mut value = value;
+            if flag(&value, "copySavedPassword") {
+                let secret = ssh::reveal_saved_password(ws, id(&value["sourceHostId"])?).await?;
+                value["localPassword"] = json!(&*secret);
+            }
+            let ws = ws.clone();
+            return blocking(move || assets::save_identity(&ws, value)).await;
+        }
+        "identities:delete" => return assets::delete_identity(ws, value),
         "hosts:save" => {
             let ws = ws.clone();
             return blocking(move || save_host(&ws, value)).await;
@@ -383,6 +557,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             if let Some(session) = ws.connections.get(id(&value)?) {
                 #[cfg(desktop)]
                 ws.transfers.cancel_session(&session).await;
+                ws.logs.stop(session.id);
                 ws.connections.remove(&session);
                 session.cancel.cancel();
             }
@@ -454,6 +629,48 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             .await?;
         }
         #[cfg(desktop)]
+        "files:mutation-preview" => {
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            return transfer::mutation_preview(&session, parse(value["paths"].clone())?).await;
+        }
+        #[cfg(desktop)]
+        "files:rename" => {
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            let _mutation = transfer::mutation_guard(ws, &session)?;
+            transfer::rename_remote(
+                &session,
+                string(&value["source"])?,
+                string(&value["destination"])?,
+                parse(value["expected"].clone())?,
+            )
+            .await?;
+        }
+        #[cfg(desktop)]
+        "files:remove" => {
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            let _mutation = transfer::mutation_guard(ws, &session)?;
+            return transfer::remove_remote(
+                &session,
+                parse(value["roots"].clone())?,
+                parse(value["expected"].clone())?,
+            )
+            .await;
+        }
+        #[cfg(desktop)]
+        "editors:list" => {
+            ws.store.lock().unwrap().data()?;
+            return Ok(ws.editors.list());
+        }
+        #[cfg(desktop)]
+        "editors:open" => {
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            return transfer::open_editor(ws, session, string(&value["path"])?, true).await;
+        }
+        #[cfg(desktop)]
+        "editors:prepare" => return transfer::prepare_edited_upload(ws, id(&value)?).await,
+        #[cfg(desktop)]
+        "editors:close" => ws.editors.close(ws, id(&value)?)?,
+        #[cfg(desktop)]
         "files:prepare" => {
             let request: transfer::PrepareRequest = parse(value)?;
             return ws
@@ -481,17 +698,11 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
     let mut store = ws.store.lock().unwrap();
     let current = store.data()?;
     match name {
-        "hosts:list" => return Ok(json!(current.hosts)),
+        "hosts:list" => return Ok(json!(current.connection_hosts())),
         "hosts:recent" => return Ok(json!(current.recent)),
         "hosts:has-password" => {
-            let host = current.host(id(&value)?)?;
-            return Ok(json!(
-                host.auth == "password"
-                    && (matches!(
-                        current.local_passwords.get(&host.id),
-                        Some(LocalPassword::Native { .. })
-                    ) || current.portable_passwords.contains_key(&host.id))
-            ));
+            let host = current.connection_host(id(&value)?)?;
+            return Ok(json!(ssh::has_saved_password(current, &host)));
         }
         _ => {}
     }
@@ -514,12 +725,12 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
             json!(data.hosts)
         }
         "hosts:forget" => {
-            let host = data.host(id(&value)?)?.clone();
+            let host = data.connection_host(id(&value)?)?;
+            let resolved = data.connection_hosts();
             data.fingerprints
                 .retain(|f| f.port != host.port || !f.address.eq_ignore_ascii_case(&host.address));
             data.local_passwords.retain(|id, _| {
-                !data
-                    .hosts
+                !resolved
                     .iter()
                     .any(|h| h.id == *id && h.same_endpoint(&host))
             });
@@ -527,17 +738,44 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
         }
         "hosts:clear-password" => {
             let id = id(&value)?;
+            if data.connection_host(id)?.identity_id.is_some() {
+                return Err("共享身份密码请到身份管理中修改，操作会影响所有引用主机。".into());
+            }
             data.host(id)?;
             data.local_passwords.remove(&id);
             data.portable_passwords.remove(&id);
             Value::Null
         }
         "hosts:remove-group" => {
-            let group = checked(string(&value)?, "分组", 120)?;
-            for host in data.hosts.iter_mut().filter(|h| h.group == group) {
-                host.group.clear();
+            let name = checked(string(&value)?, "分组", 1000)?;
+            let group = data
+                .groups
+                .iter()
+                .find(|g| assets::group_path(&data, g.id).ok().as_deref() == Some(&name))
+                .map(|g| g.id);
+            if group.is_some_and(|id| data.groups.iter().any(|g| g.parent_id == Some(id))) {
+                return Err("请先移动子分组，再移除此分组。".into());
             }
-            json!(data.hosts)
+            let resolved = data.connection_hosts();
+            for host in &mut data.hosts {
+                if let Some(effective) =
+                    resolved.iter().find(|h| h.id == host.id && h.group == name)
+                {
+                    host.group.clear();
+                    host.group_id = None;
+                    host.port = effective.port;
+                    host.identity_id = effective.identity_id;
+                    host.username = effective.username.clone();
+                    host.auth = effective.auth.clone();
+                    host.key_path = effective.key_path.clone();
+                    host.inherit_identity = false;
+                    host.inherit_port = false;
+                    host.terminal_theme = effective.terminal_theme.clone();
+                    host.inherit_theme = false;
+                }
+            }
+            data.groups.retain(|g| Some(g.id) != group);
+            json!(data.connection_hosts())
         }
         "hosts:import" => {
             let mut rows: Vec<Host> = parse(value["rows"].clone())?;
@@ -581,14 +819,50 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
         host.id = Uuid::new_v4();
         None
     } else {
-        Some(data.host(host.id)?)
+        Some(data.host(host.id)?.clone())
     };
     // Rules have their own versioned editor; saving general host fields must preserve them.
-    if let Some(previous) = previous {
+    if let Some(previous) = previous.as_ref() {
         host.local_forwards.clone_from(&previous.local_forwards);
     }
-    let host =
-        host.normalized(previous.is_some_and(|p| p.auth == "key" && p.key_path.is_none()))?;
+    host.identity_version = None;
+    if host.group_id.is_none() && !host.group.is_empty() {
+        let mut probe = host.clone();
+        probe.id = Uuid::new_v4();
+        let mut temporary = data.clone();
+        temporary.hosts.push(probe);
+        assets::migrate_groups(&mut temporary);
+        host.group_id = temporary.hosts.last().unwrap().group_id;
+        data.groups = temporary.groups;
+    }
+    if let Some(id) = host.group_id {
+        host.group = assets::group_path(&data, id)?;
+    }
+    if host.inherit_identity || host.inherit_port {
+        let mut probe = data.clone();
+        probe.hosts.retain(|h| h.id != host.id);
+        probe.hosts.push(host.clone());
+        let effective = probe.connection_host(host.id)?;
+        // Fill required legacy fields; the explicit inheritance flags remain authoritative.
+        host.username = effective.username;
+        host.auth = effective.auth;
+        host.key_path = effective.key_path;
+    }
+    if let Some(id) = host.identity_id.filter(|_| !host.inherit_identity) {
+        let i = data
+            .identities
+            .iter()
+            .find(|i| i.id == id)
+            .ok_or("身份不存在。")?;
+        host.username = i.username.clone();
+        host.auth = i.auth.clone();
+        host.key_path = i.key_path.clone();
+    }
+    let host = host.normalized(
+        previous
+            .as_ref()
+            .is_some_and(|p| p.auth == "key" && p.key_path.is_none()),
+    )?;
     let mut routed_hosts = data.hosts.clone();
     routed_hosts.retain(|h| h.id != host.id);
     routed_hosts.push(host.clone());
@@ -599,7 +873,10 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
     {
         dependent.jump_host(&routed_hosts)?;
     }
-    if previous.is_some_and(|p| host.auth != "password" || !p.same_connection(&host)) {
+    if previous
+        .as_ref()
+        .is_some_and(|p| host.auth != "password" || !p.same_connection(&host))
+    {
         data.local_passwords.remove(&host.id);
         data.portable_passwords.remove(&host.id);
     }
@@ -621,7 +898,7 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
     };
     data.hosts.retain(|item| item.id != host.id);
     data.hosts.push(host);
-    let result = json!(data.hosts);
+    let result = json!(data.connection_hosts());
     if let Err(err) = store.update(data) {
         if let Some(token) = new_token {
             keys::delete_password(token);
@@ -958,8 +1235,10 @@ pub fn run() {
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 let ws = window.state::<Workspace>();
+                ws.logs.stop_all();
                 ws.connections.close_all();
                 ws.forwards.stop_all();
+                #[cfg(desktop)] ws.editors.clear();
                 window.app_handle().exit(0);
             }
         })

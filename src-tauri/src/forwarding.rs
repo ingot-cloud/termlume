@@ -1,4 +1,5 @@
 use crate::{error, ssh::Session, store::checked, Workspace};
+use russh::{client, Channel};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -8,20 +9,35 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LocalForward {
     pub id: Uuid,
     pub name: String,
+    pub kind: String,
     pub local_port: u16,
     pub remote_address: String,
     pub remote_port: u16,
+}
+impl Default for LocalForward {
+    fn default() -> Self {
+        Self {
+            id: Uuid::nil(),
+            name: String::new(),
+            kind: "local".into(),
+            local_port: 0,
+            remote_address: String::new(),
+            remote_port: 0,
+        }
+    }
 }
 pub fn normalize_rules(rules: &mut Vec<LocalForward>) -> Result<(), String> {
     if rules.len() > 32 {
@@ -33,19 +49,27 @@ pub fn normalize_rules(rules: &mut Vec<LocalForward>) -> Result<(), String> {
             rule.id = Uuid::new_v4();
         }
         rule.name = checked(&rule.name, "规则名称", 120)?;
-        rule.remote_address = checked(&rule.remote_address, "目标地址", 255)?
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .into();
-        if rule.remote_address.is_empty()
-            || rule.remote_address.contains(['/', '@', '\\'])
-            || rule.remote_address.contains(char::is_whitespace)
-            || (rule.remote_address.contains(':')
-                && rule.remote_address.parse::<Ipv6Addr>().is_err())
-        {
-            return Err("请输入目标服务的主机名或 IP 地址。".into());
+        if !matches!(rule.kind.as_str(), "local" | "remote" | "dynamic") {
+            return Err("转发类型无效。".into());
         }
-        if rule.local_port == 0 || rule.remote_port == 0 {
+        if rule.kind == "dynamic" {
+            rule.remote_address = String::new();
+            rule.remote_port = 0;
+        } else {
+            rule.remote_address = checked(&rule.remote_address, "目标地址", 255)?
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .into();
+            if rule.remote_address.is_empty()
+                || rule.remote_address.contains(['/', '@', '\\'])
+                || rule.remote_address.contains(char::is_whitespace)
+                || (rule.remote_address.contains(':')
+                    && rule.remote_address.parse::<Ipv6Addr>().is_err())
+            {
+                return Err("请输入目标服务的主机名或 IP 地址。".into());
+            }
+        }
+        if rule.local_port == 0 || (rule.kind != "dynamic" && rule.remote_port == 0) {
             return Err("端口须在 1 至 65535 之间。".into());
         }
         if !ids.insert(rule.id) || !ports.insert(rule.local_port) {
@@ -67,6 +91,7 @@ struct Forward {
     cancel: CancellationToken,
     done: CancellationToken,
     stats: Mutex<Stats>,
+    incoming: Option<mpsc::Sender<Channel<client::Msg>>>,
 }
 #[derive(Default)]
 struct Stats {
@@ -81,6 +106,32 @@ impl Forward {
     }
 }
 impl Forwards {
+    pub fn offer_remote(&self, session: Uuid, port: u32, channel: Channel<client::Msg>) -> bool {
+        let sender = self
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .find(|job| {
+                job.session_id == session
+                    && job.rule.kind == "remote"
+                    && u32::from(job.rule.local_port) == port
+                    && !job.cancel.is_cancelled()
+            })
+            .and_then(|j| j.incoming.clone());
+        if let Some(sender) = sender {
+            match sender.try_send(channel) {
+                Ok(()) => true,
+                Err(e) => {
+                    drop(e.into_inner().into_stream());
+                    false
+                }
+            }
+        } else {
+            drop(channel.into_stream());
+            false
+        }
+    }
     pub fn list(&self) -> Value {
         json!(self
             .jobs
@@ -182,9 +233,30 @@ pub async fn start(ws: &Workspace, req: StartRequest) -> Result<Value, String> {
         }
         (rule, store.epoch)
     };
-    let listener = TcpListener::bind(("127.0.0.1", rule.local_port))
+    let client = session.client.get().ok_or("SSH 已断开。")?.clone();
+    let listener = if rule.kind == "remote" {
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            client.tcpip_forward("127.0.0.1", rule.local_port.into()),
+        )
         .await
-        .map_err(|e| format!("无法监听 127.0.0.1:{}：{e}", rule.local_port))?;
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(format!("远程监听被拒绝：{e}")),
+            Err(_) => {
+                session.cancel.cancel();
+                return Err("远程监听确认超时，已关闭 SSH 以释放可能创建的监听。".into());
+            }
+        }
+        None
+    } else {
+        Some(
+            TcpListener::bind(("127.0.0.1", rule.local_port))
+                .await
+                .map_err(|e| format!("无法监听 127.0.0.1:{}：{e}", rule.local_port))?,
+        )
+    };
+    let (incoming, receiver) = mpsc::channel(32);
     let job = Arc::new(Forward {
         id: Uuid::new_v4(),
         session_id: session.id,
@@ -194,8 +266,9 @@ pub async fn start(ws: &Workspace, req: StartRequest) -> Result<Value, String> {
         cancel: session.cancel.child_token(),
         done: CancellationToken::new(),
         stats: Mutex::default(),
+        incoming: (rule.kind == "remote").then_some(incoming),
     });
-    {
+    let registered = (|| -> Result<(), String> {
         let store = ws.store.lock().unwrap();
         crate::ensure_epoch(&store, epoch)?;
         session.check_route(store.data()?)?;
@@ -213,12 +286,32 @@ pub async fn start(ws: &Workspace, req: StartRequest) -> Result<Value, String> {
             return Err("同时运行的转发规则已达 32 条上限。".into());
         }
         jobs.insert(job.id, job.clone());
+        Ok(())
+    })();
+    if let Err(error) = registered {
+        if rule.kind == "remote" {
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.cancel_tcpip_forward("127.0.0.1", rule.local_port.into())
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                session.cancel.cancel();
+            }
+        }
+        return Err(error);
     }
     let initial = job.value("running");
     ws.emit(initial.clone());
     let ws = ws.clone();
     tauri::async_runtime::spawn(async move {
-        run(&ws, &session, job, listener).await;
+        if let Some(listener) = listener {
+            run(&ws, &session, job, listener).await;
+        } else {
+            run_remote(&ws, &session, job, receiver).await;
+        }
     });
     Ok(initial)
 }
@@ -227,10 +320,19 @@ async fn relay(
     session: Arc<Session>,
     mut socket: TcpStream,
     peer: std::net::SocketAddr,
-    rule: LocalForward,
+    mut rule: LocalForward,
 ) -> Result<(), String> {
     let client = session.client.get().ok_or("SSH 会话已断开。")?;
-    let channel = tokio::time::timeout(
+    let dynamic = rule.kind == "dynamic";
+    if dynamic {
+        let (address, port) =
+            tokio::time::timeout(Duration::from_secs(10), socks_target(&mut socket))
+                .await
+                .map_err(|_| "SOCKS 握手超时。")??;
+        rule.remote_address = address;
+        rule.remote_port = port;
+    }
+    let result = tokio::time::timeout(
         Duration::from_secs(15),
         client.channel_open_direct_tcpip(
             rule.remote_address,
@@ -240,8 +342,16 @@ async fn relay(
         ),
     )
     .await
-    .map_err(|_| "目标连接超时。".to_string())?
-    .map_err(|e| format!("目标连接失败：{e}"))?;
+    .map_err(|_| "目标连接超时。".to_string())
+    .and_then(|r| r.map_err(|e| format!("目标连接失败：{e}")));
+    if dynamic {
+        let reply = if result.is_ok() { 0 } else { 5 };
+        socket
+            .write_all(&[5, reply, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .map_err(error)?;
+    }
+    let channel = result?;
     let mut stream = channel.into_stream();
     tokio::io::copy_bidirectional(&mut socket, &mut stream)
         .await
@@ -280,6 +390,95 @@ async fn run(ws: &Workspace, session: &Arc<Session>, job: Arc<Forward>, listener
     // Drop the listening socket and every relay before reporting stopped / allowing a restart.
     drop(listener);
     sockets.shutdown().await;
+    job.stats.lock().unwrap().active = 0;
+    ws.forwards.jobs.lock().unwrap().remove(&job.id);
+    ws.emit(job.value("stopped"));
+    job.done.cancel();
+}
+
+async fn socks_target(socket: &mut TcpStream) -> Result<(String, u16), String> {
+    let mut header = [0; 2];
+    socket.read_exact(&mut header).await.map_err(error)?;
+    if header[0] != 5 || header[1] == 0 || header[1] > 16 {
+        return Err("仅支持 SOCKS5 CONNECT。".into());
+    }
+    let mut methods = vec![0; header[1] as usize];
+    socket.read_exact(&mut methods).await.map_err(error)?;
+    if !methods.contains(&0) {
+        socket.write_all(&[5, 255]).await.map_err(error)?;
+        return Err("SOCKS5 仅支持本机无认证连接。".into());
+    }
+    socket.write_all(&[5, 0]).await.map_err(error)?;
+    let mut request = [0; 4];
+    socket.read_exact(&mut request).await.map_err(error)?;
+    if request[0] != 5 || request[1] != 1 || request[2] != 0 {
+        socket
+            .write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .map_err(error)?;
+        return Err("不支持 SOCKS BIND 或 UDP。".into());
+    }
+    let address = match request[3] {
+        1 => {
+            let mut bytes = [0; 4];
+            socket.read_exact(&mut bytes).await.map_err(error)?;
+            std::net::Ipv4Addr::from(bytes).to_string()
+        }
+        4 => {
+            let mut bytes = [0; 16];
+            socket.read_exact(&mut bytes).await.map_err(error)?;
+            std::net::Ipv6Addr::from(bytes).to_string()
+        }
+        3 => {
+            let len = socket.read_u8().await.map_err(error)?;
+            if len == 0 {
+                return Err("SOCKS 目标为空。".into());
+            }
+            let mut bytes = vec![0; len as usize];
+            socket.read_exact(&mut bytes).await.map_err(error)?;
+            String::from_utf8(bytes).map_err(error)?
+        }
+        _ => return Err("SOCKS 地址类型不支持。".into()),
+    };
+    let port = socket.read_u16().await.map_err(error)?;
+    if port == 0
+        || address.chars().any(|c| c.is_control() || c.is_whitespace())
+        || address.contains(['/', '@', '\\'])
+    {
+        return Err("SOCKS 目标无效。".into());
+    }
+    Ok((address, port))
+}
+async fn run_remote(
+    ws: &Workspace,
+    session: &Arc<Session>,
+    job: Arc<Forward>,
+    mut receiver: mpsc::Receiver<Channel<client::Msg>>,
+) {
+    let mut sockets = JoinSet::new();
+    loop {
+        tokio::select! {biased;_ = job.cancel.cancelled()=>break,
+            result=sockets.join_next(),if !sockets.is_empty()=>{let mut stats=job.stats.lock().unwrap();stats.active=stats.active.saturating_sub(1);if let Some(Ok(Err(e)))=result{stats.error=e;}drop(stats);ws.emit(job.value("running"));},
+            channel=receiver.recv()=>{let Some(channel)=channel else{break;};if sockets.len()>=32{drop(channel.into_stream());job.stats.lock().unwrap().error="远程连接已达 32 条上限。".into();continue;}job.stats.lock().unwrap().active+=1;let address=job.rule.remote_address.clone();let port=job.rule.remote_port;sockets.spawn(async move{let mut stream=channel.into_stream();let mut socket=tokio::time::timeout(Duration::from_secs(10),TcpStream::connect((address.as_str(),port))).await.map_err(|_|"本机目标连接超时。".to_string())?.map_err(error)?;tokio::io::copy_bidirectional(&mut stream,&mut socket).await.map_err(error)?;Ok::<_,String>(())});ws.emit(job.value("running"));}
+        }
+    }
+    receiver.close();
+    sockets.shutdown().await;
+    if let Some(client) = session.client.get() {
+        if !session.cancel.is_cancelled()
+            && !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.cancel_tcpip_forward("127.0.0.1", job.rule.local_port.into())
+                )
+                .await,
+                Ok(Ok(()))
+            )
+        {
+            job.stats.lock().unwrap().error = "无法确认远程端口释放，已关闭 SSH 连接。".into();
+            session.cancel.cancel();
+        }
+    }
     job.stats.lock().unwrap().active = 0;
     ws.forwards.jobs.lock().unwrap().remove(&job.id);
     ws.emit(job.value("stopped"));

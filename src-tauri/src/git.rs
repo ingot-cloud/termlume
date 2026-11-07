@@ -500,7 +500,7 @@ fn merge(
 ) -> (Vec<Row>, Vec<Value>) {
     let index = |rows: &[Row]| {
         rows.iter()
-            .map(|row| (row.host.id, row.clone()))
+            .map(|row| (row.id(), row.clone()))
             .collect::<BTreeMap<_, _>>()
     };
     let (base, local, remote) = (index(base), index(local), index(remote));
@@ -536,12 +536,58 @@ fn merge(
     (rows, conflicts)
 }
 fn summary(row: Option<&Row>) -> Value {
-    row.map(|row| {
-        let mut result = json!(row.host);
-        result["passwordSaved"] = json!(row.password.is_some());
-        result
-    })
-    .unwrap_or(json!({"deleted":true}))
+    row.map(Row::summary).unwrap_or(json!({"deleted":true}))
+}
+
+#[cfg(test)]
+mod asset_merge_tests {
+    use super::*;
+
+    #[test]
+    fn assets_merge_independently_and_conflicts_hide_identity_secrets() {
+        let identity_id = Uuid::new_v4();
+        let identity: Row = serde_json::from_value(json!({"asset":{"kind":"identity","value":{
+            "id":identity_id,"name":"shared","username":"ops","auth":"password",
+            "version":Uuid::new_v4(),"password":{"secret":"test-only-secret"}
+        }}}))
+        .unwrap();
+        let group: Row = serde_json::from_value(json!({"asset":{"kind":"group","value":{
+            "id":Uuid::new_v4(),"name":"production","terminalTheme":"light"
+        }}}))
+        .unwrap();
+        let snippet: Row = serde_json::from_value(json!({"asset":{"kind":"snippet","value":{
+            "id":Uuid::new_v4(),"name":"status","command":"df -h"
+        }}}))
+        .unwrap();
+        let base = vec![identity.clone()];
+        let local = vec![identity.clone(), group.clone()];
+        let remote = vec![identity.clone(), snippet.clone()];
+        let (rows, conflicts) = merge(&base, &local, &remote, &BTreeMap::new());
+        assert!(conflicts.is_empty());
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&group) && rows.contains(&snippet));
+        let edit = |name| {
+            let mut value = json!(identity);
+            value["asset"]["value"]["name"] = json!(name);
+            serde_json::from_value::<Row>(value).unwrap()
+        };
+        let ours = vec![edit("local")];
+        let theirs = vec![edit("remote")];
+        let (_, conflicts) = merge(&base, &ours, &theirs, &BTreeMap::new());
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0]["local"]["passwordSaved"], true);
+        assert!(!conflicts[0].to_string().contains("test-only-secret"));
+        let (resolved, conflicts) = merge(
+            &base,
+            &ours,
+            &theirs,
+            &BTreeMap::from([(identity_id, "remote".into())]),
+        );
+        assert!(conflicts.is_empty());
+        assert!(resolved == theirs);
+        let (_, conflicts) = merge(&base, &[], &theirs, &BTreeMap::new());
+        assert_eq!(conflicts[0]["local"]["deleted"], true);
+    }
 }
 
 pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, String> {
@@ -708,7 +754,7 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
             let prefer_newer = ours
                 .iter()
                 .chain(&latest)
-                .map(|r| (r.host.id, "local".into()))
+                .map(|r| (r.id(), "local".into()))
                 .collect();
             let (local, _) = merge(&ours, &latest, &records, &prefer_newer);
             let pending = local != records;
@@ -913,7 +959,7 @@ pub async fn migrate(ws: &Workspace, input: MigrationRequest) -> Result<Value, S
                 let prefer_newer = ours
                     .iter()
                     .chain(&latest)
-                    .map(|r| (r.host.id, "local".into()))
+                    .map(|r| (r.id(), "local".into()))
                     .collect();
                 let (local, _) = merge(&ours, &latest, &records, &prefer_newer);
                 // Persist the integrated rows and expected root before any remote write.

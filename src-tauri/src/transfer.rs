@@ -151,6 +151,8 @@ pub struct PrepareRequest {
     names: Option<Vec<String>>,
     #[serde(rename = "dropTicket")]
     drop_ticket: Option<Uuid>,
+    #[serde(default)]
+    folder: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -168,6 +170,7 @@ struct File {
     remote: String,
     size: u64,
     original: Option<Stat>,
+    permissions: Option<u32>,
     folder: Option<Arc<DownloadFolder>>,
 }
 impl File {
@@ -180,16 +183,19 @@ impl File {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct DownloadFolder {
     root: String,
     entries: Vec<FolderEntry>,
     skipped: usize,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct FolderEntry {
     local: PathBuf,
     remote: String,
     size: Option<u64>,
+    source: Option<Stat>,
 }
 
 async fn scan_folder(
@@ -235,6 +241,7 @@ async fn scan_folder(
                 Some(size)
             };
             entries.push(FolderEntry {
+                source: None,
                 local: relative,
                 remote: child,
                 size,
@@ -250,6 +257,84 @@ async fn scan_folder(
         total,
     ))
 }
+async fn scan_upload_folder(
+    root: &Path,
+    remaining: &mut usize,
+    cancel: &CancellationToken,
+) -> Result<(DownloadFolder, u64), String> {
+    let canonical = fs::canonicalize(root).await.map_err(error)?;
+    if !fs::symlink_metadata(root).await.map_err(error)?.is_dir() {
+        return Err("请选择普通目录。".into());
+    }
+    let mut pending = vec![(root.to_path_buf(), PathBuf::new(), 0usize)];
+    let mut entries = Vec::new();
+    let mut total = 0u64;
+    let mut skipped = 0;
+    while let Some((directory, relative, depth)) = pending.pop() {
+        if cancel.is_cancelled() {
+            return Err("SSH 会话已断开。".into());
+        }
+        if depth > 32
+            || fs::canonicalize(&directory).await.map_err(error)? != canonical.join(&relative)
+        {
+            return Err("目录层数过深或路径已变化。".into());
+        }
+        let mut read = fs::read_dir(&directory).await.map_err(error)?;
+        let mut children = Vec::new();
+        while let Some(entry) = read.next_entry().await.map_err(error)? {
+            children.push(entry.path());
+        }
+        children.sort();
+        let mut subdirs = Vec::new();
+        for path in children {
+            if *remaining == 0 {
+                return Err("目录超过 1000 项，请拆分上传。".into());
+            }
+            *remaining -= 1;
+            let name = path
+                .file_name()
+                .and_then(|p| p.to_str())
+                .ok_or("文件名不是有效 Unicode。")?;
+            file_name(name)?;
+            let child = relative.join(name);
+            let attrs = fs::symlink_metadata(&path).await.map_err(error)?;
+            if attrs.is_symlink() {
+                skipped += 1;
+                continue;
+            }
+            if attrs.is_dir() {
+                entries.push(FolderEntry {
+                    local: child.clone(),
+                    remote: String::new(),
+                    size: None,
+                    source: None,
+                });
+                subdirs.push((path, child, depth + 1));
+            } else if attrs.is_file() {
+                let stat = local_stat(attrs);
+                total = total.checked_add(stat.size).ok_or("目录过大。")?;
+                entries.push(FolderEntry {
+                    local: child,
+                    remote: String::new(),
+                    size: Some(stat.size),
+                    source: Some(stat),
+                });
+            } else {
+                skipped += 1;
+            }
+        }
+        pending.extend(subdirs.into_iter().rev());
+    }
+    Ok((
+        DownloadFolder {
+            root: canonical.to_string_lossy().into_owned(),
+            entries,
+            skipped,
+        },
+        total,
+    ))
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct Stat {
     regular: bool,
@@ -345,6 +430,15 @@ pub struct Transfers {
 const HISTORY_LIMIT: usize = 200;
 
 impl Transfers {
+    pub fn active_session(&self, id: Uuid) -> bool {
+        self.queue.lock().unwrap().jobs.values().any(|j| {
+            j.file.session.id == id
+                && matches!(
+                    *j.status.lock().unwrap(),
+                    "queued" | "running" | "committing"
+                )
+        })
+    }
     pub fn history(&self, ws: &Workspace) -> Result<Vec<Value>, String> {
         self.edit_history(ws, |_| ())
     }
@@ -436,6 +530,12 @@ impl Transfers {
                     return Err("拖入的文件已失效，请重新拖入。".into());
                 }
                 drop.take().unwrap().paths
+            } else if request.folder {
+                let Some(folder) = dialog.set_title("选择要上传的目录").pick_folder().await
+                else {
+                    return Ok(Value::Null);
+                };
+                vec![folder.path().to_path_buf()]
             } else {
                 let Some(files) = dialog.set_title("选择要上传的文件").pick_files().await
                 else {
@@ -490,11 +590,18 @@ impl Transfers {
         let mut remaining = 1000;
         for (remote, local) in selections {
             let (size, folder) = if upload {
-                let source = local_stat(fs::metadata(&local).await.map_err(error)?);
-                if !source.regular {
-                    return Err("请选择普通文件。".into());
+                let metadata = fs::symlink_metadata(&local).await.map_err(error)?;
+                if metadata.is_dir() {
+                    let (folder, size) =
+                        scan_upload_folder(&local, &mut remaining, &session.cancel).await?;
+                    (size, Some(Arc::new(folder)))
+                } else {
+                    let source = local_stat(metadata);
+                    if !source.regular {
+                        return Err("请选择普通文件或目录，不支持符号链接。".into());
+                    }
+                    (source.size, None)
                 }
-                (source.size, None)
             } else {
                 let attrs = sftp.symlink_metadata(&remote).await.map_err(error)?;
                 if attrs.file_type().is_dir() {
@@ -514,9 +621,17 @@ impl Transfers {
                 remote,
                 size,
                 original: None,
+                permissions: None,
                 folder,
             };
             file.original = target(&sftp, &file).await?;
+            if file.upload && file.original.as_ref().is_some_and(|s| s.regular) {
+                file.permissions = sftp
+                    .symlink_metadata(&file.remote)
+                    .await
+                    .map_err(error)?
+                    .permissions;
+            }
             files.push(file);
         }
         let ticket = Uuid::new_v4();
@@ -556,6 +671,12 @@ impl Transfers {
             return Err("原 SSH 会话已断开。".into());
         }
         let mut queue = self.queue.lock().unwrap();
+        if files
+            .iter()
+            .any(|f| f.session.mutating.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err("远端文件操作进行中，请稍后重新提交传输。".into());
+        }
         if queue.order.len() + files.len() > 500 {
             return Err("传输队列已满。".into());
         }
@@ -706,6 +827,11 @@ impl Job {
             self.choose_new_name(&sftp, file).await?;
         }
         if let Some(folder) = &file.folder {
+            if file.upload {
+                return self
+                    .upload_folder(ws, file, folder, &sftp, bytes, committing)
+                    .await;
+            }
             return self
                 .download_folder(ws, file, folder, &sftp, bytes, committing)
                 .await;
@@ -775,6 +901,101 @@ impl Job {
         result
     }
 
+    async fn upload_folder(
+        &self,
+        ws: &Workspace,
+        file: &File,
+        folder: &DownloadFolder,
+        sftp: &SftpSession,
+        bytes: &mut u64,
+        committing: &mut bool,
+    ) -> Result<&'static str, String> {
+        let parent = file
+            .remote
+            .rsplit_once('/')
+            .map(|(p, _)| p)
+            .ok_or("远端目录无效。")?;
+        let temp = remote_join(parent, &format!(".termlume-{}.part", self.id));
+        sftp.create_dir(&temp).await.map_err(error)?;
+        let mut created = Vec::new();
+        let result = async {
+            let (current, _) = scan_upload_folder(&file.local, &mut 1000, &self.cancel).await?;
+            if current != *folder {
+                return Err("本机目录已变化，请重新选择上传。".into());
+            }
+            for entry in &folder.entries {
+                if self.cancel.is_cancelled() {
+                    return Err("上传已取消。".into());
+                }
+                let relative = entry
+                    .local
+                    .to_str()
+                    .ok_or("文件名不是有效 Unicode。")?
+                    .replace('\\', "/");
+                let destination = remote_join(&temp, &relative);
+                if let Some(size) = entry.size {
+                    let source_path = file.local.join(&entry.local);
+                    let attrs = fs::symlink_metadata(&source_path).await.map_err(error)?;
+                    if !attrs.is_file() || Some(local_stat(attrs)) != entry.source {
+                        return Err("本机文件已变化。".into());
+                    }
+                    let mut source = fs::File::open(&source_path).await.map_err(error)?;
+                    let mut attrs = FileAttributes::empty();
+                    attrs.permissions = Some(0o600);
+                    let mut output = sftp
+                        .open_with_flags_and_attributes(
+                            &destination,
+                            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
+                            attrs,
+                        )
+                        .await
+                        .map_err(error)?;
+                    created.push((destination.clone(), false));
+                    let before = *bytes;
+                    let copied = self.copy(ws, file, &mut source, &mut output, bytes).await;
+                    let closed = output.close().await.map_err(error);
+                    copied?;
+                    closed?;
+                    if *bytes - before != size
+                        || Some(local_stat(
+                            fs::symlink_metadata(&source_path).await.map_err(error)?,
+                        )) != entry.source
+                    {
+                        return Err("上传期间源文件已变化。".into());
+                    }
+                } else {
+                    sftp.create_dir(&destination).await.map_err(error)?;
+                    created.push((destination, true));
+                }
+            }
+            if self.cancel.is_cancelled() {
+                return Err("上传已取消。".into());
+            }
+            let (current, _) = scan_upload_folder(&file.local, &mut 1000, &self.cancel).await?;
+            if current != *folder {
+                return Err("本机目录内容已变化，未提交。".into());
+            }
+            if remote_target(sftp, &file.remote).await?.is_some() {
+                return Err("远端目标已出现，未覆盖。".into());
+            }
+            *committing = true;
+            self.emit(ws, file, "committing", *bytes, "");
+            sftp.rename(&temp, &file.remote).await.map_err(error)?;
+            Ok("done")
+        }
+        .await;
+        if result.is_err() {
+            for (path, directory) in created.into_iter().rev() {
+                let _ = if directory {
+                    sftp.remove_dir(path).await
+                } else {
+                    sftp.remove_file(path).await
+                };
+            }
+            let _ = sftp.remove_dir(temp).await;
+        }
+        result
+    }
     async fn download_folder(
         &self,
         ws: &Workspace,
@@ -903,7 +1124,7 @@ impl Job {
             return Err("传输已取消。".into());
         }
         let mut attrs = FileAttributes::empty();
-        attrs.permissions = Some(0o600);
+        attrs.permissions = file.permissions.or(Some(0o600));
         let mut destination = sftp
             .open_with_flags_and_attributes(
                 temp,
@@ -1027,4 +1248,360 @@ async fn publish_remote(
         SftpError::Status(_) => error(e),
         _ => format!("提交未确认，请检查目标文件。{e}"),
     })
+}
+
+#[derive(Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteNode {
+    path: String,
+    directory: bool,
+    version: String,
+}
+fn mutation_node(path: String, attrs: FileAttributes) -> RemoteNode {
+    let directory = attrs.file_type().is_dir();
+    RemoteNode {
+        path,
+        directory: attrs.file_type().is_dir(),
+        version: if directory {
+            format!("{:?}:{:?}:{:?}", attrs.permissions, attrs.uid, attrs.gid)
+        } else {
+            format!(
+                "{:?}:{:?}:{:?}:{:?}:{:?}",
+                attrs.size, attrs.permissions, attrs.mtime, attrs.uid, attrs.gid
+            )
+        },
+    }
+}
+pub struct MutationGuard<'a>(&'a Session);
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .mutating
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+pub fn mutation_guard<'a>(
+    ws: &Workspace,
+    session: &'a Session,
+) -> Result<MutationGuard<'a>, String> {
+    if session
+        .mutating
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("已有远端文件操作，请等待完成。".into());
+    }
+    let guard = MutationGuard(session);
+    if ws.transfers.active_session(session.id) {
+        return Err("请先完成或取消该会话的文件传输。".into());
+    }
+    Ok(guard)
+}
+async fn canonical_entry(sftp: &SftpSession, path: &str) -> Result<String, String> {
+    let path = remote_path(path)?;
+    if path == "/" {
+        return Ok(path);
+    }
+    let (parent, name) = path.rsplit_once('/').ok_or("路径无效。")?;
+    let parent = sftp
+        .canonicalize(if parent.is_empty() { "/" } else { parent })
+        .await
+        .map_err(error)?;
+    Ok(remote_join(&parent, file_name(name)?))
+}
+pub async fn mutation_preview(session: &Session, paths: Vec<String>) -> Result<Value, String> {
+    if paths.is_empty() || paths.len() > 100 {
+        return Err("请选择 1–100 个项目。".into());
+    }
+    let sftp = open(session).await?;
+    let mut roots = Vec::new();
+    for path in paths {
+        let path = canonical_entry(&sftp, &path).await?;
+        if path == "/" {
+            return Err("不能对远端根目录执行此操作。".into());
+        }
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    roots.sort();
+    let mut pruned: Vec<String> = Vec::new();
+    for root in roots {
+        if !pruned.iter().any(|p| root.starts_with(&format!("{p}/"))) {
+            pruned.push(root);
+        }
+    }
+    let roots = pruned;
+    let mut nodes = Vec::new();
+    let mut stack: Vec<_> = roots
+        .iter()
+        .rev()
+        .map(|p| (p.clone(), 0usize, false))
+        .collect();
+    while let Some((path, depth, visited)) = stack.pop() {
+        if session.cancel.is_cancelled() {
+            return Err("SSH 会话已断开。".into());
+        }
+        if depth > 32 || nodes.len() + stack.len() > 10000 {
+            return Err("目录超过 32 层或 10000 项，请缩小范围。".into());
+        }
+        let attrs = sftp.symlink_metadata(&path).await.map_err(error)?;
+        let node = mutation_node(path.clone(), attrs);
+        if node.directory && !visited {
+            if sftp.canonicalize(&path).await.map_err(error)? != path {
+                return Err("目录路径已变化，请刷新。".into());
+            }
+            stack.push((path.clone(), depth, true));
+            let mut children = Vec::new();
+            for entry in sftp.read_dir(&path).await.map_err(error)? {
+                let name = entry.file_name();
+                if matches!(name.as_str(), "." | "..") {
+                    continue;
+                }
+                file_name(&name)?;
+                children.push(remote_join(&path, &name));
+            }
+            children.sort();
+            for child in children.into_iter().rev() {
+                stack.push((child, depth + 1, false));
+            }
+        } else {
+            nodes.push(node);
+        }
+    }
+    Ok(json!({"roots":roots,"nodes":nodes,"count":nodes.len()}))
+}
+pub async fn rename_remote(
+    session: &Session,
+    source: &str,
+    destination: &str,
+    expected: RemoteNode,
+) -> Result<(), String> {
+    let sftp = open(session).await?;
+    let source = canonical_entry(&sftp, source).await?;
+    let destination = canonical_entry(&sftp, destination).await?;
+    if source == "/" || destination == "/" || source == destination {
+        return Err("请指定不同的非根目录路径。".into());
+    }
+    if remote_target(&sftp, &destination).await?.is_some() {
+        return Err("目标已存在，重命名不会覆盖已有项目。".into());
+    }
+    if mutation_node(
+        source.clone(),
+        sftp.symlink_metadata(&source).await.map_err(error)?,
+    ) != expected
+    {
+        return Err("源项目已变化，请刷新。".into());
+    }
+    sftp.rename(source, destination).await.map_err(error)
+}
+pub async fn remove_remote(
+    session: &Session,
+    roots: Vec<String>,
+    expected: Vec<RemoteNode>,
+) -> Result<Value, String> {
+    let current = mutation_preview(session, roots).await?;
+    let nodes: Vec<RemoteNode> = crate::parse(current["nodes"].clone())?;
+    if nodes != expected {
+        return Err("项目或目录内容已变化，请重新预览删除范围。".into());
+    }
+    let sftp = open(session).await?;
+    let mut results = Vec::new();
+    for node in nodes {
+        let result = async {
+            if session.cancel.is_cancelled() {
+                return Err("SSH 会话已断开，未执行。".to_owned());
+            }
+            let actual = mutation_node(
+                node.path.clone(),
+                sftp.symlink_metadata(&node.path).await.map_err(error)?,
+            );
+            if actual != node {
+                return Err("项目在操作期间已变化，未删除。".into());
+            }
+            if node.directory {
+                sftp.remove_dir(&node.path).await.map_err(error)
+            } else {
+                sftp.remove_file(&node.path).await.map_err(error)
+            }
+        }
+        .await;
+        results.push(json!({"path":node.path,"status":if result.is_ok(){"done"}else{"failed"},"message":result.err()}));
+    }
+    Ok(json!(results))
+}
+
+struct EditedFile {
+    session: Uuid,
+    host: String,
+    endpoint: String,
+    remote: String,
+    original: Stat,
+    digest: Vec<u8>,
+    path: PathBuf,
+    temp: tempfile::TempDir,
+}
+#[derive(Default)]
+pub struct Editors {
+    files: Mutex<HashMap<Uuid, Arc<EditedFile>>>,
+}
+impl Editors {
+    pub fn clear(&self) {
+        self.files.lock().unwrap().clear();
+    }
+    pub fn list(&self) -> Value {
+        json!(self.files.lock().unwrap().iter().map(|(id,file)|json!({"id":id,"sessionId":file.session,"host":file.host,"endpoint":file.endpoint,"remote":file.remote,"local":file.path})).collect::<Vec<_>>())
+    }
+    pub fn close(&self, ws: &Workspace, id: Uuid) -> Result<(), String> {
+        let mut files = self.files.lock().unwrap();
+        if let Some(file) = files.get(&id) {
+            if ws.transfers.active_session(file.session) {
+                return Err("请先等待或取消此会话传输，再清理编辑副本。".into());
+            }
+        }
+        files.remove(&id);
+        Ok(())
+    }
+}
+async fn editor_read(sftp: &SftpSession, path: &str) -> Result<(Vec<u8>, Stat), String> {
+    let stat = remote_stat(sftp.symlink_metadata(path).await.map_err(error)?);
+    if !stat.regular || stat.size > 4 * 1024 * 1024 {
+        return Err("外部编辑仅支持不超过 4 MiB 的普通 UTF-8 文本文件。".into());
+    }
+    let mut file = sftp.open(path).await.map_err(error)?;
+    let mut bytes = Vec::new();
+    let read = (&mut file)
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(error);
+    let _ = file.close().await;
+    read?;
+    if bytes.len() > 4 * 1024 * 1024 || std::str::from_utf8(&bytes).is_err() || bytes.contains(&0) {
+        return Err("请选择 UTF-8 文本文件。".into());
+    }
+    Ok((bytes, stat))
+}
+pub async fn open_editor(
+    ws: &Workspace,
+    session: Arc<Session>,
+    path: &str,
+    launch: bool,
+) -> Result<Value, String> {
+    use sha2::{Digest, Sha256};
+    ws.store.lock().unwrap().data()?;
+    if ws.editors.files.lock().unwrap().len() >= 16 {
+        return Err("最多打开 16 个外部编辑副本，请先清理旧任务。".into());
+    }
+    let path = remote_path(path)?;
+    let sftp = open(&session).await?;
+    let (bytes, original) = editor_read(&sftp, &path).await?;
+    let temp = tempfile::Builder::new()
+        .prefix("termlume-edit-")
+        .tempdir()
+        .map_err(error)?;
+    let name = path.rsplit('/').next().ok_or("文件名无效。")?;
+    file_name(name)?;
+    let local = temp.path().join(name);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut output = options.open(&local).await.map_err(error)?;
+    output.write_all(&bytes).await.map_err(error)?;
+    output.sync_all().await.map_err(error)?;
+    if launch {
+        #[cfg(target_os = "macos")]
+        {
+            let local = local.clone();
+            crate::blocking(move || {
+                let result = std::process::Command::new("/usr/bin/open")
+                    .arg("-t")
+                    .arg(local)
+                    .status()
+                    .map_err(error)?;
+                if result.success() {
+                    Ok(())
+                } else {
+                    Err("无法启动本机文本编辑器。".into())
+                }
+            })
+            .await?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err("外部编辑暂仅支持 macOS。".into());
+    }
+    let id = Uuid::new_v4();
+    let host = session.host.name.clone();
+    let endpoint = format!(
+        "{}@{}:{}",
+        session.host.username, session.host.address, session.host.port
+    );
+    let result = json!({"id":id,"sessionId":session.id,"host":host,"endpoint":endpoint,"remote":path,"local":local});
+    ws.editors.files.lock().unwrap().insert(
+        id,
+        Arc::new(EditedFile {
+            session: session.id,
+            host,
+            endpoint,
+            remote: path,
+            original,
+            digest: Sha256::digest(&bytes).to_vec(),
+            path: local,
+            temp,
+        }),
+    );
+    Ok(result)
+}
+pub async fn prepare_edited_upload(ws: &Workspace, id: Uuid) -> Result<Value, String> {
+    use sha2::{Digest, Sha256};
+    ws.store.lock().unwrap().data()?;
+    let file = ws
+        .editors
+        .files
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or("编辑任务已关闭。")?;
+    let session = ws.connections.connected(file.session)?;
+    if ws.transfers.active_session(file.session) {
+        return Err("请等待此会话传输完成，再上传编辑结果。".into());
+    }
+    let sftp = open(&session).await?;
+    let (remote, current) = editor_read(&sftp, &file.remote).await?;
+    if Sha256::digest(&remote).as_slice() != file.digest || current != file.original {
+        return Err("远端文件已改变，未覆盖。请重新打开并合并更改。".into());
+    }
+    let source = fs::File::open(&file.path).await.map_err(error)?;
+    let mut bytes = Vec::new();
+    source
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(error)?;
+    if bytes.len() > 4 * 1024 * 1024 || std::str::from_utf8(&bytes).is_err() || bytes.contains(&0) {
+        return Err("编辑结果须为不超过 4 MiB 的 UTF-8 文本。".into());
+    }
+    let mut count = 0;
+    let mut entries = fs::read_dir(file.temp.path()).await.map_err(error)?;
+    while entries.next_entry().await.map_err(error)?.is_some() {
+        count += 1;
+    }
+    if count > 32 {
+        return Err("此副本上传次数已达上限，请清理后重新打开。".into());
+    }
+    let snapshot = file
+        .temp
+        .path()
+        .join(format!("upload-{}.txt", Uuid::new_v4()));
+    fs::write(&snapshot, &bytes).await.map_err(error)?;
+    let ticket = ws
+        .transfers
+        .stage(session, true, vec![(file.remote.clone(), snapshot)])
+        .await?;
+    let token = crate::id(&ticket["ticket"])?;
+    if let Some(ticket) = ws.transfers.tickets.lock().unwrap().get_mut(&token) {
+        ticket.files[0].original = Some(file.original.clone());
+    }
+    Ok(ticket)
 }

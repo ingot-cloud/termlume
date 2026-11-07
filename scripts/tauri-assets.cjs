@@ -5,6 +5,7 @@ const root = join(__dirname, '..');
 const output = join(root, 'dist', 'tauri-ui');
 const assets = {
   'style.css': 'src/ui/style.css',
+  'workspace-state.js':'src/ui/workspace-state.js',
   'renderer.js': 'src/ui/renderer.js',
   'dropdown.js': 'src/ui/dropdown.js',
   'terminal-paths.js': 'src/ui/terminal-paths.js',

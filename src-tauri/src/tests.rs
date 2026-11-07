@@ -719,7 +719,7 @@ async fn macos_transport_migration_and_sync() {
         .unwrap()
         .snapshot()
         .iter()
-        .any(|row| row.password.is_some()));
+        .any(|row| row.password_saved()));
     let rejected = Uuid::new_v4();
     call(
         &ws,
@@ -1753,4 +1753,639 @@ async fn macos_local_forward_relays_and_releases_resources() {
     }
     assert_eq!(call(&ws, "forwards:list", Value::Null).await, json!([]));
     ws.connections.close_all();
+}
+
+#[tokio::test]
+async fn shared_identity_records_resolve_update_and_sync_without_local_keys() {
+    let home = tempfile::tempdir().unwrap();
+    let (_p, ws) = make_workspace(home.path(), None);
+    let added=call(&ws,"identities:save",json!({"identity":{"name":"运维身份","username":"ops","auth":"key","keyPath":"/tmp/local-identity-key"}})).await;
+    let identity = added["identities"][0].clone();
+    let id = identity["id"].clone();
+    for address in ["one.test", "two.test"] {
+        call(
+            &ws,
+            "hosts:save",
+            json!({"address":address,"port":22,"identityId":id}),
+        )
+        .await;
+    }
+    let hosts = call(&ws, "hosts:list", Value::Null).await;
+    assert_eq!(hosts[0]["username"], "ops");
+    assert_eq!(hosts[1]["keyPath"], "/tmp/local-identity-key");
+    let expected = call(&ws, "identities:list", Value::Null).await[0].clone();
+    assert_eq!(expected["hosts"].as_array().unwrap().len(), 2);
+    assert!(dispatch(
+        &ws,
+        "identities:delete",
+        json!({"id":id,"expected":expected})
+    )
+    .await
+    .is_err());
+    let changed=call(&ws,"identities:save",json!({"identity":{"id":id,"name":"新版身份","username":"admin","auth":"agent"},"expected":expected})).await;
+    assert_eq!(changed["hosts"][0]["username"], "admin");
+    assert!(dispatch(
+        &ws,
+        "ssh:connect",
+        json!({"id":Uuid::new_v4(),"expected":hosts[0],"secret":""})
+    )
+    .await
+    .is_err());
+    let data = ws.store.lock().unwrap().data().unwrap().clone();
+    let rows = data.snapshot();
+    let serialized = json!(rows);
+    assert!(serialized
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["asset"]["kind"] == "identity"));
+    assert!(!serde_json::to_string(&rows)
+        .unwrap()
+        .contains("/tmp/local-identity-key"));
+    let mut other = Data::default();
+    other.apply(store::portable_rows(rows).unwrap(), None);
+    assert_eq!(other.connection_hosts()[0].username, "admin");
+    other.identities.clear();
+    assert!(other.connection_host(other.hosts[0].id).is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires localhost password SSH and macOS keychain fixtures"]
+async fn macos_shared_identity_passwords_migrate_and_verify_each_endpoint() {
+    let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
+    let home = tempfile::tempdir().unwrap();
+    let (_p, ws) = make_workspace(home.path(), None);
+    let server: Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("password-server.json")).unwrap())
+            .unwrap();
+    let original=call(&ws,"hosts:save",json!({"address":"127.0.0.1","port":server["port"],"username":"pilot","auth":"password","localPassword":"pilot-local-only"})).await[0].clone();
+    let created=call(&ws,"identities:save",json!({"identity":{"name":"共享密码","username":"pilot","auth":"password"},"copySavedPassword":true,"sourceHostId":original["id"]})).await;
+    let id = created["identityId"].clone();
+    let mut bound = original.clone();
+    bound["identityId"] = id.clone();
+    let first = call(&ws, "hosts:save", bound).await[0].clone();
+    let second = call(
+        &ws,
+        "hosts:save",
+        json!({"address":"localhost","port":server["port"],"identityId":id}),
+    )
+    .await[1]
+        .clone();
+    assert!(ws
+        .store
+        .lock()
+        .unwrap()
+        .data()
+        .unwrap()
+        .portable_passwords
+        .is_empty());
+    assert!(
+        !serde_json::to_string(&ws.store.lock().unwrap().data().unwrap().snapshot())
+            .unwrap()
+            .contains("pilot-local-only")
+    );
+    let mut rx = events(&ws);
+    let a = connect_tab(&ws, &mut rx, &first, "", true, false).await;
+    call(&ws, "ssh:close", json!(a)).await;
+    let count = || {
+        std::fs::read(fixture.join("password-attempts"))
+            .unwrap_or_default()
+            .len()
+    };
+    let before = count();
+    let denied = Uuid::new_v4();
+    call(
+        &ws,
+        "ssh:connect",
+        json!({"id":denied,"expected":second,"secret":"","useSaved":true}),
+    )
+    .await;
+    let trust = until(&mut rx, |e| {
+        e["type"] == "trust" && e["id"] == denied.to_string()
+    })
+    .await;
+    assert_eq!(count(), before);
+    call(
+        &ws,
+        "ssh:trust",
+        json!({"id":denied,"accepted":false,"challenge":trust["challenge"]}),
+    )
+    .await;
+    until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == denied.to_string() && e["status"] == "closed"
+    })
+    .await;
+    assert_eq!(count(), before);
+    let b = connect_tab(&ws, &mut rx, &second, "", true, false).await;
+    call(&ws, "ssh:close", json!(b)).await;
+    let expected = call(&ws, "identities:list", Value::Null).await[0].clone();
+    call(&ws,"identities:save",json!({"identity":{"id":id,"name":"共享密码","username":"pilot","auth":"password"},"expected":expected,"clearPassword":true})).await;
+    assert_eq!(
+        call(&ws, "hosts:has-password", first["id"].clone()).await,
+        false
+    );
+    ws.connections.close_all();
+}
+
+#[tokio::test]
+async fn groups_preserve_empty_nodes_inheritance_and_legacy_mapping() {
+    let home = tempfile::tempdir().unwrap();
+    let (_p, ws) = make_workspace(home.path(), None);
+    let i = call(
+        &ws,
+        "identities:save",
+        json!({"identity":{"name":"default","username":"ops","auth":"agent"}}),
+    )
+    .await["identityId"]
+        .clone();
+    let root = call(
+        &ws,
+        "groups:save",
+        json!({"group":{"name":"生产","port":2222,"identityId":i,"terminalTheme":"light"}}),
+    )
+    .await["groups"][0]
+        .clone();
+    let result = call(
+        &ws,
+        "groups:save",
+        json!({"group":{"name":"API","parentId":root["id"]}}),
+    )
+    .await;
+    let child = result["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["name"] == "API")
+        .unwrap()
+        .clone();
+    assert_eq!(child["path"], "生产 / API");
+    assert!(call(&ws, "hosts:list", Value::Null)
+        .await
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let host=call(&ws,"hosts:save",json!({"address":"inherited.test","groupId":child["id"],"inheritPort":true,"inheritIdentity":true,"inheritTheme":true,"keepaliveInterval":0,"connectTimeout":90})).await[0].clone();
+    assert_eq!(host["port"], 2222);
+    assert_eq!(host["username"], "ops");
+    assert_eq!(host["terminalTheme"], "light");
+    assert_eq!(host["keepaliveInterval"], 0);
+    assert_eq!(host["connectTimeout"], 90);
+    let override_host=call(&ws,"hosts:save",json!({"address":"override.test","port":2022,"username":"own","auth":"agent","groupId":child["id"]})).await[1].clone();
+    let current = call(&ws, "groups:list", Value::Null)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == root["id"])
+        .unwrap()
+        .clone();
+    let mut changed = current.clone();
+    changed["name"] = json!("Production");
+    changed["port"] = json!(2200);
+    changed["terminalTheme"] = json!("dark");
+    let updated = call(
+        &ws,
+        "groups:save",
+        json!({"group":changed,"expected":current}),
+    )
+    .await;
+    assert_eq!(updated["hosts"][0]["group"], "Production / API");
+    assert_eq!(updated["hosts"][0]["port"], 2200);
+    assert_eq!(updated["hosts"][0]["terminalTheme"], "dark");
+    assert_eq!(updated["hosts"][1]["port"], override_host["port"]);
+    let root = updated["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == root["id"])
+        .unwrap()
+        .clone();
+    let mut cycle = root.clone();
+    cycle["parentId"] = child["id"].clone();
+    assert!(
+        dispatch(&ws, "groups:save", json!({"group":cycle,"expected":root}))
+            .await
+            .is_err()
+    );
+    assert!(
+        dispatch(&ws, "groups:delete", json!({"group":root,"expected":root}))
+            .await
+            .is_err()
+    );
+    let rows = ws.store.lock().unwrap().data().unwrap().snapshot();
+    let mut other = Data::default();
+    other.apply(store::portable_rows(rows).unwrap(), None);
+    assert_eq!(
+        other
+            .connection_host(Uuid::parse_str(host["id"].as_str().unwrap()).unwrap())
+            .unwrap()
+            .port,
+        2200
+    );
+    let old: Host =
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"name":"legacy","group":"old team"}))
+            .unwrap();
+    let (mut a, mut b) = (Data::default(), Data::default());
+    a.hosts.push(old.clone());
+    b.hosts.push(old);
+    assets::migrate_groups(&mut a);
+    assets::migrate_groups(&mut b);
+    assert_eq!(a.groups[0].id, b.groups[0].id);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated OpenSSH SFTP fixture"]
+async fn macos_remote_mutations_upload_directory_and_edit_conflicts() {
+    let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
+    let home = tempfile::tempdir().unwrap();
+    let (_p, ws) = make_workspace(home.path(), None);
+    let port: u16 = std::fs::read_to_string(fixture.join("openssh-port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let host=call(&ws,"hosts:save",json!({"address":"127.0.0.1","port":port,"username":std::env::var("USER").unwrap(),"auth":"agent"})).await[0].clone();
+    let mut rx = events(&ws);
+    let tab = connect_tab(&ws, &mut rx, &host, "", false, false).await;
+    let root = fixture.join("remote/mutation-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("source ' name.txt");
+    let target = root.join("renamed.txt");
+    std::fs::write(&source, b"original").unwrap();
+    std::fs::write(&target, b"keep target").unwrap();
+    let preview = call(
+        &ws,
+        "files:mutation-preview",
+        json!({"id":tab,"paths":[source]}),
+    )
+    .await;
+    assert!(dispatch(
+        &ws,
+        "files:rename",
+        json!({"id":tab,"source":source,"destination":target,"expected":preview["nodes"][0]})
+    )
+    .await
+    .is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep target");
+    std::fs::remove_file(&target).unwrap();
+    call(
+        &ws,
+        "files:rename",
+        json!({"id":tab,"source":source,"destination":target,"expected":preview["nodes"][0]}),
+    )
+    .await;
+    let tree = root.join("tree");
+    std::fs::create_dir_all(tree.join("nested/empty")).unwrap();
+    std::fs::write(tree.join("nested/data.txt"), b"data").unwrap();
+    std::os::unix::fs::symlink(&target, tree.join("link")).unwrap();
+    let preview = call(
+        &ws,
+        "files:mutation-preview",
+        json!({"id":tab,"paths":[tree]}),
+    )
+    .await;
+    std::fs::write(tree.join("new"), b"changed").unwrap();
+    assert!(dispatch(
+        &ws,
+        "files:remove",
+        json!({"id":tab,"roots":preview["roots"],"expected":preview["nodes"]})
+    )
+    .await
+    .is_err());
+    assert!(tree.join("nested/data.txt").exists());
+    let preview = call(
+        &ws,
+        "files:mutation-preview",
+        json!({"id":tab,"paths":[tree]}),
+    )
+    .await;
+    let removed = call(
+        &ws,
+        "files:remove",
+        json!({"id":tab,"roots":preview["roots"],"expected":preview["nodes"]}),
+    )
+    .await;
+    assert!(
+        removed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["status"] == "done"),
+        "{removed}"
+    );
+    assert!(!tree.exists());
+    assert!(target.exists());
+    let local = fixture.join("local/upload-tree");
+    std::fs::create_dir_all(local.join("nested/empty")).unwrap();
+    std::fs::write(local.join("nested/a.txt"), b"directory upload").unwrap();
+    std::os::unix::fs::symlink(&target, local.join("skip-link")).unwrap();
+    let remote = root.join("uploaded");
+    let session = ws.connections.connected(tab).unwrap();
+    let prepared = ws
+        .transfers
+        .stage(
+            session.clone(),
+            true,
+            vec![(remote.to_string_lossy().into_owned(), local.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared["files"][0]["skipped"], 1);
+    call(
+        &ws,
+        "files:enqueue",
+        json!({"ticket":prepared["ticket"],"policy":"skip"}),
+    )
+    .await;
+    let result = until(&mut rx, |e| {
+        e["type"] == "transfer" && matches!(e["status"].as_str(), Some("done" | "failed"))
+    })
+    .await;
+    assert_eq!(result["status"], "done", "{result}");
+    assert_eq!(
+        std::fs::read(remote.join("nested/a.txt")).unwrap(),
+        b"directory upload"
+    );
+    assert!(remote.join("nested/empty").is_dir());
+    assert!(!remote.join("skip-link").exists());
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let edited = transfer::open_editor(&ws, session.clone(), target.to_str().unwrap(), false)
+        .await
+        .unwrap();
+    let local_edit = PathBuf::from(edited["local"].as_str().unwrap());
+    assert_eq!(edited["host"], host["name"]);
+    assert!(edited["endpoint"].as_str().unwrap().contains("127.0.0.1"));
+    std::fs::write(&local_edit, b"new local text").unwrap();
+    std::fs::write(&target, b"remote change").unwrap();
+    assert!(dispatch(&ws, "editors:prepare", edited["id"].clone())
+        .await
+        .is_err());
+    call(&ws, "editors:close", edited["id"].clone()).await;
+    assert!(!local_edit.exists());
+    let edited = transfer::open_editor(&ws, session, target.to_str().unwrap(), false)
+        .await
+        .unwrap();
+    std::fs::write(edited["local"].as_str().unwrap(), b"approved local text").unwrap();
+    let prepared = call(&ws, "editors:prepare", edited["id"].clone()).await;
+    call(
+        &ws,
+        "files:enqueue",
+        json!({"ticket":prepared["ticket"],"policy":"replace"}),
+    )
+    .await;
+    let result = until(&mut rx, |e| {
+        e["type"] == "transfer" && matches!(e["status"].as_str(), Some("done" | "failed"))
+    })
+    .await;
+    assert_eq!(result["status"], "done", "{result}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"approved local text");
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    call(&ws, "editors:close", edited["id"].clone()).await;
+    assert!(call(&ws, "editors:list", Value::Null)
+        .await
+        .as_array()
+        .unwrap()
+        .is_empty());
+    call(&ws, "ssh:close", json!(tab)).await;
+}
+
+#[test]
+fn csv_and_workspace_state_records_validate_without_executing_input() {
+    let preview=imports::csv_preview("\u{feff}name,address,port,username,auth,tags\r\n\"API, prod\",example.test,2222,ops,agent,prod;api\r\n").unwrap();
+    assert_eq!(preview["rows"][0]["name"], "API, prod");
+    assert_eq!(preview["rows"][0]["tags"], json!(["prod", "api"]));
+    assert!(imports::csv_rows("a,b\n\"unterminated").is_err());
+    assert!(imports::csv_preview("address,address\na,b").is_err());
+    assert_eq!(
+        imports::csv_preview("address,username\nvalid.test,").unwrap()["rows"][0]["editable"],
+        true
+    );
+    assert_eq!(
+        imports::csv_preview("address,username\ninvalid/path,").unwrap()["rows"][0]["editable"],
+        false
+    );
+    let valid = ssh::command_for("tail", "/tmp/valid", 2).unwrap();
+    assert!(valid.contains("tail"));
+    let command = ssh::CommandRequest {
+        action: "custom".into(),
+        argument: "printf 'a'; printf 'b'".into(),
+        lines: 100,
+    };
+    assert!(command.preview().unwrap().starts_with("sh -c '"));
+}
+#[tokio::test]
+async fn command_library_layouts_preferences_and_empty_workspace_guards() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let snippet = call(
+        &ws,
+        "snippets:save",
+        json!({"snippet":{"name":"status","command":"printf 'one'; printf 'two'","tags":["test"]}}),
+    )
+    .await[0]
+        .clone();
+    let layout=call(&ws,"layouts:save",json!({"layout":{"name":"pair","tabs":[{"hostId":Uuid::new_v4(),"title":"left"},{"hostId":Uuid::new_v4(),"title":"right"}],"split":[0,1],"direction":"horizontal","ratio":60}})).await[0].clone();
+    assert!(dispatch(&ws, "snippets:delete", json!({"snippet":snippet}))
+        .await
+        .is_err());
+    let preferences = call(&ws, "preferences:get", Value::Null).await;
+    let mut p = preferences.clone();
+    p["theme"] = json!("light");
+    p["terminalTheme"] = json!("light");
+    p["fontSize"] = json!(18);
+    p["recordCommands"] = json!(true);
+    call(&ws, "preferences:save", p.clone()).await;
+    let mut invalid = p.clone();
+    invalid["fontSize"] = json!(100);
+    assert!(dispatch(&ws, "preferences:save", invalid).await.is_err());
+    let rows = ws.store.lock().unwrap().data().unwrap().snapshot();
+    let mut restored = Data::default();
+    restored.apply(store::portable_rows(rows).unwrap(), None);
+    assert_eq!(json!(restored.snippets)[0], snippet);
+    assert_eq!(json!(restored.layouts)[0], layout);
+    assert_eq!(restored.preferences.font_size, 14);
+    assert!(ws.store.lock().unwrap().ensure_empty().is_err());
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "preferences:get", Value::Null).await, p);
+    call(
+        &ws,
+        "snippets:delete",
+        json!({"snippet":snippet,"expected":snippet}),
+    )
+    .await;
+    call(
+        &ws,
+        "layouts:delete",
+        json!({"layout":layout,"expected":layout}),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated OpenSSH, TCP fixture, and local log files"]
+async fn macos_commands_logs_remote_and_dynamic_forwards() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+    async fn free_port() -> u16 {
+        TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+    let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
+    let home = tempfile::tempdir().unwrap();
+    let (_p, ws) = make_workspace(home.path(), None);
+    let port: u16 = std::fs::read_to_string(fixture.join("openssh-port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let echo: u16 = std::fs::read_to_string(fixture.join("echo-port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let host=call(&ws,"hosts:save",json!({"address":"127.0.0.1","port":port,"username":std::env::var("USER").unwrap(),"auth":"agent","startupCommand":"printf 'STARTUP_%s\\n' 'DONE'","startupEnabled":true,"autoReconnect":true})).await[0].clone();
+    let mut rx = events(&ws);
+    let tab = connect_tab(&ws, &mut rx, &host, "", false, false).await;
+    let mut output = String::new();
+    while !output.contains("STARTUP_DONE") {
+        let e = until(&mut rx, |e| {
+            e["type"] == "output" && e["id"] == tab.to_string()
+        })
+        .await;
+        output.push_str(&String::from_utf8_lossy(
+            &STANDARD.decode(e["bytes"].as_str().unwrap()).unwrap(),
+        ));
+    }
+    let log = call(&ws, "logs:start", json!(tab)).await;
+    let mut p = call(&ws, "preferences:get", Value::Null).await;
+    p["recordCommands"] = json!(true);
+    call(&ws, "preferences:save", p).await;
+    let snippet=call(&ws,"snippets:save",json!({"snippet":{"name":"compound","command":"printf 'FIRST_%s\\n' 'DONE'; printf 'SECOND_%s\\n' 'DONE'"}})).await[0].clone();
+    let command = Uuid::new_v4();
+    call(
+        &ws,
+        "snippets:run",
+        json!({"id":command,"sessionId":tab,"snippetId":snippet["id"],"expected":snippet}),
+    )
+    .await;
+    let mut output = String::new();
+    loop {
+        let e = until(&mut rx, |e| e["id"] == command.to_string()).await;
+        if e["type"] == "output" {
+            output.push_str(&String::from_utf8_lossy(
+                &STANDARD.decode(e["bytes"].as_str().unwrap()).unwrap(),
+            ));
+        }
+        if e["type"] == "command" && e["status"] == "done" {
+            break;
+        }
+    }
+    assert!(
+        output.contains("FIRST_DONE") && output.contains("SECOND_DONE"),
+        "{output}"
+    );
+    assert_eq!(
+        call(&ws, "history:list", Value::Null)
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    call(&ws, "logs:stop", json!(tab)).await;
+    let text = call(&ws, "logs:read", log["id"].clone()).await;
+    assert!(text.as_str().unwrap().contains("SECOND_DONE"));
+    call(&ws, "logs:delete", log["id"].clone()).await;
+    assert!(call(&ws, "logs:list", Value::Null)
+        .await
+        .as_array()
+        .unwrap()
+        .is_empty());
+    call(&ws, "history:clear", Value::Null).await;
+    for kind in ["remote", "dynamic"] {
+        let listen = free_port().await;
+        let mut rule = json!({"name":kind,"kind":kind,"localPort":listen,"remoteAddress":"127.0.0.1","remotePort":echo});
+        if kind == "dynamic" {
+            rule["remoteAddress"] = json!("");
+            rule["remotePort"] = json!(0);
+        }
+        let saved = call(
+            &ws,
+            "forwards:save",
+            json!({"hostId":host["id"],"rule":rule}),
+        )
+        .await;
+        let rule = saved[0]["localForwards"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let run = call(
+            &ws,
+            "forwards:start",
+            json!({"sessionId":tab,"ruleId":rule["id"],"expected":rule}),
+        )
+        .await;
+        let mut socket = TcpStream::connect(("127.0.0.1", listen)).await.unwrap();
+        if kind == "dynamic" {
+            socket.write_all(&[5, 1, 0]).await.unwrap();
+            let mut response = [0; 2];
+            socket.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [5, 0]);
+            let domain = b"localhost";
+            let mut request = vec![5, 1, 0, 3, domain.len() as u8];
+            request.extend(domain);
+            request.extend(echo.to_be_bytes());
+            socket.write_all(&request).await.unwrap();
+            let mut response = [0; 10];
+            socket.read_exact(&mut response).await.unwrap();
+            assert_eq!(response[1], 0);
+        }
+        let payload = b"forward round trip";
+        socket.write_all(payload).await.unwrap();
+        let mut response = vec![0; payload.len()];
+        tokio::time::timeout(Duration::from_secs(10), socket.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, payload);
+        drop(socket);
+        call(&ws, "forwards:stop", run["id"].clone()).await;
+        assert!(TcpListener::bind(("127.0.0.1", listen)).await.is_ok());
+        assert!(ws.connections.connected(tab).is_ok());
+    }
+    // An abrupt SSH disconnect is retryable, while normal shell exits are not.
+    ws.connections
+        .connected(tab)
+        .unwrap()
+        .client
+        .get()
+        .unwrap()
+        .disconnect(russh::Disconnect::ByApplication, "test transport loss", "")
+        .await
+        .unwrap();
+    let closed = until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == tab.to_string() && e["status"] == "closed"
+    })
+    .await;
+    assert_eq!(closed["retryable"], true);
+    let normal = connect_tab(&ws, &mut rx, &host, "", false, false).await;
+    call(&ws, "ssh:input", json!({"id":normal,"data":"exit\r"})).await;
+    let closed = until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == normal.to_string() && e["status"] == "closed"
+    })
+    .await;
+    assert_eq!(closed["retryable"], false);
 }

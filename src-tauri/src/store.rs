@@ -1,4 +1,5 @@
 use crate::{
+    assets::{Asset, Group, Identity, Layout, Preferences, Snippet},
     error,
     forwarding::LocalForward,
     ssh, startup_unlock,
@@ -26,16 +27,37 @@ pub struct Host {
     pub username: String,
     pub auth: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_version: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub key_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jump_host_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub local_forwards: Vec<LocalForward>,
     pub group: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<Uuid>,
+    #[serde(default)]
+    pub inherit_port: bool,
+    #[serde(default)]
+    pub inherit_identity: bool,
     pub tags: Vec<String>,
     pub note: String,
     pub log_path: String,
     pub service: String,
+    #[serde(default)]
+    pub startup_command: String,
+    #[serde(default)]
+    pub startup_enabled: bool,
+    #[serde(default)]
+    pub auto_reconnect: bool,
+    pub keepalive_interval: u16,
+    pub connect_timeout: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_theme: Option<String>,
+    pub inherit_theme: bool,
 }
 impl Default for Host {
     fn default() -> Self {
@@ -46,14 +68,26 @@ impl Default for Host {
             port: 22,
             username: String::new(),
             auth: "agent".into(),
+            identity_id: None,
+            identity_version: None,
             key_path: None,
             jump_host_id: None,
             local_forwards: vec![],
             group: String::new(),
+            group_id: None,
+            inherit_port: false,
+            inherit_identity: false,
             tags: vec![],
             note: String::new(),
             log_path: String::new(),
             service: String::new(),
+            startup_command: String::new(),
+            startup_enabled: false,
+            auto_reconnect: false,
+            keepalive_interval: 15,
+            connect_timeout: 65,
+            terminal_theme: None,
+            inherit_theme: false,
         }
     }
 }
@@ -66,7 +100,14 @@ impl Host {
             && self.username == other.username
             && self.auth == other.auth
             && self.key_path == other.key_path
+            && self.keepalive_interval == other.keepalive_interval
+            && self.connect_timeout == other.connect_timeout
             && self.jump_host_id == other.jump_host_id
+            && self.identity_id == other.identity_id
+            && self.identity_version == other.identity_version
+            && self.group_id == other.group_id
+            && self.inherit_port == other.inherit_port
+            && self.inherit_identity == other.inherit_identity
     }
     pub fn jump_host<'a>(&self, hosts: &'a [Host]) -> Result<Option<&'a Host>, String> {
         let Some(id) = self.jump_host_id else {
@@ -89,6 +130,15 @@ impl Host {
     }
     pub fn normalized(mut self, allow_missing_key: bool) -> Result<Self, String> {
         crate::forwarding::normalize_rules(&mut self.local_forwards)?;
+        if self.keepalive_interval > 300
+            || !(5..=180).contains(&self.connect_timeout)
+            || self
+                .terminal_theme
+                .as_ref()
+                .is_some_and(|t| !matches!(t.as_str(), "dark" | "light"))
+        {
+            return Err("连接超时须为 5–180 秒，保活为 0–300 秒，配色须有效。".into());
+        }
         self.address = checked(&self.address, "主机地址", 255)?
             .trim_start_matches('[')
             .trim_end_matches(']')
@@ -113,6 +163,9 @@ impl Host {
         self.note = optional(&self.note, "备注", 1024)?;
         self.log_path = optional(&self.log_path, "日志路径", 4096)?;
         self.service = optional(&self.service, "服务名", 255)?;
+        if self.startup_enabled || !self.startup_command.is_empty() {
+            self.startup_command = crate::assets::command_text(&self.startup_command)?;
+        }
         if !self.log_path.is_empty() {
             ssh::command_for("tail", &self.log_path, 100)?;
         }
@@ -175,11 +228,39 @@ impl Drop for Password {
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct Row {
+pub struct HostRow {
     #[serde(flatten)]
     pub host: Host,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<Password>,
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Row {
+    Asset { asset: Asset },
+    Host(HostRow),
+}
+impl Row {
+    pub fn id(&self) -> Uuid {
+        match self {
+            Self::Host(h) => h.host.id,
+            Self::Asset { asset } => asset.id(),
+        }
+    }
+    pub fn summary(&self) -> Value {
+        match self {
+            Self::Host(h) => {
+                let mut v = json!(h.host);
+                v["passwordSaved"] = json!(h.password.is_some());
+                v
+            }
+            Self::Asset { asset } => asset.summary(),
+        }
+    }
+    #[cfg(test)]
+    pub fn password_saved(&self) -> bool {
+        matches!(self,Self::Host(h) if h.password.is_some())
+    }
 }
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Fingerprint {
@@ -243,6 +324,17 @@ impl Default for LockSettings {
 #[serde(rename_all = "camelCase", default)]
 pub struct Data {
     pub hosts: Vec<Host>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub identities: Vec<Identity>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<Group>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub snippets: Vec<Snippet>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub layouts: Vec<Layout>,
+    pub preferences: Preferences,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub command_history: Vec<Value>,
     pub fingerprints: Vec<Fingerprint>,
     pub recent: BTreeMap<Uuid, u64>,
     pub local_passwords: BTreeMap<Uuid, LocalPassword>,
@@ -261,6 +353,63 @@ impl Data {
             .find(|host| host.id == id)
             .ok_or("主机已删除，请重新选择。".into())
     }
+    pub fn connection_host(&self, id: Uuid) -> Result<Host, String> {
+        let mut host = self.host(id)?.clone();
+        if let Some(id) = host.group_id {
+            host.group = crate::assets::group_path(self, id)?;
+            let mut current = Some(id);
+            let mut port = None;
+            let mut theme = None;
+            let mut identity = None;
+            let mut seen = HashSet::new();
+            while let Some(id) = current {
+                if !seen.insert(id) {
+                    return Err("分组循环引用。".into());
+                }
+                let g = self
+                    .groups
+                    .iter()
+                    .find(|g| g.id == id)
+                    .ok_or("分组不存在。")?;
+                port = port.or(g.port);
+                theme = theme.or(g.terminal_theme.clone());
+                identity = identity.or(g.identity_id);
+                current = g.parent_id;
+            }
+            if host.inherit_theme {
+                host.terminal_theme = theme;
+            }
+            if host.inherit_port {
+                host.port = port.unwrap_or(22);
+            }
+            if host.inherit_identity {
+                host.identity_id =
+                    Some(identity.ok_or("分组没有可继承的身份，请设置组默认值或改为独立凭据。")?);
+            }
+        } else if host.inherit_port || host.inherit_identity || host.inherit_theme {
+            return Err("请先选择分组后再继承设置。".into());
+        }
+        if let Some(id) = host.identity_id {
+            let identity = self
+                .identities
+                .iter()
+                .find(|i| i.id == id)
+                .ok_or("关联身份不存在，请重新选择。")?;
+            host.username = identity.username.clone();
+            host.auth = identity.auth.clone();
+            host.key_path = identity.key_path.clone();
+            host.identity_version = Some(identity.version);
+        } else {
+            host.identity_version = None;
+        }
+        Ok(host)
+    }
+    pub fn connection_hosts(&self) -> Vec<Host> {
+        self.hosts
+            .iter()
+            .map(|h| self.connection_host(h.id).unwrap_or_else(|_| h.clone()))
+            .collect()
+    }
     pub fn fingerprint(&self, host: &Host) -> Option<&str> {
         self.fingerprints
             .iter()
@@ -271,33 +420,88 @@ impl Data {
         let mut rows: Vec<_> = self
             .hosts
             .iter()
-            .map(|host| Row {
-                host: Host {
-                    key_path: None,
-                    ..host.clone()
-                },
-                password: self.portable_passwords.get(&host.id).cloned(),
+            .map(|host| {
+                Row::Host(HostRow {
+                    host: Host {
+                        key_path: None,
+                        identity_version: None,
+                        ..host.clone()
+                    },
+                    password: self.portable_passwords.get(&host.id).cloned(),
+                })
             })
             .collect();
-        rows.sort_by_key(|row| row.host.id);
+        rows.extend(self.identities.iter().map(|i| Row::Asset {
+            asset: Asset::Identity(i.clone()).portable(),
+        }));
+        rows.extend(self.groups.iter().map(|g| Row::Asset {
+            asset: Asset::Group(g.clone()),
+        }));
+        rows.extend(self.snippets.iter().map(|s| Row::Asset {
+            asset: Asset::Snippet(s.clone()),
+        }));
+        rows.extend(self.layouts.iter().map(|l| Row::Asset {
+            asset: Asset::Layout(l.clone()),
+        }));
+        rows.sort_by_key(Row::id);
         rows
     }
     pub fn apply(&mut self, rows: Vec<Row>, sync: Option<Binding>) {
+        let mut hosts = Vec::new();
+        let mut identities = Vec::new();
+        let mut groups = Vec::new();
+        let mut snippets = Vec::new();
+        let mut layouts = Vec::new();
+        for row in rows {
+            match row {
+                Row::Host(h) => hosts.push(h),
+                Row::Asset {
+                    asset: Asset::Layout(l),
+                } => layouts.push(l),
+                Row::Asset {
+                    asset: Asset::Snippet(s),
+                } => snippets.push(s),
+                Row::Asset {
+                    asset: Asset::Group(g),
+                } => groups.push(g),
+                Row::Asset {
+                    asset: Asset::Identity(mut i),
+                } => {
+                    if let Some(old) = self.identities.iter().find(|old| {
+                        old.id == i.id && old.username == i.username && old.auth == i.auth
+                    }) {
+                        i.key_path = old.key_path.clone();
+                    }
+                    identities.push(i);
+                }
+            }
+        }
+        let identity_ids: HashSet<_> = identities
+            .iter()
+            .filter(|i| {
+                self.identities.iter().any(|old| {
+                    old.id == i.id && old.version == i.version && old.password == i.password
+                })
+            })
+            .map(|i| i.id)
+            .collect();
+        let rows = hosts;
         let mut next = Vec::new();
         self.local_passwords.retain(|id, _| {
-            rows.iter().any(|row| {
-                row.host.id == *id
-                    && self.hosts.iter().any(|old| {
-                        old.id == *id
-                            && old.same_endpoint(&row.host)
-                            && old.username == row.host.username
-                            && old.auth == row.host.auth
-                    })
-                    && self.portable_passwords.get(id) == row.password.as_ref()
-            })
+            identity_ids.contains(id)
+                || rows.iter().any(|row| {
+                    row.host.id == *id
+                        && self.hosts.iter().any(|old| {
+                            old.id == *id
+                                && old.same_endpoint(&row.host)
+                                && old.username == row.host.username
+                                && old.auth == row.host.auth
+                        })
+                        && self.portable_passwords.get(id) == row.password.as_ref()
+                })
         });
         self.portable_passwords.clear();
-        for Row { mut host, password } in rows {
+        for HostRow { mut host, password } in rows {
             if let Some(old) = self.hosts.iter().find(|old| {
                 old.id == host.id
                     && old.same_endpoint(&host)
@@ -312,6 +516,11 @@ impl Data {
             next.push(host);
         }
         self.hosts = next;
+        self.identities = identities;
+        self.groups = groups;
+        self.snippets = snippets;
+        self.layouts = layouts;
+        crate::assets::migrate_groups(self);
         self.sync = sync;
     }
 }
@@ -321,22 +530,30 @@ pub fn portable_rows(mut rows: Vec<Row>) -> Result<Vec<Row>, String> {
     }
     let mut seen = HashSet::new();
     for row in &mut rows {
-        if row.host.id.is_nil() || !seen.insert(row.host.id) {
-            return Err("保险库主机标识无效。".into());
+        if row.id().is_nil() || !seen.insert(row.id()) {
+            return Err("保险库记录标识无效。".into());
         }
-        row.host.key_path = None;
-        row.host = row.host.clone().normalized(true)?;
-        if let Some(secret) = &row.password {
-            if row.host.auth != "password"
-                || secret.password.is_empty()
-                || secret.password.len() > 4096
-                || !ssh::valid_fingerprint(&secret.fingerprint)
-            {
-                return Err("保险库凭据格式无效。".into());
+        match row {
+            Row::Host(row) => {
+                row.host.key_path = None;
+                row.host.identity_version = None;
+                row.host = row.host.clone().normalized(true)?;
+                if let Some(secret) = &row.password {
+                    if row.host.auth != "password"
+                        || secret.password.is_empty()
+                        || secret.password.len() > 4096
+                        || !ssh::valid_fingerprint(&secret.fingerprint)
+                    {
+                        return Err("保险库凭据格式无效。".into());
+                    }
+                }
+            }
+            Row::Asset { asset } => {
+                *asset = asset.clone().normalized()?.portable();
             }
         }
     }
-    rows.sort_by_key(|row| row.host.id);
+    rows.sort_by_key(Row::id);
     Ok(rows)
 }
 
@@ -515,7 +732,7 @@ impl Store {
         true
     }
     pub fn ensure_empty(&self) -> Result<(), String> {
-        if self.envelope.is_some() || !self.data()?.hosts.is_empty() {
+        if self.envelope.is_some() || !self.data()?.snapshot().is_empty() {
             return Err("恢复需要空工作区。".into());
         }
         Ok(())

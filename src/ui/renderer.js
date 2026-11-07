@@ -14,21 +14,27 @@ const removedJobs = new Set();
 const transferFilters = $('transfer-filters').querySelectorAll('button');
 const transferHistoryLimit = 200;
 const recent = new Map();
-const actionLabels = { tail: '查看日志末尾', follow: '跟踪日志', journal: '查看服务日志', disk: '查看磁盘' };
+const actionLabels = { custom:'自定义命令', tail: '查看日志末尾', follow: '跟踪日志', journal: '查看服务日志', disk: '查看磁盘' };
 const authLabels = { password: '密码', key: '私钥', agent: 'Agent' };
 const jobLabels = { queued: '等待', running: '传输中', committing: '提交中', done: '完成', canceled: '已取消', skipped: '已跳过', failed: '失败', unverified: '待确认' };
-const terminalFontSize = 14;
 const searchOptions = { decorations: {
   matchBackground: '#544622', matchBorder: '#b49352', matchOverviewRuler: '#b49352',
   activeMatchBackground: '#795120', activeMatchBorder: '#ffd68d', activeMatchColorOverviewRuler: '#ffd68d'
 } };
 let hosts = [];
+let groupAssets = [];
 let hostsLoaded = false;
 let currentGroup = '';
 let selectedGroup = '';
 let selectedHostId = '';
 let hostMenu;
 let active;
+let splitLayout;
+let draggingTab;
+let splitGrip;
+let uiPreferences={theme:"dark",terminalTheme:"dark",fontFamily:"SFMono-Regular, Menlo, monospace",fontSize:14,recordCommands:false};
+const recordingSessions=new Set();
+const {retryDelay,automaticCredential}=window.workspaceState;
 const forwardRuns = new Map();
 const forwardVersions = new Map();
 let forwardVersion = 0;
@@ -103,11 +109,13 @@ function chromeIcon(kind) {
     server: 'M3 4h18v7H3zm0 9h18v7H3zM7 7.5h.01M7 16.5h.01m4-9h6m-6 9h6',
     'new-tab': 'M4 4h16v16H4zM12 8v8m-4-4h8',
     terminal: 'M3 5h18v14H3zM7 9l3 3-3 3m6 0h4',
+    settings: 'M4 7h16M4 17h16M8 4v6m8 4v6',
     sync: 'M20 10a8 8 0 0 0-14-4L4 8m0-4v4h4m-4 6a8 8 0 0 0 14 4l2-2m0 4v-4h-4'
   }[kind]);
   svg.append(path);
   return svg;
 }
+function sidebarAction(label,icon,action){const control=button('',action,'',label);control.append(chromeIcon(icon),node('span','sidebar-label',label));return control;}
 function settingsIcon(kind) { return node('span', 'settings-icon', chromeIcon(kind)); }
 function endpoint(host) {
   const address = host.address.includes(':') && !host.address.startsWith('[') ? `[${host.address}]` : host.address;
@@ -148,7 +156,7 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
     const controls = node('div', 'actions', ...extra, cancel, confirm);
     const form = options.drawer
       ? node('form', '', node('div', 'drawer-fields', ...fields, error), controls)
-      : node('form', '', ...fields, error, controls);
+      : node('form', '', node('div','dialog-fields',...fields,error), controls);
     const header = options.drawer ? node('header', 'drawer-header', heading,
       button('×', () => { if (canClose()) dialog.close(); }, '', '关闭主机表单')) : heading;
     dialog.replaceChildren(header, form);
@@ -189,6 +197,7 @@ async function confirm(title, text, submit) {
 }
 
 async function refreshHosts() {
+  if(api.groups) groupAssets=await api.groups.list();
   const [result, timestamps] = await Promise.all([api.hosts.list(), api.hosts.recent()]);
   if (vaultStatus.locked) return;
   hosts = result;
@@ -214,6 +223,7 @@ async function refreshTouchIdAvailability() {
 function applyVaultState(state) {
   const refreshTouchId = state.enabled !== vaultStatus.enabled || state.locked !== vaultStatus.locked;
   vaultStatus = state;
+  if(!state.locked&&api.preferences) void api.preferences.get().then(p=>{if(!vaultStatus.locked&&JSON.stringify(p)!==JSON.stringify(uiPreferences)){const fonts=p.fontFamily!==uiPreferences.fontFamily||p.fontSize!==uiPreferences.fontSize;uiPreferences=p;applyPreferences(fonts);}}).catch(()=>{});
   updateTouchIdUnlock();
   const transfersSupported = state.fileTransfers !== false;
   document.querySelector('[data-page="transfers"]').hidden = $('queue-button').hidden = !transfersSupported;
@@ -221,7 +231,8 @@ function applyVaultState(state) {
   $('vault-lock').hidden = !state.locked;
   $('library-button').disabled = Boolean(state.locked);
   if (state.locked) {
-    forwardRuns.clear(); forwardVersions.clear();
+    for(const tab of tabs.values()){clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);tab.reconnectCancelled=true;}
+    forwardRuns.clear(); forwardVersions.clear();recordingSessions.clear();
     historyReady = false;
     $('terminal-drop').hidden = true;
     closeDropdown();
@@ -412,6 +423,10 @@ async function restoreVault(fromGit) {
 
 function conflictDescription(host) {
   if (host.deleted) return '已删除';
+  if(host.recordType) {
+    const {id,name,recordType,passwordSaved,...details}=host;
+    return `${name} · ${recordType}${passwordSaved?' · 含已保存密码':''}\n${JSON.stringify(details,null,2)}`;
+  }
   return `${host.name} · ${endpoint(host)} · ${host.auth}${host.group ? ` · ${host.group}` : ''}${host.passwordSaved ? ' · 含已保存密码' : ''}`;
 }
 
@@ -918,8 +933,183 @@ function passwordEditor(host, auth, hasPassword, sameTarget) {
   return { pane, password, hide, update };
 }
 
+async function manageTrust() {
+  while(!vaultStatus.locked){const entries=await api.trust.list();let choice;const search=input('','search');search.placeholder='搜索地址、指纹或主机';const list=node('div','forward-list');const render=()=>{const q=search.value.toLowerCase();list.replaceChildren(...entries.filter(e=>`${e.address} ${e.fingerprint} ${e.hosts.join(' ')}`.toLowerCase().includes(q)).map(e=>node('section','forward-rule',node('strong','',`${e.address}:${e.port}`),node('code','',e.fingerprint),node('small','muted',e.hosts.join('、')||'未关联主机'),button('移除信任',()=>{choice={forget:e};dialog.close();},'outlined danger'))));};search.addEventListener('input',render);render();await prompt('Known Hosts',[search,list],'关闭',()=>true,[button('导入 known_hosts…',()=>{choice={import:true};dialog.close();},'outlined')]);if(!choice)break;
+    if(choice.forget){const e=choice.forget;if(await confirm('移除主机信任',`${e.address}:${e.port}\n${e.fingerprint}\n后续连接会重新要求确认指纹；共享身份密码仍保留，但不会跳过目标信任检查。`,'移除'))await api.trust.forget(e);}
+    else {const preview=await api.trust.importPreview();if(!preview)continue;const checks=preview.rows.map(row=>{const selected=input('','checkbox');selected.checked=true;return {row,selected,view:node('label','checkbox-row',selected,`${row.address}:${row.port} · ${row.fingerprint}`)};});await prompt('导入主机信任',[...preview.warnings.map(w=>node('p','muted',w)),node('p','muted','仅导入已独立核验来源的密钥；不同指纹不会覆盖已有记录。'),...checks.map(c=>c.view)],'导入选中指纹',()=>api.trust.import(checks.filter(c=>c.selected.checked).map(c=>c.row)));}
+  }
+}
+
+function applyTerminalPreferences(tab) {
+  if(!tab?.terminal)return;const css=getComputedStyle(document.documentElement);const light=(tab.host?.terminalTheme||uiPreferences.terminalTheme)==='light';
+  const ansi=light?{black:'#273444',brightBlack:'#5c6878',red:'#b73535',brightRed:'#b73535',green:'#187447',brightGreen:'#187447',yellow:'#8b650b',brightYellow:'#8b650b',blue:'#285eb2',brightBlue:'#285eb2',magenta:'#8c3fab',brightMagenta:'#8c3fab',cyan:'#0c7180',brightCyan:'#0c7180',white:'#677387',brightWhite:'#172238'}:{black:'#596578',brightBlack:'#9aa9d7',red:'#f58291',brightRed:'#ffacb7',green:'#84d5a4',brightGreen:'#a2e9bb',yellow:'#e7c47d',brightYellow:'#ffdb97',blue:'#83aff6',brightBlue:'#a6c7ff',magenta:'#c9a2f4',brightMagenta:'#e0bfff',cyan:'#7ccedb',brightCyan:'#a0e7f0',white:'#d3dceb',brightWhite:'#f4f7fc'};
+  tab.terminal.options.theme={...ansi,background:light?'#f7f8fb':'#11161f',foreground:light?'#172238':'#e8edf6',cursor:light?'#147d55':'#4bce95',selectionBackground:light?'#b9d8d3':'#30534e'};
+}
+function applyPreferences(fonts = false) {
+  document.documentElement.dataset.theme=uiPreferences.theme==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):uiPreferences.theme;
+  document.documentElement.dataset.terminalTheme=uiPreferences.terminalTheme;
+  for(const tab of tabs.values())if(tab.terminal){if(fonts){tab.terminal.options.fontFamily=uiPreferences.fontFamily;tab.terminal.options.fontSize=uiPreferences.fontSize;}applyTerminalPreferences(tab);tab.fit.fit();}
+}
+async function editPreferences() {
+  const p=await api.preferences.get();const theme=node('select');const terminal=node('select');for(const[value,label]of [['dark','深色'],['light','浅色'],['system','跟随系统']]){const o=node('option','',label);o.value=value;theme.append(o);}theme.value=p.theme;
+  for(const[value,label]of [['dark','深色终端'],['light','浅色终端']]){const o=node('option','',label);o.value=value;terminal.append(o);}terminal.value=p.terminalTheme;
+  const family=input(p.fontFamily);const size=input(p.fontSize,'number');size.min=9;size.max=32;const history=input('','checkbox');history.checked=p.recordCommands;
+  const result=await prompt('界面与终端偏好',[field('应用主题',selectControl(theme,'应用主题')),field('终端配色',selectControl(terminal,'终端配色')),field('终端字体',family),field('默认字号（9–32）',size),node('label','checkbox-row',history,'保存通过命令库和快捷命令执行的历史'),node('p','muted','偏好与历史仅保存在此设备；不采集任意终端键入和密码提示中的输入。')],'保存偏好',()=>api.preferences.save({theme:theme.value,terminalTheme:terminal.value,fontFamily:family.value,fontSize:Number(size.value),recordCommands:history.checked}));
+  if(result){uiPreferences=result;applyPreferences(true);}
+}
+async function toggleRecording(session){
+  if(recordingSessions.has(session.id)){await api.logs.stop(session.id);recordingSessions.delete(session.id);}
+  else if(await confirm('记录会话输出',`${session.host.name} · ${endpoint(session.host)}\n只记录后续远端输出（含此会话的命令输出），不记录键入。输出可能含敏感内容，将以明文保存在本机；每条最多 20 MiB，保留最近 50 条。锁定或断线后停止。`,'开始记录')){await api.logs.start(session.id);recordingSessions.add(session.id);}
+  renderContext();
+}
+async function manageLogs(){
+  while(!vaultStatus.locked){const logs=await api.logs.list();recordingSessions.clear();for(const log of logs)if(log.active)recordingSessions.add(log.sessionId);let choice;const filter=input('','search');filter.placeholder='搜索主机、地址或时间';const list=node('div','forward-list');
+    const render=()=>{const q=filter.value.toLowerCase();list.replaceChildren(...logs.filter(l=>`${l.host} ${l.address} ${new Date(l.started).toLocaleString()}`.toLowerCase().includes(q)).map(l=>node('section','forward-rule',node('strong','',`${l.host} · ${new Date(l.started).toLocaleString()}`),node('small','muted',`${l.address} · ${bytes(l.bytes)}${l.active?' · 录制中':''}`),node('div','forward-actions',button('查看',()=>{choice={read:l};dialog.close();},'outlined'),button('导出',()=>api.logs.export(l.id),'outlined'),button(l.active?'停止':'删除',()=>{choice=l.active?{stop:l}:{remove:l};dialog.close();},'outlined danger')))));};filter.addEventListener('input',render);render();await prompt('本机会话日志',[filter,list],'关闭',()=>true);if(!choice)break;
+    if(choice.stop){await api.logs.stop(choice.stop.sessionId);continue;}if(choice.remove){if(await confirm('删除会话日志',`永久删除 ${choice.remove.host} 的这条本机日志？`,'删除'))await api.logs.remove(choice.remove.id);continue;}
+    const text=await api.logs.read(choice.read.id);const search=input('','search');search.placeholder='筛选日志行';const output=node('pre','operation-results',text);search.addEventListener('input',()=>{output.textContent=search.value?text.split('\n').filter(line=>line.toLowerCase().includes(search.value.toLowerCase())).join('\n'):text;});await prompt('查看会话日志',[search,output],'关闭',()=>true);
+  }renderContext();
+}
+async function commandHistory(session){const history=await api.history.list();let selected;const list=history.slice().reverse().map(item=>node('section','forward-rule',node('strong','',`${item.host} · ${new Date(item.at).toLocaleString()}`),node('pre','operation-results',item.command),...(session?.status==='ready'?[button('执行到当前会话…',()=>{selected=item;dialog.close();},'outlined')]:[])));
+  await prompt('本机命令执行历史',list.length?list:[node('p','muted','在偏好中开启后，仅保存由命令库和快捷命令执行的记录。')],'关闭',()=>true,[button('清空历史',async()=>{if(window.confirm('清空本机命令历史？')){await api.history.clear();dialog.close();}},'outlined danger')]);
+  if(selected&&await confirm('再次执行',`原目标 ${selected.endpoint}\n当前目标 ${endpoint(session.host)}\n${selected.command}`,'执行')){const tab={id:sessionId(),kind:'command',sessionId:session.id,host:session.host,action:'custom',status:'connecting'};attachTerminal(tab);tabs.set(tab.id,tab);selectTab(tab);await api.commands.start({id:tab.id,sessionId:session.id,request:{action:'custom',argument:selected.command,lines:100}});}
+}
+
+function reorderTabs(moving,before) {
+  if(moving===before||!tabs.has(moving)||!tabs.has(before))return;
+  const entries=window.workspaceState.reorder([...tabs.keys()],moving,before).map(id=>[id,tabs.get(id)]);tabs.clear();for(const[id,tab]of entries)tabs.set(id,tab);$('tabs').append(...[...tabs.values()].map(t=>t.tabRow));renderTabs();
+}
+async function editTab(tab) {
+  const title=input(tab.title||'');title.maxLength=80;title.placeholder=tabName(tab);
+  const move=delta=>{const ids=[...tabs.keys()];const index=ids.indexOf(tab.id);const target=ids[index+delta];if(target){if(delta<0)reorderTabs(tab.id,target);else reorderTabs(target,tab.id);}dialog.close();};
+  await prompt('标签名称与顺序',[field('自定义名称（留空恢复默认）',title)],'保存',()=>{tab.title=title.value.trim();renderTabs();renderSplitLayout();return true;},[button('左移',()=>move(-1),'outlined'),button('右移',()=>move(1),'outlined')]);
+}
+function renderSplitLayout() {
+  const container=$('terminal-views');splitGrip?.remove();splitGrip=undefined;
+  const split=splitLayout&&splitLayout.panes.includes(active?.id)&&splitLayout.panes.every(id=>tabs.has(id));
+  container.dataset.split=split?splitLayout.direction:'';container.style.gridTemplateColumns='';container.style.gridTemplateRows='';
+  for(const tab of tabs.values()) if(tab.view){tab.view.hidden=split?!splitLayout.panes.includes(tab.id):tab!==active;tab.view.classList.toggle('split-focused',Boolean(split&&tab===active));tab.view.dataset.paneTitle=tabTitle(tab);if(split)tab.view.style.order=String(splitLayout.panes.indexOf(tab.id)*2);else tab.view.style.order='';}
+  if(split){
+    const dimension=splitLayout.direction==='vertical'?'gridTemplateRows':'gridTemplateColumns';
+    const resize=()=>{container.style[dimension]=`${splitLayout.ratio}fr 7px ${100-splitLayout.ratio}fr`;splitGrip.setAttribute('aria-valuenow',String(Math.round(splitLayout.ratio)));for(const id of splitLayout.panes)tabs.get(id)?.fit.fit();};
+    splitGrip=node('div','split-grip');splitGrip.style.order='1';splitGrip.tabIndex=0;splitGrip.setAttribute('role','separator');splitGrip.setAttribute('aria-label','调整分屏尺寸');splitGrip.setAttribute('aria-orientation',splitLayout.direction==='vertical'?'horizontal':'vertical');
+    splitGrip.setAttribute('aria-valuemin','20');splitGrip.setAttribute('aria-valuemax','80');
+    splitGrip.addEventListener('keydown',event=>{if(['ArrowLeft','ArrowUp','ArrowRight','ArrowDown'].includes(event.key)){event.preventDefault();splitLayout.ratio=Math.max(20,Math.min(80,splitLayout.ratio+(['ArrowLeft','ArrowUp'].includes(event.key)?-5:5)));resize();}});
+    splitGrip.addEventListener('pointerdown',event=>{const grip=splitGrip;grip.setPointerCapture(event.pointerId);const move=e=>{const rect=container.getBoundingClientRect();const vertical=splitLayout.direction==='vertical';splitLayout.ratio=Math.max(20,Math.min(80,100*((vertical?e.clientY-rect.top:e.clientX-rect.left)/(vertical?rect.height:rect.width))));resize();};const end=()=>{grip.removeEventListener('pointermove',move);grip.removeEventListener('pointerup',end);};grip.addEventListener('pointermove',move);grip.addEventListener('pointerup',end);});
+    container.append(splitGrip);resize();
+  }
+}
+async function configureSplit(session) {
+  const other=node('select');const options=[['new','同主机新建独立会话'],...[...tabs.values()].filter(t=>t.kind==='shell'&&t.id!==session.id).map(t=>[t.id,tabTitle(t)])];for(const[value,label]of options){const o=node('option','',label);o.value=value;other.append(o);}
+  const direction=node('select');for(const[value,label]of [['horizontal','左右分屏'],['vertical','上下分屏']]){const o=node('option','',label);o.value=value;direction.append(o);}direction.value=splitLayout?.direction||'horizontal';let reset=false;
+  const result=await prompt('独立会话分屏',[node('p','muted','两个分屏分别连接和输入。移动、调整尺寸或拆回标签不会重建已有连接。'),field('另一会话',selectControl(other,'另一会话')),field('排列',selectControl(direction,'分屏方向'))],'应用',()=>({other:other.value,direction:direction.value}),[button('拆回标签',()=>{reset=true;dialog.close();},'outlined')]);
+  if(reset){splitLayout=undefined;selectTab(session);return;}if(!result||!tabs.has(session.id))return;
+  let partner=tabs.get(result.other);if(result.other==='new'){await openHost(hosts.find(h=>h.id===session.host.id)||session.host,{force:true});partner=active;}
+  if(partner?.kind==='shell'&&tabs.has(session.id)){splitLayout={panes:[session.id,partner.id],direction:result.direction,ratio:50};selectTab(session);}
+}
+async function manageLayouts() {
+  while(!vaultStatus.locked){const layouts=await api.layouts.list();let choice;
+    const rows=layouts.map(l=>node('section','forward-rule',node('strong','',l.name),node('p','muted',`${l.tabs.length} 个主机标签${l.split.length?' · 双分屏':''}`),node('div','forward-actions',button('恢复…',()=>{choice={restore:l};dialog.close();},'outlined'),button('删除',()=>{choice={remove:l};dialog.close();},'outlined danger'))));
+    await prompt('工作区布局模板',rows.length?rows:[node('p','muted','保存标签顺序、名称和双分屏排列；不保存终端内容或运行中的进程。')],'关闭',()=>true,[button('保存当前布局',()=>{choice={save:true};dialog.close();},'outlined')]);if(!choice)break;
+    if(choice.remove){if(await confirm('删除布局',`删除「${choice.remove.name}」？现有会话保留。`,'删除'))await api.layouts.remove({layout:choice.remove,expected:choice.remove});continue;}
+    if(choice.save){const sessions=[...tabs.values()].filter(t=>t.kind==='shell');const name=input('工作区布局');await prompt('保存当前布局',[field('布局名称',name),node('p','muted',`${sessions.length} 个主机标签；恢复后需逐个连接新的 SSH 会话。`)],'保存',()=>api.layouts.save({layout:{name:name.value,tabs:sessions.map(t=>({hostId:t.host.id,title:t.title||''})),split:splitLayout?splitLayout.panes.map(id=>sessions.findIndex(t=>t.id===id)):[],direction:splitLayout?.direction||'horizontal',ratio:Math.round(splitLayout?.ratio||50)}}));continue;}
+    const l=choice.restore;await refreshHosts();const missing=l.tabs.filter(t=>!hosts.some(h=>h.id===t.hostId));if(missing.length)throw new Error(`${missing.length} 个主机已删除，请先修复布局引用。`);
+    if(!await confirm('恢复布局',`新建 ${l.tabs.length} 个终端标签，原有会话保留。恢复后逐个点击连接，重新认证与核对指纹；不会恢复进程或终端内容。`,'恢复为新标签'))continue;
+    const ids=[];for(const saved of l.tabs){await openHost(hosts.find(h=>h.id===saved.hostId),{force:true,connectNow:false});active.title=saved.title;ids.push(active.id);}if(l.split.length===2)splitLayout={panes:l.split.map(i=>ids[i]),direction:l.direction,ratio:l.ratio};selectTab(tabs.get(ids[0]));return;
+  }
+}
+
+async function manageSnippets(session) {
+  while(!vaultStatus.locked) {
+    const snippets=await api.snippets.list();let choice;const search=input('','search');search.placeholder='搜索名称、标签和命令';const list=node('div','forward-list');
+    const render=()=>{const query=search.value.toLowerCase();list.replaceChildren(...snippets.filter(s=>`${s.name} ${s.command} ${s.tags.join(' ')}`.toLowerCase().includes(query)).map(s=>node('section','forward-rule',node('strong','',s.name),node('pre','operation-results',s.command),node('div','forward-actions',
+      ...((session?.status==='ready')?[button('粘贴',()=>{choice={paste:s};dialog.close();},'outlined'),button('执行…',()=>{choice={run:s};dialog.close();},'outlined')]:[]),button('编辑',()=>{choice={snippet:s};dialog.close();},'outlined'),button('删除',()=>{choice={remove:s};dialog.close();},'outlined danger')))));};
+    search.addEventListener('input',render);render();await prompt('命令库',[search,list],'关闭',()=>true,[button('新建命令',()=>{choice={create:true};dialog.close();},'outlined')]);if(!choice)break;
+    if(choice.paste){if(/[\r\n]/.test(choice.paste.command)){await confirm('多行命令', '粘贴仅支持单行命令，避免换行触发远端执行；多行命令请使用执行并预览。','知道了');continue;}if(session.status==='ready'){await api.ssh.input({id:session.id,data:choice.paste.command});selectTab(session);}return;}
+    if(choice.run){const s=choice.run;const attempt=session.attempts;if(await confirm('执行保存的命令',`${session.host.name} · ${endpoint(session.host)}\n以当前 SSH 用户在独立命令通道执行：\n${s.command}`,'执行')){
+      if(!readySession(session,attempt))throw new Error('SSH 会话已变化。');const tab={id:sessionId(),kind:'command',sessionId:session.id,host:session.host,action:'custom',status:'connecting'};attachTerminal(tab);tabs.set(tab.id,tab);selectTab(tab);try{await api.snippets.run({id:tab.id,sessionId:session.id,snippetId:s.id,expected:s});}catch(error){updateSession(tab,'failed',message(error));}
+    }return;}
+    if(choice.remove){if(await confirm('删除命令',`删除「${choice.remove.name}」？`,'删除'))await api.snippets.remove({snippet:choice.remove,expected:choice.remove});continue;}
+    const s=choice.snippet;const name=input(s?.name);const tags=input(s?.tags.join(', ')||'');const command=node('textarea');command.rows=8;command.value=s?.command||'';
+    await prompt(s?'编辑命令':'新建命令',[field('名称',name),field('标签（逗号分隔）',tags),field('命令文本',command)],'保存命令',()=>api.snippets.save({snippet:{id:s?.id,name:name.value,command:command.value,tags:tags.value.split(/[,，]/).map(t=>t.trim()).filter(Boolean)},expected:s}));
+  }
+}
+
+async function manageGroups() {
+  if(!api.groups) return;
+  while(!vaultStatus.locked) {
+    groupAssets=await api.groups.list();let choice;
+    const rows=groupAssets.map(g=>node('section','forward-rule',node('strong','',g.path),node('p','muted',`${g.hosts.length} 台主机 · 端口 ${g.port||'继承 / 22'} · ${g.identityId?'已设身份':'继承上级身份'}`),node('div','forward-actions',button('编辑',()=>{choice={group:g};dialog.close();},'outlined'),button('删除',()=>{choice={remove:g};dialog.close();},'outlined danger'))));
+    await prompt('分组管理',rows.length?rows:[node('p','muted','可创建空分组、嵌套分组与默认 SSH 设置。')],'关闭',()=>true,[button('新建分组',()=>{choice={create:true};dialog.close();},'outlined')]);
+    if(!choice) break;
+    if(choice.remove) {if(await confirm('删除分组',`删除「${choice.remove.path}」？请先移走主机与子分组。`,'删除')) {const result=await api.groups.remove({group:choice.remove,expected:choice.remove});groupAssets=result.groups;hosts=result.hosts;}continue;}
+    const g=choice.group;const name=input(g?.name);const parent=node('select');const port=input(g?.port||'','number');port.min=1;port.max=65535;
+    const identities=await api.identities.list();const identity=node('select');const theme=node('select');for(const[value,label]of [['','继承 / 终端偏好'],['dark','深色'],['light','浅色']]){const o=node('option','',label);o.value=value;theme.append(o);}theme.value=g?.terminalTheme||'';
+    for(const [value,label] of [['','无上级分组'],...groupAssets.filter(p=>p.id!==g?.id).map(p=>[p.id,p.path])]) {const o=node('option','',label);o.value=value;parent.append(o);}parent.value=g?.parentId||'';
+    for(const [value,label] of [['','继承上级 / 未设置'],...identities.map(i=>[i.id,i.name])]) {const o=node('option','',label);o.value=value;identity.append(o);}identity.value=g?.identityId||'';
+    await prompt(g?'编辑分组':'新建分组',[node('p','muted',`影响 ${g?.hosts.length||0} 台主机（含子分组），仅启用继承的主机使用默认值。`),field('分组名称',name),field('上级分组',selectControl(parent,'上级分组')),field('默认 SSH 端口（留空继承）',port),field('默认共享身份',selectControl(identity,'分组身份')),field('默认终端配色',selectControl(theme,'分组终端配色'))],'保存分组',async()=>{
+      const result=await api.groups.save({group:{id:g?.id,name:name.value,parentId:parent.value||undefined,port:port.value?Number(port.value):undefined,identityId:identity.value||undefined,terminalTheme:theme.value||undefined},expected:g});groupAssets=result.groups;hosts=result.hosts;renderHosts();return true;
+    });
+  }
+  await refreshHosts();
+}
+
+async function editIdentity(identity, sourceHost) {
+  const name=input(identity?.name || (sourceHost ? `${sourceHost.name} 身份` : ''));
+  const user=input(identity?.username || sourceHost?.username);
+  const auth=node('select');
+  for(const [value,label] of [['agent','SSH Agent'],['key','本机私钥'],['password','SSH 密码']]) {const o=node('option','',label);o.value=value;auth.append(o);}
+  auth.value=identity?.auth || sourceHost?.auth || 'agent';const authPicker=selectControl(auth,'身份认证方式');
+  const key=input(identity?.keyPath || sourceHost?.keyPath);const password=input('','password');
+  const share=input('','checkbox');const clear=input('','checkbox');const copy=input('','checkbox');
+  const canCopy=sourceHost?.auth==='password' && await api.hosts.hasPassword(sourceHost.id);
+  const keyField=field('本机私钥路径（仅保存在本机）',key);
+  const passwordField=field('新密码（留空保留原密码）',password);
+  const shareField=node('label','checkbox-row',share,'将本次新密码加入加密备份/Git 同步');
+  const copyField=node('label','checkbox-row',copy,'复制此主机已保存的密码到共享身份');
+  const clearField=node('label','checkbox-row',clear,'清除此身份已保存的密码（影响全部引用主机）');
+  const update=()=>{keyField.hidden=auth.value!=='key';passwordField.hidden=shareField.hidden=auth.value!=='password';copyField.hidden=!canCopy||auth.value!=='password';clearField.hidden=!identity?.passwordSaved||auth.value!=='password';share.disabled=!vaultStatus.enabled;password.disabled=copy.checked;};
+  auth.addEventListener('change',update);copy.addEventListener('change',update);update();
+  const affected=identity?.hosts || [];
+  return prompt(identity?'编辑共享身份':'新建共享身份',[
+    node('p','muted',`影响 ${affected.length} 台主机：${affected.map(h=>h.name).join('、') || '尚未引用'}。修改凭据后，新连接使用新值；已连接会话保持原连接。`),
+    ...(sourceHost?[node('p','muted',`保存后关联「${sourceHost.name}」。旧主机凭据会解除；需要沿用密码时勾选复制。`)]:[]),
+    field('身份名称',name),field('SSH 用户名',user),field('认证方式',authPicker),keyField,
+    button('选择本机私钥…',async()=>{const path=await api.hosts.pickKey();if(path){key.value=path;auth.value='key';auth.dispatchEvent(new Event('change'));}},'outlined'),
+    passwordField,copyField,shareField,clearField
+  ],sourceHost?'保存并关联此主机':'保存身份',async()=>{
+    const result=await api.identities.save({identity:{id:identity?.id,name:name.value,username:user.value,auth:auth.value,keyPath:key.value||undefined},
+      expected:identity,localPassword:password.value||undefined,sharePassword:share.checked,clearPassword:clear.checked,copySavedPassword:copy.checked,sourceHostId:sourceHost?.id});
+    if(sourceHost) hosts=await api.hosts.save({...sourceHost,identityId:result.identityId});
+    else hosts=result.hosts;
+    renderHosts();return result.identityId;
+  });
+}
+async function manageIdentities() {
+  if(!api.identities) return;
+  while(!vaultStatus.locked) {
+    const identities=await api.identities.list();let choice;
+    const rows=identities.map(identity=>node('section','forward-rule',node('strong','',identity.name),node('p','muted',`${identity.username} · ${authLabels[identity.auth]} · ${identity.hosts.length} 台主机${identity.passwordSaved?' · 已保存密码':''}`),
+      node('div','forward-actions',button('编辑',()=>{choice={identity};dialog.close();},'outlined'),button('删除',()=>{choice={remove:identity};dialog.close();},'outlined danger'))));
+    await prompt('共享身份',rows.length?rows:[node('p','muted','创建可供多台主机引用的用户名和认证资料。')],'关闭',()=>true,[button('新建身份',()=>{choice={create:true};dialog.close();},'outlined')]);
+    if(!choice) break;
+    if(choice.remove) {
+      const i=choice.remove;
+      if(i.hosts.length) {await confirm('身份仍被引用',`请先为这些主机解除身份关联：${i.hosts.map(h=>h.name).join('、')}`,'知道了');continue;}
+      if(await confirm('删除共享身份',`删除「${i.name}」及其保存的凭据？`,'删除')) await api.identities.remove({id:i.id,expected:i});
+    } else await editIdentity(choice.identity);
+  }
+  await refreshHosts();
+}
+
 async function editHost(host, draftTab, target) {
-  const hasPassword = host?.auth === 'password' && await api.hosts.hasPassword(host.id);
+  if(api.groups) groupAssets=await api.groups.list();
+  const identities=api.identities ? await api.identities.list() : [];
+  const identity=node('select');
+  const own=node('option','','主机独立凭据');own.value='';identity.append(own);
+  for(const i of identities) {const o=node('option','',`${i.name} · ${i.username}`);o.value=i.id;identity.append(o);}
+  if(host?.identityId&&!identities.some(i=>i.id===host.identityId)) {const o=node('option','','身份不可用，请重新选择');o.value=host.identityId;identity.append(o);}
+  identity.value=host?.identityId||'';const identityPicker=selectControl(identity,'共享身份');
+  const hasPassword = !host?.identityId && host?.auth === 'password' && await api.hosts.hasPassword(host.id);
   const name = input(host?.name);
   const addressField = input(host?.address ?? target?.address);
   const port = input(host?.port || target?.port || '22', 'number');
@@ -929,10 +1119,18 @@ async function editHost(host, draftTab, target) {
   group.placeholder = '选择或输入分组';
   const tags = input(host?.tags?.join(', ') || '');
   tags.placeholder = '以逗号分隔';
+  const inheritPort=input('','checkbox');inheritPort.checked=Boolean(host?.inheritPort);
+  const inheritTheme=input('','checkbox');inheritTheme.checked=Boolean(host?.inheritTheme);
+  const terminalTheme=node('select');for(const[value,label]of [['','使用终端偏好'],['dark','深色'],['light','浅色']]){const o=node('option','',label);o.value=value;terminalTheme.append(o);}terminalTheme.value=host?.terminalTheme||'';const terminalThemePicker=selectControl(terminalTheme,'主机终端配色');
+  const keepalive=input(host?.keepaliveInterval??15,'number');keepalive.min=0;keepalive.max=300;const timeout=input(host?.connectTimeout??65,'number');timeout.min=5;timeout.max=180;
+  const inheritIdentity=input('','checkbox');inheritIdentity.checked=Boolean(host?.inheritIdentity);
   const note = input(host?.note);
   const logPath = input(host?.logPath);
   const service = input(host?.service);
-  const groups = [...new Set(hosts.map((item) => item.group).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+  const startup=node('textarea');startup.value=host?.startupCommand||'';startup.rows=3;
+  const reconnect=input('','checkbox');reconnect.checked=Boolean(host?.autoReconnect);
+  const autoStartup=input('','checkbox');autoStartup.checked=Boolean(host?.startupEnabled);
+  const groups = [...new Set([...groupAssets.map(g=>g.path),...hosts.map((item) => item.group).filter(Boolean)])].sort((a, b) => a.localeCompare(b, 'zh-CN'));
   const groupPicker = editableControl(group, '分组', (query) => {
     const matches = groups.filter((value) => !query || value.toLowerCase().includes(query.toLowerCase())).map((value) => ({ value, label: value }));
     if (!query) return [{ value: '', label: '无分组' }, ...matches];
@@ -968,19 +1166,34 @@ async function editHost(host, draftTab, target) {
   const matches = (item) => item.address.toLowerCase() === normalizedAddress() && item.port === Number(port.value) && item.username === username.value.trim();
   const sameTarget = () => Boolean(host?.auth === 'password' && auth.value === 'password' && matches(host));
   const editor = api.hosts.revealPassword ? passwordEditor(host, auth, hasPassword, sameTarget) : null;
+  const inheritanceHint=node('p','muted');inheritanceHint.setAttribute('aria-live','polite');
+  const inheritedSource=property=>{let g=groupAssets.find(g=>g.path===group.value);const seen=new Set();while(g&&!seen.has(g.id)){seen.add(g.id);if(g[property]!==undefined&&g[property]!==null&&g[property]!=='')return g;g=groupAssets.find(p=>p.id===g.parentId);}return undefined;};
   const updateAuth = () => {
-    keyRow.hidden = auth.value !== 'key';
+    const portSource=inheritedSource('port'),identitySource=inheritedSource('identityId'),themeSource=inheritedSource('terminalTheme');
+    const inheritedIdentity=identities.find(i=>i.id===identitySource?.identityId);
+    const hints=[];
+    if(inheritPort.checked){port.value=portSource?.port||22;hints.push(`端口 ${port.value}：${portSource?.path||'默认值'}`);}
+    if(inheritIdentity.checked){identity.value=inheritedIdentity?.id||'';identity.dispatchEvent(new Event('input'));if(inheritedIdentity){username.value=inheritedIdentity.username;auth.value=inheritedIdentity.auth;key.value=inheritedIdentity.keyPath||'';auth.dispatchEvent(new Event('input'));}hints.push(inheritedIdentity?`身份 ${inheritedIdentity.name}：${identitySource.path}`:'未找到分组身份，请先配置或取消身份继承');}
+    if(inheritTheme.checked){terminalTheme.value=themeSource?.terminalTheme||'';terminalTheme.dispatchEvent(new Event('input'));hints.push(`终端配色：${themeSource?`${themeSource.path}（${themeSource.terminalTheme==='light'?'浅色':'深色'}）`:'设备终端偏好'}`);}
+    inheritanceHint.textContent=hints.join('；');inheritanceHint.hidden=!hints.length;
+    const linked=Boolean(identity.value)||inheritIdentity.checked;
+    auth.disabled=username.disabled=key.disabled=select.disabled=linked;port.disabled=inheritPort.checked;identity.disabled=inheritIdentity.checked;terminalTheme.disabled=inheritTheme.checked;
+    if(editor) {editor.pane.hidden=linked;if(linked) editor.password.value='';}
+    keyRow.hidden = linked || auth.value !== 'key';
     key.required = auth.value === 'key' && !(host?.auth === 'key' && !host.keyPath);
     if (editor) {
       if (auth.value !== 'password') editor.password.value = '';
       editor.hide();
     }
   };
+  inheritPort.addEventListener('change',updateAuth);inheritIdentity.addEventListener('change',updateAuth);inheritTheme.addEventListener('change',updateAuth);
+  group.addEventListener('input',updateAuth);group.addEventListener('change',updateAuth);
+  identity.addEventListener('change',()=>{const i=identities.find(i=>i.id===identity.value);if(i){username.value=i.username;auth.value=i.auth;key.value=i.keyPath||'';auth.dispatchEvent(new Event('change'));}updateAuth();});
   auth.addEventListener('change', updateAuth);
   updateAuth();
   for (const required of [addressField, username, port]) required.required = true;
-  const draft = () => ({ id: host?.id, name: name.value, address: addressField.value, port: Number(port.value), username: username.value, group: group.value,
-    auth: auth.value, keyPath: key.value || undefined, jumpHostId: jump.value || undefined, tags: tags.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean), note: note.value, logPath: logPath.value, service: service.value });
+  const draft = () => ({ id: host?.id, name: name.value, address: addressField.value, port: Number(port.value), username: username.value, group: group.value, groupId:groupAssets.find(g=>g.path===group.value)?.id, inheritPort:inheritPort.checked, inheritIdentity:inheritIdentity.checked, inheritTheme:inheritTheme.checked,terminalTheme:terminalTheme.value||undefined,keepaliveInterval:Number(keepalive.value),connectTimeout:Number(timeout.value),
+    identityId: inheritIdentity.checked ? undefined : identity.value || undefined, auth: auth.value, keyPath: key.value || undefined, jumpHostId: jump.value || undefined, tags: tags.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean), note: note.value, logPath: logPath.value, service: service.value, startupCommand:startup.value, startupEnabled:autoStartup.checked, autoReconnect:reconnect.checked });
   const original = JSON.stringify(draft());
   const duplicate = input('', 'checkbox');
   const duplicateRow = node('label', 'checkbox-row', duplicate, '已有相同地址、端口和用户名，仍保存为另一条配置');
@@ -1010,7 +1223,7 @@ async function editHost(host, draftTab, target) {
     pasteHint.textContent = '已填入连接信息，请核对后保存。';
     updateDuplicate();
   });
-  const details = node('details', 'host-form-section', node('summary', '', '更多设置'), field('标签', tags), field('备注', note), field('常用日志路径', logPath), field('常用 systemd 服务', service));
+  const details = node('details', 'host-form-section', node('summary', '', '更多设置'), field('标签', tags), field('备注', note), field('常用日志路径', logPath), field('常用 systemd 服务', service),...(api.snippets?[field('终端配色（未继承时）',terminalThemePicker),field('SSH 保活间隔（秒，0 关闭）',keepalive),field('连接超时（秒）',timeout),field('启动命令',startup),node('label','checkbox-row',autoStartup,'每次新建连接后在终端自动执行上述命令'),node('label','checkbox-row',reconnect,'异常断线后自动重连（最多 3 次；仅 Agent 或已保存密码）'),node('p','muted','自动重连会创建新会话，也会重新执行已启用的启动命令；转发规则须手动恢复。')]:[]));
   const management = host && node('details', 'host-form-section', node('summary', '', '管理主机'), node('div', 'management-actions',
     ...(hasPassword ? [button('清除已保存密码', () => { dialog.close('clear-password'); }, 'outlined')] : []),
     button('忘记指纹', () => { dialog.close('forget'); }, 'outlined'),
@@ -1028,9 +1241,9 @@ async function editHost(host, draftTab, target) {
   try {
     result = await prompt(host ? '编辑主机' : '新建主机', [
       node('section', 'host-form-section', node('h3', '', '地址'), field('主机地址', addressField), pasteHint),
-      node('section', 'host-form-section', node('h3', '', '常规'), field('显示名称', name), field('分组', groupPicker)),
+      node('section', 'host-form-section', node('h3', '', '常规'), field('显示名称', name), field('分组', groupPicker),...(api.groups?[node('label','checkbox-row',inheritPort,'继承分组端口（未设置时 22）'),node('label','checkbox-row',inheritIdentity,'继承分组共享身份'),node('label','checkbox-row',inheritTheme,'继承分组终端配色'),inheritanceHint]:[])),
       node('section', 'host-form-section', node('h3', '', 'SSH 连接'),
-        node('div', 'dialog-row', field('SSH 用户名', username), field('端口', port)), field('认证方式', authPicker), field('连接路径', jumpPicker), routeHint,
+        node('div', 'dialog-row', field('SSH 用户名', username), field('端口', port)), ...(api.identities?[field('共享身份',identityPicker)]:[]), field('认证方式', authPicker), field('连接路径', jumpPicker), routeHint,
         keyRow, ...(editor ? [editor.pane] : []), duplicateRow),
       details, ...(management ? [management] : [])
     ], '保存并连接', async (action) => {
@@ -1172,7 +1385,8 @@ function openHostMenu(host, anchor, x, y) {
     ['连接 / 切换已有会话', () => openHost(host)],
     ['在新标签连接', () => openHost(host, { force: true })],
     ['编辑主机…', () => editHost(host)],
-    ...(api.forwards ? [['本地端口转发…', () => manageForwards(host)]] : [])
+    ...(api.identities ? [['共享身份…',()=>manageIdentities()],...(!host.identityId?[['保存为共享身份…',()=>editIdentity(undefined,host)]]:[])] : []),
+    ...(api.forwards ? [['端口转发…', () => manageForwards(host)]] : [])
   ];
   for (const [label, run] of actions) {
     const action = button(label, () => { closeHostMenu(true); return run(); });
@@ -1216,7 +1430,7 @@ function recentFirst(a, b) {
 
 function renderHosts() {
   closeHostMenu();
-  const groups = new Map();
+  const groups = new Map(groupAssets.map(g=>[g.path,0]));
   for (const host of hosts) {
     if (host.group) groups.set(host.group, (groups.get(host.group) || 0) + 1);
   }
@@ -1248,8 +1462,8 @@ function renderHosts() {
   if (!visibleHosts.some((host) => host.id === selectedHostId)) selectedHostId = '';
   visibleHosts.sort(recentFirst);
   const matchingGroups = new Set(matching.map((host) => host.group));
-  const visibleGroups = currentGroup ? [] : [...groups]
-    .filter(([group]) => !searching || matchingGroups.has(group))
+  const visibleGroups = [...groups]
+    .filter(([group]) => {const asset=groupAssets.find(g=>g.path===group);const parent=groupAssets.find(g=>g.id===asset?.parentId)?.path||'';return searching ? matchingGroups.has(group)||group.toLowerCase().includes(query) : asset ? parent===currentGroup : !currentGroup;})
     .sort(([a], [b]) => a.localeCompare(b, 'zh-CN'));
   $('host-breadcrumb').hidden = !currentGroup;
   $('current-group').textContent = $('current-group').title = currentGroup;
@@ -1276,8 +1490,8 @@ function renderHosts() {
   list.replaceChildren(...sections);
 }
 
-async function importHosts() {
-  const preview = await api.hosts.importPreview();
+async function importHosts(csv=false) {
+  const preview = await (csv ? api.hosts.csvPreview() : api.hosts.importPreview());
   if (!preview) return;
   const duplicates = input('', 'checkbox');
   const rows = preview.rows.map((row) => {
@@ -1290,13 +1504,13 @@ async function importHosts() {
     const authentication = node('small', '', row.auth === 'key' ? `本机私钥 · ${row.keyPath}` : 'SSH Agent');
     return { row, selected, username, view: node('div', 'import-row', label, authentication, ...(row.editable ? [field('SSH 用户名', username)] : [])) };
   });
-  const result = await prompt('预览 OpenSSH 导入', [...preview.warnings.map((warning) => node('p', 'muted', warning)),
+  const result = await prompt(csv?'预览 CSV 导入':'预览 OpenSSH 导入', [...preview.warnings.map((warning) => node('p', 'muted', warning)),
     node('div', 'key-list', ...rows.map((row) => row.view)), node('label', 'checkbox-row', duplicates, '保留重复配置')], '导入所选主机', () => {
     const selected = rows.filter((row) => row.selected.checked).map(({ row, username }) => ({ ...row, username: username.value }));
     if (!selected.length) throw new Error('请选择至少一条可导入的主机。');
     return api.hosts.import({ rows: selected, keepDuplicates: duplicates.checked });
   });
-  if (result) { hosts = result.hosts; renderHosts(); status(`已导入 ${result.count} 台主机。`); }
+  if (result) { hosts = result.hosts; await refreshHosts(); status(`已导入 ${result.count} 台主机。`); }
 }
 
 function attachTerminal(tab) {
@@ -1306,7 +1520,7 @@ function attachTerminal(tab) {
   const styles = getComputedStyle(document.documentElement);
   const color = (name) => styles.getPropertyValue(name).trim();
   const terminal = new Terminal({
-    fontFamily: 'SFMono-Regular, Menlo, monospace', fontSize: terminalFontSize, lineHeight: 1.2, scrollback: 6000,
+    fontFamily: uiPreferences.fontFamily, fontSize: uiPreferences.fontSize, lineHeight: 1.2, scrollback: 6000,
     cursorBlink: tab.kind === 'shell', disableStdin: tab.kind === 'command',
     convertEol: tab.kind === 'command', allowProposedApi: true, minimumContrastRatio: 4.5, theme: {
       background: color('--terminal'), foreground: color('--terminal-text'), cursor: color('--accent'), selectionBackground: color('--terminal-selection'),
@@ -1351,7 +1565,10 @@ function attachTerminal(tab) {
       if (await prompt('确认多行粘贴', [node('p', '', `目标 ${endpoint(tab.host)}`), preview], '粘贴', () => true) && active === tab && tab.status === 'ready') terminal.paste(text);
     } catch (error) { status(message(error)); }
   }, true);
+  view.addEventListener('pointerdown',()=>{if(active!==tab&&splitLayout?.panes.includes(tab.id)) selectTab(tab);});
+  const resizeObserver=new ResizeObserver(()=>{if(!view.hidden)fit.fit();});resizeObserver.observe(view);tab.resizeObserver=resizeObserver;
   Object.assign(tab, { view, terminal, fit, search, paths });
+  applyTerminalPreferences(tab);
 }
 
 function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session' : 'hosts') {
@@ -1389,7 +1606,7 @@ function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session'
   $('terminal-find').hidden = true;
   $('terminal-drop').hidden = true;
   renderTerminalBottom();
-  for (const entry of tabs.values()) if (entry.view) entry.view.hidden = entry !== tab;
+  renderSplitLayout();
   renderTabs();
   revealActiveTab('smooth');
   if (view === 'hosts') renderHosts();
@@ -1444,6 +1661,7 @@ function tabName(tab) {
 }
 
 function tabTitle(tab) {
+  if(tab.title) return tab.title;
   return tabName(tab) + (tab.number > 1 ? ` · ${tab.number}` : '');
 }
 
@@ -1465,12 +1683,20 @@ function renderTabs() {
       if (tab.kind !== 'new') open.append(icon);
       const row = node('div', 'tab', leading, open);
       row.dataset.kind = tab.kind;
+      row.draggable=true;
+      row.addEventListener('dragstart',(event)=>{draggingTab=tab.id;event.dataTransfer.setData('application/x-termlume-tab',tab.id);});
+      row.addEventListener('dragover',(event)=>{if(draggingTab&&tabs.has(draggingTab))event.preventDefault();});
+      row.addEventListener('drop',(event)=>{event.preventDefault();if(draggingTab)reorderTabs(draggingTab,tab.id);draggingTab=undefined;});
+      row.addEventListener('dragend',()=>{draggingTab=undefined;});
+      row.addEventListener('contextmenu',(event)=>{event.preventDefault();void editTab(tab);});
       if (tab.tabRow) tab.tabRow.replaceWith(row);
       else strip.append(row);
       tab.tabRow = row;
     }
     tab.tabRow.dataset.active = String(tab === active);
+    tab.tabRow.querySelector('.tab-close').setAttribute('aria-label',`关闭 ${tabTitle(tab)}`);
     const open = tab.tabRow.querySelector('.tab-open');
+    open.querySelector('.text-ellipsis').textContent=tab.title||tabName(tab);
     const state = tab.kind === 'new' ? '选择主机' : sessionLabels[tab.status] || '等待连接';
     open.setAttribute('aria-pressed', String(tab === active));
     open.setAttribute('aria-label', `${tabTitle(tab)} · ${state}${tab.unread ? ' · 有未读输出' : ''}`);
@@ -1588,24 +1814,30 @@ async function openForwardPanel(host, session) {
   const feedback = node('p', 'dialog-error');
   feedback.setAttribute('role', 'alert');
   const name = input('');
+  const kind=node('select');for(const[value,label]of [['local','本地转发：本机 → SSH 主机侧'],['remote','远程转发：SSH 主机侧 → 本机'],['dynamic','动态转发：本机 SOCKS5（仅 CONNECT）']]){const o=node('option','',label);o.value=value;kind.append(o);}const kindPicker=selectControl(kind,'转发类型');
   const localPort = input('', 'number');
   const address = input('127.0.0.1');
   const remotePort = input('', 'number');
   for (const port of [localPort, remotePort]) { port.min = 1; port.max = 65535; }
-  const editor = node('section', 'forward-editor', node('h3', '', '规则设置'), field('规则名称', name),
-    field('本地端口（127.0.0.1）', localPort), field('目标服务地址（由 SSH 主机访问）', address), field('目标服务端口', remotePort));
+  const listenField=field('本机监听端口（127.0.0.1）',localPort),targetField=field('目标服务地址（由 SSH 主机访问）',address);
+  const updateKind=()=>{address.disabled=remotePort.disabled=kind.value==='dynamic';address.required=remotePort.required=kind.value!=='dynamic';listenField.firstChild.textContent=kind.value==='remote'?'远端监听端口（请求 127.0.0.1）':'本机监听端口（127.0.0.1）';targetField.firstChild.textContent=kind.value==='remote'?'目标服务地址（由本机访问）':'目标服务地址（由 SSH 主机访问）';};
+  const editor = node('section', 'forward-editor', node('h3', '', '规则设置'), field('规则名称', name),field('转发类型',kindPicker),
+    listenField, targetField, field('目标服务端口', remotePort));
   editor.hidden = true;
   let editing, original = '', pending = new Set();
-  const draft = () => ({ id: editing?.id, name: name.value, localPort: Number(localPort.value), remoteAddress: address.value, remotePort: Number(remotePort.value) });
+  const draft = () => ({ id: editing?.id, name: name.value, kind:kind.value, localPort: Number(localPort.value), remoteAddress: address.value, remotePort: Number(remotePort.value) });
   const openEditor = (rule) => {
     editing = rule || null;
+    kind.value=rule?.kind||'local';kind.dispatchEvent(new Event('change'));
     name.value = rule?.name || ''; localPort.value = rule?.localPort || ''; address.value = rule?.remoteAddress || '127.0.0.1'; remotePort.value = rule?.remotePort || '';
     editor.hidden = false;
     for (const field of [name, localPort, address, remotePort]) field.required = true;
+    address.disabled=remotePort.disabled=kind.value==='dynamic';address.required=remotePort.required=kind.value!=='dynamic';
     original = JSON.stringify(draft());
     render();
     name.focus();
   };
+  kind.addEventListener('change',updateKind);
   const cancelEdit = button('取消编辑', () => {
     if (JSON.stringify(draft()) !== original && !window.confirm('放弃尚未保存的转发规则？')) return;
     editor.hidden = true;
@@ -1657,11 +1889,11 @@ async function openForwardPanel(host, session) {
       edit.disabled = remove.disabled = Boolean(running.length || pending.has(rule.id) || !currentHost());
       actions.append(start, edit, remove);
       const row = node('section', 'forward-rule', node('strong', '', rule.name),
-        node('code', '', `127.0.0.1:${rule.localPort} → ${rule.remoteAddress.includes(':') ? `[${rule.remoteAddress}]` : rule.remoteAddress}:${rule.remotePort}`), detail, actions);
+        node('code', '', rule.kind==='dynamic'?`本机 127.0.0.1:${rule.localPort} → SOCKS5`:`${rule.kind==='remote'?'远端':'本机'} 127.0.0.1:${rule.localPort} → ${rule.kind==='remote'?'本机服务':'远端服务'} ${rule.remoteAddress.includes(':') ? `[${rule.remoteAddress}]` : rule.remoteAddress}:${rule.remotePort}`), detail, actions);
       row.setAttribute('aria-label', `转发规则 ${rule.name}`);
       return row;
     });
-    list.replaceChildren(...(rows.length ? rows : [node('p', 'muted', '还没有本地转发规则。')]));
+    list.replaceChildren(...(rows.length ? rows : [node('p', 'muted', '还没有转发规则。')]));
     const save = dialog.querySelector('button[type="submit"]');
     save.hidden = editor.hidden;
   };
@@ -1678,9 +1910,9 @@ async function openForwardPanel(host, session) {
   }), 'outlined');
   add.disabled = !currentHost();
   try {
-    const task = prompt(`${host.name} · 本地端口转发`, [
+    const task = prompt(`${host.name} · 端口转发`, [
       node('p', 'muted', `${endpoint(host)}${session?.jumpHost ? ` · 经 ${session.jumpHost.name}` : ''}`),
-      node('p', 'muted', '本地仅监听 127.0.0.1；目标地址由 SSH 主机访问。保存后手动启动，停止会关闭已有连接。'),
+      node('p', 'muted', '本地/动态转发只监听本机 127.0.0.1；远程转发请求服务器监听 127.0.0.1（实际范围受 sshd 配置影响）。远程类型的目标由本机访问；其他类型由 SSH 主机访问。仅手动启停，不随重连恢复。'),
       ...(!session ? [node('p', 'muted', '连接主机后，从会话工具栏启动规则。')] : []), node('div', 'forward-actions', add, reload), list, feedback, editor
     ], '保存规则', async () => {
       const saved = await api.forwards.save({ hostId: host.id, rule: draft(), expected: editing || undefined });
@@ -1707,7 +1939,8 @@ function renderContext() {
   if (session?.jumpHost) $('context').append(summaryText('small', `经 ${session.jumpHost.name}`));
   const controls = $('session-actions');
   controls.replaceChildren();
-  if (tab.kind === 'shell' && tab.status === 'closed') controls.append(button(tab.promptForPassword ? '重新输入密码' : '重连', () => connect(tab)));
+  if(tab.reconnectTimer&&tab.status==='closed') controls.append(button('取消自动重连',()=>{clearTimeout(tab.reconnectTimer);tab.reconnectTimer=undefined;tab.reconnectCancelled=true;renderContext();}));
+  if (tab.kind === 'shell' && tab.status === 'closed') controls.append(button(tab.promptForPassword ? '重新输入密码' : tab.attempts ? '重连' : '连接', () => connect(tab)));
   if (tab.kind === 'command') {
     if (session) controls.append(button('返回终端', () => selectTab(session), 'outlined'));
     if (tab.action === 'follow' && ['running', 'connecting'].includes(tab.status)) controls.append(button('停止跟踪', () => api.commands.stop(tab.id)));
@@ -1719,6 +1952,11 @@ function renderContext() {
     const running = [...forwardRuns.values()].filter((job) => job.sessionId === session.id && ['running', 'stopping'].includes(job.status)).length;
     controls.append(button(`端口转发${running ? ` · ${running}` : ''}`, () => manageForwards(session.host, session)));
   }
+  if(api.logs&&session?.status==='ready') controls.append(button(recordingSessions.has(session.id)?'停止录制':'记录输出',()=>toggleRecording(session)));
+  if(api.history&&session) controls.append(button('历史',()=>commandHistory(session)));
+  if(session?.kind==='shell') controls.append(button(splitLayout?.panes.includes(session.id)?'分屏设置':'分屏…',()=>configureSplit(session)));
+  if(api.layouts) controls.append(button('布局',()=>manageLayouts()));
+  if(api.snippets&&session) controls.append(button('命令库',()=>manageSnippets(session)));
   const shortcuts = button('快捷命令', () => openPalette('commands'));
   shortcuts.disabled = session?.status !== 'ready';
   controls.append(shortcuts);
@@ -1760,7 +1998,7 @@ async function enterCredential(host, jump = false) {
   const share = input('', 'checkbox');
   const fields = [node('p', '', `${host.name} · ${endpoint(host)}`), field(label, credential)];
   if (passwordAuth) {
-    fields.push(node('label', 'checkbox-row', remember, '在本机记住密码'));
+    fields.push(node('label', 'checkbox-row', remember, host.identityId ? '在本机记住此共享身份密码' : '在本机记住密码'));
     if (vaultStatus.enabled) {
       const portable = node('label', 'checkbox-row', share, '同时加入加密备份和 Git 同步');
       portable.hidden = true;
@@ -1775,8 +2013,12 @@ async function enterCredential(host, jump = false) {
   }
 }
 
-async function connect(tab, enterPassword = false) {
+async function connect(tab, enterPassword = false, automatic = false) {
+  clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);
+  tab.reconnectTimer=undefined;
+  if(!automatic){tab.retryCount=0;tab.reconnectCancelled=false;}
   if (tab.status === 'connecting' || !tabs.has(tab.id)) return;
+  if(!tab.attempts) tab.host=hosts.find(h=>h.id===tab.host.id)||tab.host;
   tab.status = 'connecting';
   tab.paths.reset();
   tab.message = '';
@@ -1793,6 +2035,7 @@ async function connect(tab, enterPassword = false) {
     renderContext();
     const credentialFor = async (host, isJump = false) => {
       const useSaved = host.auth === 'password' && !enterPassword && !tab.promptForPassword && await api.hosts.hasPassword(host.id);
+      if(automatic&&!automaticCredential(host.auth,useSaved)) throw new Error('自动重连需要手动输入凭据，请点击连接继续。');
       const credentials = host.auth === 'agent' || useSaved ? { secret: '' } : await enterCredential(host, isJump);
       return credentials && { ...credentials, useSaved };
     };
@@ -1817,13 +2060,13 @@ async function connect(tab, enterPassword = false) {
   }
 }
 
-async function openHost(host, { force = false, draftTab } = {}) {
+async function openHost(host, { force = false, draftTab, connectNow = true } = {}) {
   if (draftTab && (active !== draftTab || draftTab.kind !== 'new')) return;
-  if (host.auth === 'key' && !host.keyPath) { await editHost(host, draftTab); return; }
+  if (connectNow && host.auth === 'key' && !host.keyPath) { if(host.identityId){await manageIdentities();}else await editHost(host,draftTab);return; }
   const sessions = [...tabs.values()].filter((tab) => tab.kind === 'shell' && tab.host.id === host.id);
   const existing = sessions.filter((tab) => ['ready', 'trust', 'connecting'].includes(tab.status)
-    && ['address', 'port', 'username', 'auth', 'keyPath', 'jumpHostId'].every((field) => tab.host[field] === host[field])
-    && (!host.jumpHostId || ['address', 'port', 'username', 'auth', 'keyPath', 'jumpHostId'].every((field) => tab.jumpHost?.[field] === hosts.find((item) => item.id === host.jumpHostId)?.[field]))).sort((a, b) => b.used - a.used)[0];
+    && ['address', 'port', 'username', 'auth', 'keyPath', 'jumpHostId', 'identityId', 'identityVersion'].every((field) => tab.host[field] === host[field])
+    && (!host.jumpHostId || ['address', 'port', 'username', 'auth', 'keyPath', 'jumpHostId', 'identityId', 'identityVersion'].every((field) => tab.jumpHost?.[field] === hosts.find((item) => item.id === host.jumpHostId)?.[field]))).sort((a, b) => b.used - a.used)[0];
   if (existing && !force && !draftTab) { selectTab(existing); return; }
   const tab = draftTab || { id: sessionId() };
   Object.assign(tab, { kind: 'shell', host, status: 'idle', number: Math.max(0, ...sessions.map((entry) => entry.number)) + 1,
@@ -1831,12 +2074,13 @@ async function openHost(host, { force = false, draftTab } = {}) {
   attachTerminal(tab);
   tabs.set(tab.id, tab);
   selectTab(tab);
-  await connect(tab);
+  if(connectNow) await connect(tab);else updateSession(tab,'closed','布局已恢复。点击连接建立新的 SSH 会话；不会恢复原进程。');
 }
 
 async function closeTab(tab) {
   if (tab.closing || !tabs.has(tab.id)) return;
   tab.closing = true;
+  clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);
   try {
     if (tab.kind === 'shell') {
       const ongoing = [...jobs.values()].filter((job) => job.sessionId === tab.id && ['queued', 'running', 'committing'].includes(job.status));
@@ -1846,14 +2090,19 @@ async function closeTab(tab) {
     } else if (tab.kind === 'command') {
       await api.commands.close(tab.id);
     }
+    const partner=splitLayout?.panes.includes(tab.id) ? tabs.get(splitLayout.panes.find(id=>id!==tab.id)) : undefined;
+    if(partner) splitLayout=undefined;
+    recordingSessions.delete(tab.id);
     tabs.delete(tab.id);
     tab.tabRow.remove();
     refreshTransferActions(tab.id);
     for (const acknowledge of tab.pendingAcks?.values() || []) acknowledge();
+    tab.resizeObserver?.disconnect();
     tab.terminal?.dispose();
     tab.view?.remove();
-    if (active === tab) selectTab(tabs.get(tab.sessionId) || [...tabs.values()].sort((a, b) => b.used - a.used)[0]);
+    if (active === tab) selectTab(partner || tabs.get(tab.sessionId) || [...tabs.values()].sort((a, b) => b.used - a.used)[0]);
     else {
+      renderSplitLayout();
       renderTabs();
       if (active?.sessionId === tab.id || active?.id === tab.sessionId) {
         renderContext();
@@ -1865,9 +2114,11 @@ async function closeTab(tab) {
 
 function updateSession(tab, next, detail = '') {
   tab.status = next;
+  if(next==='closed')recordingSessions.delete(tab.id);
   renderForwardPanel?.();
   tab.message = detail;
   if (next === 'ready') {
+    clearTimeout(tab.stableTimer);tab.stableTimer=setTimeout(()=>{tab.retryCount=0;},30000);
     recent.set(tab.host.id, Date.now());
     void api.hosts.touch(tab.host.id).catch(() => {});
     if (active === tab) status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
@@ -1875,6 +2126,7 @@ function updateSession(tab, next, detail = '') {
     if (active?.kind === 'new') renderQuickConnect(active);
     if (filesOpen && origin() === tab) ensureFiles(tab);
   } else if (next === 'closed') {
+    clearTimeout(tab.stableTimer);
     tab.paths.reset();
     tab.terminal.write(`\r\n\x1b[90m${detail.replace(/[\x00-\x1f\x7f]/g, ' ')}\x1b[0m\r\n`);
     if (active === tab) status(`${tab.host.name} · ${detail}`);
@@ -2225,6 +2477,7 @@ function renderFiles() {
     return entry?.kind === 'file' && !other ? pathOf(tab, entry.name) : undefined;
   };
   const upload = button('↑ 上传', () => prepareTransfer(tab, 'up'));
+  const uploadFolder=button('↑ 上传目录',()=>prepareTransfer(tab,'up',undefined,{folder:true}),'outlined');
   const download = button('↓ 下载', () => prepareTransfer(tab, 'down', selection().map(({ name }) => name)));
   const follow = button('跟踪日志', () => configureCommand(tab, 'follow', logPath()));
   const tail = button('查看末尾', () => configureCommand(tab, 'tail', logPath()));
@@ -2232,6 +2485,11 @@ function renderFiles() {
   mkdir.prepend(chromeIcon('folder'));
   const touch = button('新建文件', () => createRemoteItem(tab, false), 'outlined');
   touch.prepend(chromeIcon('file'));
+  const operationResults=button('操作结果',()=>showMutationResults(tab),'outlined');operationResults.hidden=!files.lastMutation;
+  const edit=button('外部编辑',()=>externalEdit(tab,logPath()),'outlined');
+  const editTasks=button('编辑任务',()=>manageEditorTasks(),'outlined');
+  const rename = button('重命名', () => mutateRemote(tab, false, selection()), 'outlined');
+  const remove = button('删除', () => mutateRemote(tab, true, selection()), 'outlined danger');
   const filter = input(files.query || '', 'search');
   filter.placeholder = '筛选当前目录';
   filter.setAttribute('aria-label', '筛选当前目录文件名');
@@ -2258,6 +2516,8 @@ function renderFiles() {
   const updateSelection = () => {
     const count = selection().length;
     download.disabled = count === 0;
+    edit.disabled=!logPath();
+    rename.disabled=count!==1;remove.disabled=count===0;
     follow.disabled = tail.disabled = !logPath();
     selectedCount.textContent = count ? `已选 ${count} 项` : '';
     selectedCount.hidden = count === 0;
@@ -2269,8 +2529,8 @@ function renderFiles() {
     all.indeterminate = checked > 0 && checked < selectableEntries.length;
   };
   updateSelection();
-  panel.append(node('div', 'file-toolbar', node('div', 'file-tools', upload, download, follow, tail),
-    node('div', 'file-tools file-create', mkdir, touch, selectedCount, clear)));
+  panel.append(node('div', 'file-toolbar', node('div', 'file-tools', upload, ...(api.files.directoryUploads?[uploadFolder]:[]), download, follow, tail),
+    node('div', 'file-tools file-create', mkdir, touch, ...(api.files.mutations?[rename,remove]:[]), ...(api.editors?[edit,editTasks]:[]),operationResults, selectedCount, clear)));
   panel.append(node('div', 'file-filters', filter, selectControl(sorting)),
     node('div', 'file-options', node('label', 'checkbox-row', all, '全选可见'), node('label', 'checkbox-row', hidden, '显示隐藏项')));
   panel.append(node('div', 'file-columns muted', node('span', '', '名称'), node('span', '', '大小 / 类型')));
@@ -2336,6 +2596,52 @@ function fileEntry(name, kind, action) {
   return entry;
 }
 
+async function externalEdit(tab,path) {
+  if(!path) return;
+  if(await confirm('外部编辑',`${tab.host.name} · ${path}\n会创建本机临时副本，并用本机文本编辑器打开。保存后回到编辑任务手动上传；远端变化时拒绝覆盖。`,'打开编辑器')) {
+    await api.editors.open({id:tab.id,path});await manageEditorTasks();
+  }
+}
+async function manageEditorTasks() {
+  while(!vaultStatus.locked) {
+    const editors=await api.editors.list();let choice;
+    const rows=editors.map(edit=>node('section','forward-rule',node('strong','',`${edit.host} · ${edit.remote}`),node('small','muted',edit.endpoint),node('small','muted',`本机副本：${edit.local}`),node('div','forward-actions',button('上传已保存副本',()=>{choice={upload:edit};dialog.close();},'outlined'),button('清理副本',()=>{choice={close:edit};dialog.close();},'outlined danger'))));
+    await prompt('外部编辑任务',rows.length?rows:[node('p','muted','从文件侧栏选择普通文本文件后打开外部编辑器。')],'关闭',()=>true);
+    if(!choice) break;
+    if(choice.close) {if(await confirm('清理本机副本',`删除 ${choice.close.local}？远端文件保留，未上传的本机更改会丢失。`,'清理')) await api.editors.close(choice.close.id);}
+    else {
+      const prepared=await api.editors.prepare(choice.upload.id);
+      try {if(await confirm('上传编辑结果',`${choice.upload.host} · ${choice.upload.endpoint}\n覆盖 ${choice.upload.remote}？将使用本次准备时保存的本机快照，后续编辑不会混入此次上传。`,'上传并覆盖')) await api.files.enqueue({ticket:prepared.ticket,policy:'replace'});}
+      finally {await api.files.discard(prepared.ticket);}
+    }
+  }
+}
+
+async function showMutationResults(tab){const result=tab.files.lastMutation||[];await prompt('远端操作结果',[node('p','',`${tab.host.name} · ${result.filter(r=>r.status==='done').length}/${result.length} 项完成`),node('pre','operation-results',result.map(r=>`${r.status==='done'?'完成':'失败'} ${r.path}${r.message?' · '+r.message:''}`).join('\n'))],'关闭',()=>true);}
+
+async function mutateRemote(tab, deleting, entries) {
+  const attempt=tab.attempts;
+  if([...jobs.values()].some(j=>j.sessionId===tab.id&&['queued','running','committing'].includes(j.status))) throw new Error('请先完成或取消此会话的传输，再修改远端文件。');
+  const paths=entries.map(entry=>pathOf(tab,entry.name));
+  const preview=await api.files.mutationPreview({id:tab.id,paths});
+  if(!readySession(tab,attempt)) return;
+  const name=input(entries[0]?.name);
+  const check=input('','checkbox');check.required=true;
+  const fields=[node('p','',`${tab.host.name} · ${endpoint(tab.host)}`),node('pre','operation-results',preview.roots.join('\n')),
+    ...(deleting?[node('p','muted',`包含 ${preview.count} 个对象；目录会递归删除，不跟随符号链接。操作不能撤销，失败时可能只完成一部分。`),node('label','checkbox-row',check,'确认永久删除以上范围')]:[field('新名称',name),node('p','muted','在同一目录中重命名，不覆盖已有项目。')])];
+  const result=await prompt(deleting?'删除远端项目':'重命名远端项目',fields,deleting?'永久删除':'重命名',async()=>{
+    if(!readySession(tab,attempt)) throw new Error('SSH 会话已变化，请重新选择。');
+    if(deleting) return api.files.remove({id:tab.id,roots:preview.roots,expected:preview.nodes});
+    if(!name.value||/[\/\x00-\x1f]/.test(name.value)||['.','..'].includes(name.value)) throw new Error('请输入有效的新名称。');
+    await api.files.rename({id:tab.id,source:preview.roots[0],destination:pathOf(tab,name.value),expected:preview.nodes.find(n=>n.path===preview.roots[0])});
+    return [{path:paths[0],status:'done',message:`已重命名为 ${name.value}`}];
+  });
+  if(result) {
+    tab.files.lastMutation=result;tab.files.selected.clear();await loadFiles(tab,tab.files.directory);
+    await showMutationResults(tab);
+  }
+}
+
 async function createRemoteItem(tab, folder) {
   const directory = tab.files.directory;
   const attempt = tab.attempts;
@@ -2351,13 +2657,13 @@ async function createRemoteItem(tab, folder) {
   if (created && readySession(tab, attempt) && tab.files.directory === directory) await loadFiles(tab, directory);
 }
 
-async function prepareTransfer(tab, direction, names, { directory = tab.files.directory, dropTicket } = {}) {
+async function prepareTransfer(tab, direction, names, { directory = tab.files.directory, dropTicket, folder } = {}) {
   const attempt = tab.attempts;
   const preparing = direction === 'down' ? '正在准备下载，请选择本机保存位置…' : '正在准备上传…';
   if (origin() === tab) status(preparing);
   let prepared;
   try {
-    prepared = await api.files.prepare({ id: tab.id, direction, directory, names, dropTicket });
+    prepared = await api.files.prepare({ id: tab.id, direction, directory, names, dropTicket, folder });
   } finally {
     if ($('status').textContent === preparing && origin() === tab) status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
   }
@@ -2537,6 +2843,7 @@ function renderJobActions(job, row) {
 
 api.onEvent((event) => {
   if (event.type === 'vault') { applyVaultState(event.state); return; }
+  if(event.type==='log'){recordingSessions.delete(event.id);if(!vaultStatus.locked){status(event.message||'日志已停止');renderContext();}return;}
   if (event.type === 'forward') {
     if (vaultStatus.locked) return;
     forwardVersions.set(event.id, ++forwardVersion);
@@ -2580,8 +2887,11 @@ api.onEvent((event) => {
     tab.message = event.message;
     if (tab === active) status(`${tab.host.name} · ${event.message}`);
   } else if (tab) {
-    if (event.retryWithPassword) tab.promptForPassword = true;
+    if (event.retryWithPassword && !event.retryable) tab.promptForPassword = true;
     updateSession(tab, event.status, event.message);
+    if(event.status==='closed'&&event.retryable&&tab.host?.autoReconnect&&!tab.reconnectCancelled&&!vaultStatus.locked){
+      const count=(tab.retryCount||0)+1;const delay=retryDelay(count);if(delay){tab.retryCount=count;tab.message+=` · ${delay/1000} 秒后尝试第 ${count}/3 次重连（将创建新会话）`;tab.reconnectTimer=setTimeout(()=>{tab.reconnectTimer=undefined;if(tabs.has(tab.id)&&tab.status==='closed'&&!vaultStatus.locked&&!dialog.open&&!tab.reconnectCancelled)void connect(tab,false,true);else if(active===tab)renderContext();},delay);if(active===tab)renderContext();}
+    }
   }
 });
 
@@ -2632,7 +2942,7 @@ $('remove-group').addEventListener('click', async () => {
   try {
     if (!await confirm('移除分组', `「${group}」内的主机会归入未分组。`, '移除分组')) return;
     hosts = await api.hosts.removeGroup(group);
-    renderHosts();
+    await refreshHosts();
   } catch (error) { status(message(error)); }
 });
 for (const control of pageButtons) {
@@ -2826,9 +3136,22 @@ window.addEventListener('keydown', (event) => {
   if (event.key.toLowerCase() === 'f' && active?.terminal) { event.preventDefault(); $('terminal-find').hidden = false; $('terminal-find').querySelector('input').focus(); }
   if (active?.terminal && ['+', '=', '-', '0'].includes(event.key)) {
     event.preventDefault();
-    active.terminal.options.fontSize = event.key === '0' ? terminalFontSize : Math.min(28, Math.max(9, active.terminal.options.fontSize + (event.key === '-' ? -1 : 1)));
+    active.terminal.options.fontSize = event.key === '0' ? uiPreferences.fontSize : Math.min(32, Math.max(9, active.terminal.options.fontSize + (event.key === '-' ? -1 : 1)));
     active.fit.fit();
   }
 });
 api.vault.state().then((state) => { applyVaultState(state); if (!state.locked) return refreshHosts(); }).catch((error) => status(message(error)));
 selectTab();
+
+if(api.groups) $('workspace-nav').append(sidebarAction('分组管理','group',()=>manageGroups()));
+if(api.identities) $('workspace-nav').append(sidebarAction('共享身份','key',()=>manageIdentities()));
+
+if(api.snippets) $('workspace-nav').append(sidebarAction('命令库','terminal',()=>manageSnippets()));
+
+if(api.layouts) $('workspace-nav').append(sidebarAction('布局模板','new-tab',()=>manageLayouts()));
+
+if(api.preferences){$('workspace-nav').append(sidebarAction('偏好设置','settings',()=>editPreferences()));matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{if(uiPreferences.theme==='system')applyPreferences();});}
+if(api.logs) $('workspace-nav').append(sidebarAction('会话日志','file',()=>manageLogs()));
+
+if(api.trust) $('workspace-nav').append(sidebarAction('Known Hosts','lock',()=>manageTrust()));
+if(api.hosts.csvPreview) $('import-hosts').after(button('导入 CSV…',()=>importHosts(true),'outlined'));

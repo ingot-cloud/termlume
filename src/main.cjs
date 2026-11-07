@@ -38,6 +38,7 @@ function normalizeHost(input, id, { portable = false, allowMissingKey = false } 
   };
   if (input.localForwards !== undefined) {
     if (!Array.isArray(input.localForwards) || input.localForwards.length > 32) throw new Error('本地转发规则无效。');
+    if(input.localForwards.some(r=>r.kind&&r.kind!=='local')) throw new Error('远程/动态转发数据需使用 macOS Tauri 应用。');
     host.localForwards = input.localForwards.map((rule) => {
       const localPort = Number(rule.localPort), remotePort = Number(rule.remotePort);
       const remoteAddress = checkedText(rule.remoteAddress, '目标地址', 255).replace(/^\[(.*)\]$/, '$1');
@@ -49,6 +50,9 @@ function normalizeHost(input, id, { portable = false, allowMissingKey = false } 
         new Set(host.localForwards.map((r) => r.localPort)).size !== host.localForwards.length) throw new Error('转发规则标识和本地端口不能重复。');
     if (!host.localForwards.length) delete host.localForwards;
   }
+  if(input.startupCommand) host.startupCommand=checkedText(input.startupCommand,'启动命令',16384);
+  if(input.startupEnabled) host.startupEnabled=true;
+  if (input.identityId) throw new Error('共享身份需使用 macOS Tauri 应用。');
   if (input.jumpHostId) host.jumpHostId = checkId(input.jumpHostId);
   if (host.logPath) commandFor({ action: 'tail', argument: host.logPath });
   if (host.service) commandFor({ action: 'journal', argument: host.service });
@@ -252,6 +256,7 @@ const dependencies = path.join(__dirname, '..', 'node_modules', '@xterm');
 const resources = new Map([
   ['/index.html', [path.join(rendererDir, 'index.html'), 'text/html']],
   ['/style.css', [path.join(rendererDir, 'style.css'), 'text/css']],
+  ['/workspace-state.js',[path.join(rendererDir,'workspace-state.js'),'text/javascript']],
   ['/renderer.js', [path.join(rendererDir, 'renderer.js'), 'text/javascript']],
   ['/dropdown.js', [path.join(rendererDir, 'dropdown.js'), 'text/javascript']],
   ['/terminal-paths.js', [path.join(rendererDir, 'terminal-paths.js'), 'text/javascript']],
@@ -379,6 +384,10 @@ function lockVault() {
 function portableRows(rows) {
   if (!Array.isArray(rows) || rows.length > 5000) throw new Error('保险库主机列表无效。');
   const ids = new Set();
+  const modernFields = ['groupId', 'identityId', 'inheritPort', 'inheritIdentity', 'inheritTheme', 'terminalTheme', 'startupCommand', 'startupEnabled', 'autoReconnect', 'keepaliveInterval', 'connectTimeout'];
+  if (rows.some((row) => row?.asset || modernFields.some((key) => Object.hasOwn(row || {}, key)))) {
+    throw new Error('此保险库包含新版共享资料或连接设置，请使用 macOS Tauri 应用。');
+  }
   return rows.map((row) => {
     const id = checkId(row?.id);
     if (ids.has(id)) throw new Error('保险库包含重复的主机标识。');

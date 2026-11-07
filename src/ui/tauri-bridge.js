@@ -16,8 +16,16 @@
       }
     },
     vault: { ...bind({ state: 'vault:state', recoveryCode: 'vault:recovery-code', copyRecovery: 'vault:copy-recovery', enable: 'vault:enable', lock: 'vault:lock', unlock: 'vault:unlock', touchIdAvailable: 'vault:touch-id-available', setTouchId: 'vault:set-touch-id', setStartupUnlockRequired: 'vault:set-startup-unlock', setAutoLockMinutes: 'vault:set-auto-lock', export: 'vault:export', restoreFile: 'vault:restore-file', restoreGit: 'vault:restore-git', sync: 'vault:sync', migrateGit: 'vault:migrate-git' }), activity: notify('vault:activity') },
+    trust:bind({list:'trust:list',forget:'trust:forget',importPreview:'trust:import-preview',import:'trust:import'}),
+    preferences:bind({get:'preferences:get',save:'preferences:save'}),
+    logs:bind({list:'logs:list',start:'logs:start',stop:'logs:stop',read:'logs:read',remove:'logs:delete',export:'logs:export'}),
+    history:bind({list:'history:list',clear:'history:clear'}),
+    layouts:bind({list:'layouts:list',save:'layouts:save',remove:'layouts:delete'}),
+    snippets:bind({list:'snippets:list',save:'snippets:save',remove:'snippets:delete',run:'snippets:run'}),
+    groups: bind({list:'groups:list',save:'groups:save',remove:'groups:delete'}),
+    identities: bind({ list:'identities:list', save:'identities:save', remove:'identities:delete' }),
     keys: bind({ scan: 'keys:scan', agent: 'keys:agent', directory: 'keys:directory', generate: 'keys:generate', copy: 'keys:copy' }),
-    hosts: bind({ list: 'hosts:list', recent: 'hosts:recent', touch: 'hosts:touch', save: 'hosts:save', remove: 'hosts:delete', forget: 'hosts:forget', pickKey: 'hosts:key-picker', hasPassword: 'hosts:has-password', revealPassword: 'hosts:reveal-password', clearPassword: 'hosts:clear-password', removeGroup: 'hosts:remove-group', importPreview: 'hosts:import-preview', import: 'hosts:import' }),
+    hosts: bind({ list: 'hosts:list', recent: 'hosts:recent', touch: 'hosts:touch', save: 'hosts:save', remove: 'hosts:delete', forget: 'hosts:forget', pickKey: 'hosts:key-picker', hasPassword: 'hosts:has-password', revealPassword: 'hosts:reveal-password', clearPassword: 'hosts:clear-password', removeGroup: 'hosts:remove-group', csvPreview:'hosts:csv-preview', importPreview: 'hosts:import-preview', import: 'hosts:import' }),
     ssh: {
       jumpHosts: true,
       connect(value) {
@@ -38,10 +46,12 @@
       },
       resize: notify('ssh:resize'), ack: notify('ssh:ack'), directory: (id) => request('ssh:directory', id)
     },
+    editors:bind({list:'editors:list',open:'editors:open',prepare:'editors:prepare',close:'editors:close'}),
     forwards: bind({ list: 'forwards:list', save: 'forwards:save', remove: 'forwards:delete', start: 'forwards:start', stop: 'forwards:stop' }),
     commands: bind({ preview: 'commands:preview', start: 'commands:start', stop: 'commands:stop', close: 'commands:close' }),
     files: {
-      ...bind({ list: 'files:list', inspect: 'files:inspect', mkdir: 'files:mkdir', createFile: 'files:create-file', history: 'files:history', removeHistory: 'files:remove-history', prepare: 'files:prepare', enqueue: 'files:enqueue', discard: 'files:discard', cancel: 'files:cancel', retry: 'files:retry' }),
+      mutations: true, directoryUploads:true,
+      ...bind({ mutationPreview:'files:mutation-preview',rename:'files:rename',remove:'files:remove', list: 'files:list', inspect: 'files:inspect', mkdir: 'files:mkdir', createFile: 'files:create-file', history: 'files:history', removeHistory: 'files:remove-history', prepare: 'files:prepare', enqueue: 'files:enqueue', discard: 'files:discard', cancel: 'files:cancel', retry: 'files:retry' }),
       directoryDownloads: /Mac|Linux/.test(navigator.platform)
     },
     onEvent(listener) {
