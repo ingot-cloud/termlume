@@ -145,8 +145,8 @@ fn password_key(password: &str, salt: &[u8]) -> Result<Key, String> {
 }
 
 pub fn create(password: &str, recovery: &str) -> Result<(Key, Header), String> {
-    if password.encode_utf16().count() < 12 {
-        return Err("主密码至少需要 12 个字符。".into());
+    if password.encode_utf16().count() < 8 {
+        return Err("主密码至少需要 8 个字符。".into());
     }
     let id = Uuid::new_v4();
     let salt = rand::random::<[u8; 16]>();

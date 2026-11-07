@@ -83,7 +83,7 @@ function openGitEnvelope(envelope, key) {
 }
 
 async function createVault(password, recovery) {
-  if (typeof password !== 'string' || password.length < 12) throw new Error('主密码至少需要 12 个字符。');
+  if (typeof password !== 'string' || password.length < 8) throw new Error('主密码至少需要 8 个字符。');
   await sodium.ready;
   const id = randomUUID();
   const salt = randomBytes(16);

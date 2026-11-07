@@ -28,7 +28,7 @@
     const rect = wrapper.getBoundingClientRect();
     const viewportWidth = document.documentElement.clientWidth;
     const viewportHeight = document.documentElement.clientHeight;
-    const width = Math.min(Math.max(144, rect.width), viewportWidth - 16);
+    const width = Math.min(Math.max(208, rect.width), viewportWidth - 16);
     panel.style.width = `${width}px`;
     const below = viewportHeight - rect.bottom - 12;
     const above = rect.top - 12;
@@ -160,7 +160,7 @@
     trigger.type = 'button';
     const icon = element('span', 'dropdown-icon');
     icon.setAttribute('aria-hidden', 'true');
-    const value = element('span', 'dropdown-text');
+    const value = element('span', 'dropdown-text text-ellipsis');
     const caret = element('span', 'dropdown-caret');
     caret.setAttribute('aria-hidden', 'true');
     trigger.append(icon, value, caret);
@@ -175,6 +175,7 @@
       icon.textContent = selected?.dataset.icon || '';
       icon.hidden = !icon.textContent;
       value.textContent = selected?.textContent || '请选择';
+      value.title = value.textContent;
       trigger.disabled = select.disabled;
       trigger.setAttribute('aria-required', String(select.required));
       if (select.validity.valid) {

@@ -15,7 +15,7 @@
         if (!(await appWindow.isFullscreen())) await appWindow.toggleMaximize();
       }
     },
-    vault: { ...bind({ state: 'vault:state', recoveryCode: 'vault:recovery-code', copyRecovery: 'vault:copy-recovery', enable: 'vault:enable', lock: 'vault:lock', unlock: 'vault:unlock', export: 'vault:export', restoreFile: 'vault:restore-file', restoreGit: 'vault:restore-git', sync: 'vault:sync', migrateGit: 'vault:migrate-git' }), activity: notify('vault:activity') },
+    vault: { ...bind({ state: 'vault:state', recoveryCode: 'vault:recovery-code', copyRecovery: 'vault:copy-recovery', enable: 'vault:enable', lock: 'vault:lock', unlock: 'vault:unlock', touchIdAvailable: 'vault:touch-id-available', setTouchId: 'vault:set-touch-id', setStartupUnlockRequired: 'vault:set-startup-unlock', setAutoLockMinutes: 'vault:set-auto-lock', export: 'vault:export', restoreFile: 'vault:restore-file', restoreGit: 'vault:restore-git', sync: 'vault:sync', migrateGit: 'vault:migrate-git' }), activity: notify('vault:activity') },
     keys: bind({ scan: 'keys:scan', agent: 'keys:agent', directory: 'keys:directory', generate: 'keys:generate', copy: 'keys:copy' }),
     hosts: bind({ list: 'hosts:list', recent: 'hosts:recent', touch: 'hosts:touch', save: 'hosts:save', remove: 'hosts:delete', forget: 'hosts:forget', pickKey: 'hosts:key-picker', hasPassword: 'hosts:has-password', revealPassword: 'hosts:reveal-password', clearPassword: 'hosts:clear-password', removeGroup: 'hosts:remove-group', importPreview: 'hosts:import-preview', import: 'hosts:import' }),
     ssh: {

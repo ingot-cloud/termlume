@@ -26,14 +26,20 @@ let hosts = [];
 let hostsLoaded = false;
 let currentGroup = '';
 let selectedGroup = '';
+let selectedHostId = '';
+let hostMenu;
 let active;
 let filesOpen = false;
 let vaultStatus = {};
+let touchIdAvailable = false;
 let draggedFileCount = 0;
 let transferDirection = '';
 let loadingHistory;
 let historyReady = false;
 let editingHistory = false;
+let hostSearchAction;
+let hostSearchMatch;
+const sessionLabels = { idle: '等待连接', connecting: '连接中', trust: '等待核对指纹', ready: '已连接', closed: '已断开', running: '运行中', done: '已完成', stopped: '已停止', failed: '失败' };
 
 function node(tag, className, ...children) {
   const element = document.createElement(tag);
@@ -88,6 +94,8 @@ function chromeIcon(kind) {
     lock: 'M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3',
     file: 'M6 3h8l4 4v14H6zM14 3v5h4m-9 5h6m-6 4h6',
     folder: 'M3 6h7l2 2h9v11H3z',
+    group: 'M3 5h8v8H3zm10 6h8v8h-8zM15 5h6v3m-12 11H3v-3',
+    server: 'M3 4h18v7H3zm0 9h18v7H3zM7 7.5h.01M7 16.5h.01m4-9h6m-6 9h6',
     'new-tab': 'M4 4h16v16H4zM12 8v8m-4-4h8',
     terminal: 'M3 5h18v14H3zM7 9l3 3-3 3m6 0h4',
     sync: 'M20 10a8 8 0 0 0-14-4L4 8m0-4v4h4m-4 6a8 8 0 0 0 14 4l2-2m0 4v-4h-4'
@@ -96,7 +104,19 @@ function chromeIcon(kind) {
   return svg;
 }
 function settingsIcon(kind) { return node('span', 'settings-icon', chromeIcon(kind)); }
-function endpoint(host) { return `${host.username}@${host.address}${host.port === 22 ? '' : `:${host.port}`}`; }
+function endpoint(host) {
+  const address = host.address.includes(':') && !host.address.startsWith('[') ? `[${host.address}]` : host.address;
+  return `${host.username}@${address}${host.port === 22 ? '' : `:${host.port}`}`;
+}
+function hostTarget(text) {
+  const match = /^(?:ssh\s+)?(?:-p\s+(\d+)\s+)?([^@:\s]+)@(\[[\da-f:.%\w-]+\]|[^@\s:]+)(?::(\d+))?(?:\s+-p\s+(\d+))?$/i.exec(text.trim());
+  if (!match || [match[1], match[4], match[5]].filter(Boolean).length > 1) return undefined;
+  return { username: match[2], address: match[3], port: match[1] || match[4] || match[5] };
+}
+function matchesTarget(host, target) {
+  return host.username === target.username && host.port === Number(target.port || 22) &&
+    host.address.toLowerCase() === target.address.replace(/^\[(.*)\]$/, '$1').toLowerCase();
+}
 function origin(tab = active) {
   return tab?.kind === 'command' ? tabs.get(tab.sessionId) : tab?.kind === 'shell' ? tab : undefined;
 }
@@ -104,6 +124,7 @@ function address(path) { return path === '/' ? '' : path.replace(/\/$/, ''); }
 function pathOf(tab, name) { return `${address(tab.files.directory)}/${name}`; }
 
 function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
+  closeHostMenu();
   if (vaultStatus.locked) return Promise.reject(new Error('请先解锁保险库。'));
   if (dialog.open) return Promise.reject(new Error('请先完成当前弹窗。'));
   return new Promise((resolve) => {
@@ -123,7 +144,9 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
     const form = options.drawer
       ? node('form', '', node('div', 'drawer-fields', ...fields, error), controls)
       : node('form', '', ...fields, error, controls);
-    dialog.replaceChildren(heading, form);
+    const header = options.drawer ? node('header', 'drawer-header', heading,
+      button('×', () => { if (canClose()) dialog.close(); }, '', '关闭主机表单')) : heading;
+    dialog.replaceChildren(header, form);
     dialog.classList.toggle('host-drawer', Boolean(options.drawer));
     const cancelEvent = (event) => { if (!canClose()) event.preventDefault(); };
     dialog.addEventListener('cancel', cancelEvent);
@@ -141,6 +164,7 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
         dialog.close();
       } catch (failure) {
         error.textContent = message(failure);
+        error.scrollIntoView({ block: 'nearest' });
         form.removeAttribute('aria-busy');
         enabled.forEach((control) => { control.disabled = false; });
         busy = false;
@@ -165,41 +189,59 @@ async function refreshHosts() {
   if (active?.kind === 'new') renderQuickConnect(active);
 }
 
+function updateTouchIdUnlock() {
+  $('unlock-touch-id').hidden = !vaultStatus.touchIdEnabled || !touchIdAvailable;
+}
+
+async function refreshTouchIdAvailability() {
+  if (!vaultStatus.enabled || !api.vault.touchIdAvailable) return;
+  const available = await api.vault.touchIdAvailable().catch(() => false);
+  if (available === touchIdAvailable) return;
+  touchIdAvailable = available;
+  updateTouchIdUnlock();
+  if (!vaultStatus.locked && workspace.dataset.view === 'vault') renderVaultPage();
+}
+
 function applyVaultState(state) {
+  const refreshTouchId = state.enabled !== vaultStatus.enabled || state.locked !== vaultStatus.locked;
   vaultStatus = state;
+  updateTouchIdUnlock();
   const transfersSupported = state.fileTransfers !== false;
   document.querySelector('[data-page="transfers"]').hidden = $('queue-button').hidden = !transfersSupported;
   document.body.classList.toggle('vault-locked', state.locked);
   $('vault-lock').hidden = !state.locked;
+  $('library-button').disabled = Boolean(state.locked);
   if (state.locked) {
     historyReady = false;
     $('terminal-drop').hidden = true;
     closeDropdown();
+    closeHostMenu();
     for (const pane of [$('key-dialog'), $('session-switcher'), dialog]) if (pane.open) pane.close();
     $('keys-page').replaceChildren();
     hosts = [];
     hostsLoaded = false;
     renderHosts();
     $('quick-connect-results').replaceChildren();
-    $('unlock-error').textContent = '';
+    $('unlock-error').textContent = state.startupUnlockError || '';
     $('unlock-secret').focus();
   } else if (transfersSupported && !historyReady) void loadTransferHistory();
   if (workspace.dataset.view === 'vault') renderVaultPage();
+  if (refreshTouchId) void refreshTouchIdAvailability();
 }
 
 async function enableVault() {
   const password = input('', 'password');
   const repeated = input('', 'password');
   password.required = repeated.required = true;
-  password.minLength = 12;
+  password.minLength = 8;
   password.autocomplete = repeated.autocomplete = 'new-password';
   try {
     while (await prompt('设置主密码', [
       node('p', 'step-label', '第 1 步，共 2 步'),
-      node('p', 'muted', '主密码用于解锁保险库，至少需要 12 个字符。'),
+      node('p', 'muted', '主密码用于解锁保险库，至少需要 8 个字符。'),
       field('主密码', password), field('确认主密码', repeated)
     ], '继续', () => {
-      if (password.value.length < 12) throw new Error('主密码至少需要 12 个字符。');
+      if (password.value.length < 8) throw new Error('主密码至少需要 8 个字符。');
       if (password.value !== repeated.value) throw new Error('两次输入的主密码不同。');
       return true;
     })) {
@@ -463,11 +505,13 @@ async function finishGitOperation(result, request, submit, label, success) {
 }
 
 function settingsHeading(title, subtitle, actions) {
-  return node('header', 'settings-heading', node('div', '', node('h1', '', title), node('p', 'muted', subtitle)), ...(actions ? [actions] : []));
+  return node('header', 'page-toolbar settings-heading', node('div', '', node('h1', '', title), node('p', 'muted', subtitle)), ...(actions ? [actions] : []));
 }
 
 function renderVaultPage() {
-  const { enabled, remote, branch, fileTransfers, gitMigration, lastSynced, locked } = vaultStatus;
+  const { enabled, remote, branch, fileTransfers, gitMigration, lastSynced, locked, touchIdEnabled, startupUnlockRequired } = vaultStatus;
+  const autoLockMinutes = vaultStatus.autoLockMinutes === undefined ? 15 : vaultStatus.autoLockMinutes;
+  const autoLockSummary = autoLockMinutes === null ? '闲置自动锁定已关闭。' : `闲置 ${autoLockMinutes} 分钟后自动锁定。`;
   const page = $('vault-page');
   if (locked) { page.replaceChildren(); return; }
   if (typeof enabled !== 'boolean') {
@@ -477,8 +521,97 @@ function renderVaultPage() {
   const hero = node('section', 'vault-hero', settingsIcon('lock'), node('div', 'vault-summary',
     node('span', enabled ? 'vault-badge online' : 'vault-badge muted', enabled ? '已启用 · 已解锁' : '未启用'),
     node('h2', '', enabled ? '主机资料已加密' : '为主机资料启用加密'),
-    node('p', 'muted', enabled ? '闲置 15 分钟后自动锁定。' : '设置主密码后，可用它解锁工作台，也可以导出加密备份。')),
+    node('p', 'muted', enabled ? autoLockSummary : '设置主密码后，可用它解锁工作台，也可以导出加密备份。')),
     enabled ? button('锁定保险库', async () => applyVaultState(await api.vault.lock()), 'outlined') : button('启用保险库', enableVault, 'primary'));
+  if (enabled && (touchIdEnabled || touchIdAvailable)) {
+    const action = button(touchIdEnabled ? '关闭触控 ID' : '启用触控 ID…', async () => {
+      action.disabled = true;
+      try {
+        applyVaultState(await api.vault.setTouchId(!touchIdEnabled));
+        status(touchIdEnabled ? '已关闭本机的触控 ID 解锁。' : '已启用本机的触控 ID 解锁。');
+      } finally { action.disabled = false; }
+    }, 'outlined');
+    hero.append(action);
+  }
+  const accessSettings = node('section', 'vault-card vault-access', node('h2', '', '启动与解锁'));
+  if (enabled && vaultStatus.startupUnlockSupported && api.vault.setStartupUnlockRequired) {
+    const required = input('', 'checkbox');
+    required.id = 'vault-startup-unlock';
+    required.checked = startupUnlockRequired !== false;
+    const error = node('p', 'dialog-error danger');
+    error.setAttribute('role', 'alert');
+    const setting = node('div', 'vault-startup-setting',
+      node('label', 'checkbox-row', required, '启动时需要解锁'),
+      node('p', 'muted', required.checked
+        ? '打开应用后，使用主密码、恢复密钥或触控 ID 进入工作台。'
+        : '打开应用直接进入工作台。本机已保存自动解锁凭据。'),
+      node('p', 'muted', '关闭后仅对本机生效。资料、备份和 Git 同步仍加密保存。锁定方式可在下方设置。'), error);
+    required.addEventListener('change', async () => {
+      required.disabled = true;
+      error.textContent = '';
+      setting.setAttribute('aria-busy', 'true');
+      try {
+        applyVaultState(await api.vault.setStartupUnlockRequired(required.checked));
+        status(required.checked ? '已开启启动解锁。' : '已关闭启动解锁，下次打开直接进入工作台。');
+      } catch (failure) {
+        required.checked = startupUnlockRequired !== false;
+        error.textContent = message(failure);
+      } finally {
+        required.disabled = false;
+        setting.removeAttribute('aria-busy');
+      }
+    });
+    accessSettings.append(setting);
+  }
+  if (enabled && api.vault.setAutoLockMinutes) {
+    const autoLock = input('', 'checkbox');
+    autoLock.id = 'vault-auto-lock';
+    autoLock.checked = autoLockMinutes !== null;
+    const minutes = input(String(autoLockMinutes ?? 15), 'number');
+    minutes.id = 'vault-auto-lock-minutes';
+    minutes.min = '1';
+    minutes.max = '1440';
+    minutes.step = '1';
+    minutes.required = true;
+    minutes.disabled = !autoLock.checked;
+    const save = node('button', 'outlined', '保存自动锁定设置');
+    save.type = 'submit';
+    save.disabled = true;
+    const error = node('p', 'dialog-error danger');
+    error.setAttribute('role', 'alert');
+    const form = node('form', 'vault-idle-form',
+      node('label', 'checkbox-row', autoLock, '闲置自动锁定'),
+      node('div', 'settings-actions', field('闲置时间（分钟）', minutes), save),
+      node('p', 'muted', '支持 1–1440 分钟。取消勾选并保存可关闭自动锁定，仍可手动锁定保险库。此设置仅对本机生效。'), error);
+    const edit = () => {
+      minutes.disabled = !autoLock.checked;
+      const value = autoLock.checked ? Number(minutes.value) : null;
+      save.disabled = value === autoLockMinutes;
+      error.textContent = '';
+    };
+    autoLock.addEventListener('change', edit);
+    minutes.addEventListener('input', edit);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const value = autoLock.checked ? Number(minutes.value) : null;
+      autoLock.disabled = minutes.disabled = save.disabled = true;
+      form.setAttribute('aria-busy', 'true');
+      error.textContent = '';
+      try {
+        applyVaultState(await api.vault.setAutoLockMinutes(value));
+        status(value === null ? '已关闭闲置自动锁定。' : `已设置闲置 ${value} 分钟后锁定，从现在开始计时。`);
+      } catch (failure) {
+        error.textContent = message(failure);
+        save.disabled = false;
+      } finally {
+        autoLock.disabled = false;
+        minutes.disabled = !autoLock.checked;
+        form.removeAttribute('aria-busy');
+      }
+    });
+    accessSettings.append(form);
+  }
+  accessSettings.hidden = accessSettings.children.length === 1;
   const card = (icon, title, text, action, detail) => node('section', 'vault-card',
     settingsIcon(icon), node('h3', '', title), node('p', 'muted', text), ...(detail ? [detail] : []), action);
   const runGitAction = (action) => async () => {
@@ -535,8 +668,9 @@ function renderVaultPage() {
     ...(fileTransfers === false ? [] : [card('file', '本地备份', '使用备份文件和原有凭据恢复。', button('从加密备份恢复…', () => restoreVault(false), 'outlined'))]),
     card('sync', 'Git 仓库', '从已同步的私有 Git 仓库恢复。', button('从 Git 恢复…', () => restoreVault(true), 'outlined'))
   ];
-  page.replaceChildren(settingsHeading('保险库', '管理主机资料的加密、备份和同步。'), hero,
-    node('h2', 'settings-section-label', enabled ? '备份与同步' : '已有保险库？'), node('div', 'vault-grid', ...cards));
+  page.replaceChildren(settingsHeading('保险库', '管理主机资料的加密、备份和同步。'),
+    node('div', 'page-body', hero, accessSettings, node('h2', 'settings-section-label', enabled ? '备份与同步' : '已有保险库？'),
+      node('div', 'vault-grid', ...cards)));
 }
 
 let keyDirectory;
@@ -617,11 +751,11 @@ function keyBrowser(onSelect) {
         if (!detail.hidden) detail.scrollIntoView({ block: 'nearest' });
       }, 'key-card');
       card.key = key;
-      card.append(settingsIcon('key'), node('span', 'key-card-label', node('strong', '', key.name), node('small', '', describe(key))));
+      card.append(settingsIcon('key'), node('span', 'key-card-label', summaryText('strong', key.name), summaryText('small', describe(key))));
       list.append(card);
     }
-    if (!visible.length) list.append(node('p', 'settings-empty muted', query ? '没有匹配的密钥。' :
-      (fromAgent ? '暂无可显示的 Agent 身份。' : onSelect ? '此目录中没有可选的私钥。' : '此目录中没有找到 SSH 密钥。')));
+    if (!visible.length) list.append(node('div', 'empty-state', settingsIcon('key'), node('p', 'muted', query ? '没有匹配的密钥。' :
+      (fromAgent ? '暂无可显示的 Agent 身份。' : onSelect ? '此目录中没有可选的私钥。' : '此目录中没有找到 SSH 密钥。'))));
     showDetail(visible.includes(selected) ? selected : undefined);
   }
   function setSource(agent) {
@@ -679,10 +813,15 @@ function keyBrowser(onSelect) {
     finally { passphrase.value = ''; submit.disabled = !directoryReady; }
   });
   search.addEventListener('input', render);
-  const heading = onSelect ? node('div', 'key-picker-intro', node('p', 'muted', '选择此主机使用的本机私钥。'), generate)
-    : settingsHeading('SSH 密钥', '查找、生成和管理本机 SSH 密钥。', generate);
-  browser.append(heading, node('div', 'key-toolbar', node('div', 'settings-switcher', localTab, agentTab), search),
-    directories, generator, note, node('div', 'key-body', list, detail));
+  const controls = node('div', 'key-toolbar', node('div', 'settings-switcher', localTab, agentTab), search);
+  const body = node('div', onSelect ? '' : 'page-body', directories, generator, note, node('div', 'key-body', list, detail));
+  if (onSelect) {
+    browser.append(node('div', 'key-picker-intro', node('p', 'muted', '选择此主机使用的本机私钥。'), generate), controls, body);
+  } else {
+    const heading = settingsHeading('SSH 密钥', '查找、生成和管理本机 SSH 密钥。', generate);
+    controls.classList.add('page-toolbar');
+    browser.append(heading, controls, body);
+  }
   setSource(false);
   // Scan after the page or dialog has attached the browser.
   queueMicrotask(() => { if (browser.isConnected) void scan(keyDirectory); });
@@ -769,13 +908,13 @@ function passwordEditor(host, auth, hasPassword, sameTarget) {
   return { pane, password, hide, update };
 }
 
-async function editHost(host, draftTab) {
+async function editHost(host, draftTab, target) {
   const hasPassword = host?.auth === 'password' && await api.hosts.hasPassword(host.id);
   const name = input(host?.name);
-  const addressField = input(host?.address);
-  const port = input(host?.port || '22', 'number');
+  const addressField = input(host?.address ?? target?.address);
+  const port = input(host?.port || target?.port || '22', 'number');
   port.min = 1; port.max = 65535;
-  const username = input(host?.username);
+  const username = input(host?.username ?? target?.username);
   const group = input(host?.group ?? currentGroup);
   group.placeholder = '选择或输入分组';
   const tags = input(host?.tags?.join(', ') || '');
@@ -837,16 +976,16 @@ async function editHost(host, draftTab) {
     const pasted = event.clipboardData?.getData('text')?.trim();
     if (!pasted || (!pasted.includes('@') && !/^ssh\s/i.test(pasted))) return;
     event.preventDefault();
-    const match = /^(?:ssh\s+)?(?:-p\s+(\d+)\s+)?([^@\s]+)@(\[[\da-f:.%\w-]+\]|[^\s:]+)(?::(\d+))?(?:\s+-p\s+(\d+))?$/i.exec(pasted);
-    if (!match || [match[1], match[4], match[5]].filter(Boolean).length > 1) {
+    const target = hostTarget(pasted);
+    if (!target) {
       addressField.value = pasted;
       pasteHint.textContent = '无法解析这条命令，请手动填写连接字段。';
       updateDuplicate();
       return;
     }
-    username.value = match[2];
-    addressField.value = match[3];
-    port.value = match[1] || match[4] || match[5] || port.value;
+    username.value = target.username;
+    addressField.value = target.address;
+    port.value = target.port || port.value;
     pasteHint.textContent = '已填入连接信息，请核对后保存。';
     updateDuplicate();
   });
@@ -867,8 +1006,8 @@ async function editHost(host, draftTab) {
   document.addEventListener('visibilitychange', conceal);
   try {
     result = await prompt(host ? '编辑主机' : '新建主机', [
-      node('section', 'host-form-section', node('h3', '', '基本信息'), field('主机地址', addressField), pasteHint,
-        node('div', 'dialog-row', field('显示名称', name), field('分组', groupPicker))),
+      node('section', 'host-form-section', node('h3', '', '地址'), field('主机地址', addressField), pasteHint),
+      node('section', 'host-form-section', node('h3', '', '常规'), field('显示名称', name), field('分组', groupPicker)),
       node('section', 'host-form-section', node('h3', '', 'SSH 连接'),
         node('div', 'dialog-row', field('SSH 用户名', username), field('端口', port)), field('认证方式', authPicker),
         keyRow, ...(editor ? [editor.pane] : []), duplicateRow),
@@ -913,21 +1052,20 @@ function openGroup(group) {
   closeDropdown();
   const previous = currentGroup;
   currentGroup = group;
+  selectedHostId = '';
   selectedGroup = group ? '' : previous;
   $('host-search').value = '';
   $('tag-filter').value = '';
   $('tag-filter').dispatchEvent(new Event('input'));
   renderHosts();
-  $('host-list').scrollTop = 0;
+  $('host-library').scrollTop = 0;
   const returnCard = [...$('host-list').querySelectorAll('.group-open')].find((card) => card.dataset.group === previous);
   (group ? $('all-hosts') : returnCard || $('host-search')).focus({ preventScroll: true });
 }
 
 function groupCard(group, count) {
-  const folder = node('span', 'host-icon folder-icon');
-  folder.setAttribute('aria-hidden', 'true');
-  const card = node('button', 'group-open', folder, node('span', 'host-identity',
-    node('strong', '', group), node('small', '', `${count} 台主机`)), node('span', 'group-arrow', '›'));
+  const card = node('button', 'group-open', settingsIcon('group'), node('span', 'host-identity',
+    summaryText('strong', group), node('small', '', `${count} 台主机`)), node('span', 'group-arrow', '›'));
   card.type = 'button';
   card.dataset.group = group;
   card.setAttribute('aria-label', `打开分组 ${group}，${count} 台主机`);
@@ -936,6 +1074,9 @@ function groupCard(group, count) {
   card.addEventListener('click', (event) => {
     if (event.detail === 0) { openGroup(group); return; }
     selectedGroup = group;
+    selectedHostId = '';
+    updateHostActions();
+    for (const item of $('host-list').querySelectorAll('.host-open')) item.setAttribute('aria-pressed', 'false');
     for (const item of $('host-list').querySelectorAll('.group-open')) {
       item.setAttribute('aria-pressed', String(item === card));
     }
@@ -945,22 +1086,106 @@ function groupCard(group, count) {
 }
 
 function hostCard(host, showGroup) {
-  const icon = node('span', 'host-icon', '›_');
-  icon.setAttribute('aria-hidden', 'true');
-  const open = button('', () => openHost(host), 'host-open', `连接 ${host.name}`);
+  const open = node('button', 'host-open');
+  open.type = 'button';
+  open.dataset.hostId = host.id;
+  open.setAttribute('aria-label', `主机 ${host.name}，${endpoint(host)}`);
+  open.setAttribute('aria-pressed', String(selectedHostId === host.id));
   const address = showGroup && host.group ? `${endpoint(host)} · ${host.group}` : endpoint(host);
-  open.replaceChildren(icon, node('span', 'host-identity', node('strong', '', host.name), node('small', '', address)));
-  open.title = [host.name, address, host.tags?.join(', '), host.note].filter(Boolean).join('\n');
-  return node('div', 'host-row', open, node('small', 'host-auth', authLabels[host.auth] || 'SSH'),
-    button('⋯', () => editHost(host), 'host-edit', `编辑 ${host.name}`));
+  const detail = `${address} · ${authLabels[host.auth] || 'SSH'}`;
+  open.replaceChildren(settingsIcon('server'), node('span', 'host-identity', summaryText('strong', host.name), summaryText('small', detail)));
+  open.title = [host.name, detail, host.tags?.join(', '), host.note, '单击选中，双击或按回车连接'].filter(Boolean).join('\n');
+  open.addEventListener('click', (event) => {
+    selectHost(host);
+    if (event.detail === 0) void openHost(host).catch((error) => status(message(error)));
+  });
+  open.addEventListener('dblclick', () => { void openHost(host).catch((error) => status(message(error))); });
+  const more = button('⋯', () => openHostMenu(host, more), 'host-edit', `主机操作 ${host.name}`);
+  more.setAttribute('aria-haspopup', 'menu');
+  more.setAttribute('aria-expanded', 'false');
+  const row = node('div', 'host-row', open, more);
+  row.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    openHostMenu(host, more, event.clientX || undefined, event.clientY || undefined);
+  });
+  return row;
+}
+
+function selectHost(host) {
+  selectedHostId = host.id;
+  selectedGroup = '';
+  for (const item of $('host-list').querySelectorAll('.host-open')) item.setAttribute('aria-pressed', String(item.dataset.hostId === host.id));
+  for (const item of $('host-list').querySelectorAll('.group-open')) item.setAttribute('aria-pressed', 'false');
+  updateHostActions();
+}
+
+function updateHostActions() {
+  const host = hosts.find((item) => item.id === selectedHostId);
+  hostSearchAction = host ? () => openHost(host) : hostSearchMatch?.run;
+  $('host-connect').disabled = !hostSearchAction;
+  $('host-connect').textContent = !host && hostSearchMatch?.draft ? '填写主机' : '连接';
+  $('host-selection-actions').hidden = !host;
+  const hint = $('host-selection-hint');
+  hint.textContent = host ? `已选 ${host.name} · ${endpoint(host)}` : '单击选中，双击或按回车连接';
+  hint.title = hint.textContent;
+}
+
+function closeHostMenu(restoreFocus = false) {
+  if (!hostMenu) return;
+  const { panel, anchor } = hostMenu;
+  hostMenu = undefined;
+  panel.remove();
+  anchor.setAttribute('aria-expanded', 'false');
+  if (restoreFocus && anchor.isConnected) anchor.focus({ preventScroll: true });
+}
+
+function openHostMenu(host, anchor, x, y) {
+  if (vaultStatus.locked || dialog.open) return;
+  closeHostMenu();
+  closeDropdown();
+  selectHost(host);
+  const panel = node('div', 'host-menu');
+  panel.setAttribute('role', 'menu');
+  panel.setAttribute('aria-label', `${host.name} 的操作`);
+  const actions = [
+    ['连接 / 切换已有会话', () => openHost(host)],
+    ['在新标签连接', () => openHost(host, { force: true })],
+    ['编辑主机…', () => editHost(host)]
+  ];
+  for (const [label, run] of actions) {
+    const action = button(label, () => { closeHostMenu(true); return run(); });
+    action.setAttribute('role', 'menuitem');
+    panel.append(action);
+  }
+  document.body.append(panel);
+  const rect = anchor.getBoundingClientRect();
+  panel.style.left = `${Math.max(8, Math.min(x ?? rect.right - panel.offsetWidth, innerWidth - panel.offsetWidth - 8))}px`;
+  panel.style.top = `${Math.max(8, Math.min(y ?? rect.bottom + 5, innerHeight - panel.offsetHeight - 8))}px`;
+  hostMenu = { panel, anchor };
+  anchor.setAttribute('aria-expanded', 'true');
+  panel.firstElementChild.focus();
+  panel.addEventListener('keydown', (event) => {
+    const choices = [...panel.children];
+    const index = choices.indexOf(document.activeElement);
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? choices.length - 1
+        : (index + (event.key === 'ArrowDown' ? 1 : -1) + choices.length) % choices.length;
+      choices[next].focus();
+    } else if (event.key === 'Escape' || event.key === 'Tab') {
+      event.preventDefault();
+      closeHostMenu(true);
+    }
+  });
 }
 
 function hostSection(title, entries) {
   return node('section', 'host-section', node('h2', 'host-group', title), node('div', 'host-entries', ...entries));
 }
 
-function hostMatches(host, query) {
-  return `${host.name} ${endpoint(host)} ${host.group || ''} ${(host.tags || []).join(' ')} ${host.note || ''}`.toLowerCase().includes(query);
+function hostMatches(host, query, target) {
+  return (target && matchesTarget(host, target)) ||
+    `${host.name} ${endpoint(host)} ${host.group || ''} ${(host.tags || []).join(' ')} ${host.note || ''}`.toLowerCase().includes(query);
 }
 
 function recentFirst(a, b) {
@@ -968,6 +1193,7 @@ function recentFirst(a, b) {
 }
 
 function renderHosts() {
+  closeHostMenu();
   const groups = new Map();
   for (const host of hosts) {
     if (host.group) groups.set(host.group, (groups.get(host.group) || 0) + 1);
@@ -991,19 +1217,28 @@ function renderHosts() {
     tagControl.value = tags.includes(selected) ? selected : '';
   }
   const tag = tagControl.value;
-  const query = $('host-search').value.trim().toLowerCase();
+  const text = $('host-search').value.trim();
+  const query = text.toLowerCase();
+  const target = hostTarget(text);
   const searching = Boolean(query || tag);
-  const matching = scope.filter((host) => (!tag || host.tags?.includes(tag)) && hostMatches(host, query));
+  const matching = scope.filter((host) => (!tag || host.tags?.includes(tag)) && hostMatches(host, query, target));
   const visibleHosts = currentGroup || searching ? matching : matching.filter((host) => !host.group);
+  if (!visibleHosts.some((host) => host.id === selectedHostId)) selectedHostId = '';
   visibleHosts.sort(recentFirst);
   const matchingGroups = new Set(matching.map((host) => host.group));
   const visibleGroups = currentGroup ? [] : [...groups]
     .filter(([group]) => !searching || matchingGroups.has(group))
     .sort(([a], [b]) => a.localeCompare(b, 'zh-CN'));
   $('host-breadcrumb').hidden = !currentGroup;
-  $('current-group').textContent = currentGroup;
+  $('current-group').textContent = $('current-group').title = currentGroup;
   $('remove-group').hidden = !currentGroup;
   $('host-count').textContent = scope.length;
+  const exact = query ? matching.filter((host) => target ? matchesTarget(host, target) : host.name.toLowerCase() === query) : [];
+  const candidates = target || exact.length ? exact : matching;
+  const saved = query && candidates.length === 1 ? candidates[0] : undefined;
+  const draft = target && !exact.length;
+  hostSearchMatch = saved ? { run: () => openHost(saved) } : draft ? { draft: true, run: () => editHost(undefined, undefined, target) } : undefined;
+  updateHostActions();
   const list = $('host-list');
   const sections = [];
   if (visibleGroups.length) sections.push(hostSection('分组', visibleGroups.map(([group, count]) => groupCard(group, count))));
@@ -1011,8 +1246,9 @@ function renderHosts() {
   else if (!searching && visibleGroups.length) sections.push(hostSection('主机', [node('p', 'muted', '暂无未分组的主机')]));
   if (!sections.length) {
     sections.push(searching
-      ? node('div', 'host-empty', node('strong', '', '没有匹配的结果'), node('p', '', '试试其他搜索词或清除筛选。'))
-      : node('div', 'host-empty', node('span', 'host-icon', '›_'), node('strong', '', '还没有已保存的主机'),
+      ? node('div', 'empty-state', settingsIcon('server'), node('strong', '', draft ? '新 SSH 地址' : '没有匹配的结果'),
+        node('p', '', draft ? '按回车或点「填写主机」，核对连接信息后保存。' : '试试其他搜索词或清除筛选。'))
+      : node('div', 'empty-state', settingsIcon('server'), node('strong', '', '还没有已保存的主机'),
         node('p', '', '保存连接信息后，可从这里打开 SSH 会话。'), button('新建主机', () => editHost(), 'primary')));
   }
   list.replaceChildren(...sections);
@@ -1045,11 +1281,13 @@ function attachTerminal(tab) {
   const view = node('div', 'terminal-view');
   view.hidden = true;
   $('terminal-views').append(view);
+  const styles = getComputedStyle(document.documentElement);
+  const color = (name) => styles.getPropertyValue(name).trim();
   const terminal = new Terminal({
     fontFamily: 'SFMono-Regular, Menlo, monospace', fontSize: terminalFontSize, lineHeight: 1.2, scrollback: 6000,
     cursorBlink: tab.kind === 'shell', disableStdin: tab.kind === 'command',
     convertEol: tab.kind === 'command', allowProposedApi: true, minimumContrastRatio: 4.5, theme: {
-      background: '#11161f', foreground: '#e8edf6', cursor: '#a6ceff', selectionBackground: '#365579',
+      background: color('--terminal'), foreground: color('--terminal-text'), cursor: color('--accent'), selectionBackground: color('--terminal-selection'),
       black: '#596578', brightBlack: '#9aa9bf', red: '#f58291', brightRed: '#ffacb7',
       green: '#84d5a4', brightGreen: '#a2e9bb', yellow: '#e7c47d', brightYellow: '#ffdb97',
       blue: '#83aff6', brightBlue: '#a6c7ff', magenta: '#c9a2f4', brightMagenta: '#e0bfff',
@@ -1096,8 +1334,14 @@ function attachTerminal(tab) {
 
 function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session' : 'hosts') {
   closeDropdown();
+  closeHostMenu();
   active = tab;
+  if (tab) tab.unread = false;
   workspace.dataset.view = view;
+  const library = $('library-button');
+  library.dataset.active = String(!tab);
+  if (view === 'hosts') library.setAttribute('aria-current', 'page');
+  else library.removeAttribute('aria-current');
   $('work').hidden = view !== 'session';
   $('new-tab-page').hidden = view !== 'new-tab';
   for (const control of pageButtons) {
@@ -1191,7 +1435,7 @@ function renderTabs() {
     if (tab.tabRow?.dataset.kind !== tab.kind) {
       const title = tabTitle(tab);
       const open = button('', () => selectTab(tab), 'tab-open', title);
-      open.replaceChildren(node('span', 'tab-title', tabName(tab)),
+      open.replaceChildren(node('span', 'tab-status'), summaryText('span', tabName(tab)), node('span', 'tab-unread', '新'),
         ...(tab.number > 1 ? [node('span', 'tab-number', String(tab.number))] : []));
       const close = button('×', () => closeTab(tab), 'tab-close', `关闭 ${title}`);
       const icon = tabIcon(tab);
@@ -1204,7 +1448,16 @@ function renderTabs() {
       tab.tabRow = row;
     }
     tab.tabRow.dataset.active = String(tab === active);
-    tab.tabRow.querySelector('.tab-open').setAttribute('aria-pressed', String(tab === active));
+    const open = tab.tabRow.querySelector('.tab-open');
+    const state = tab.kind === 'new' ? '选择主机' : sessionLabels[tab.status] || '等待连接';
+    open.setAttribute('aria-pressed', String(tab === active));
+    open.setAttribute('aria-label', `${tabTitle(tab)} · ${state}${tab.unread ? ' · 有未读输出' : ''}`);
+    open.title = open.getAttribute('aria-label');
+    tab.tabRow.dataset.status = tab.status || '';
+    const indicator = open.querySelector('.tab-status');
+    indicator.hidden = tab.kind === 'new';
+    indicator.title = state;
+    open.querySelector('.tab-unread').hidden = !tab.unread;
   }
   $('switch-tabs').hidden = tabs.size < 2;
   updateTabEdges();
@@ -1216,7 +1469,7 @@ function tabChoice(tab) {
     if ($('session-switcher').open) $('session-switcher').close();
     selectTab(tab);
   }, 'tab-choice');
-  choice.append(tabIcon(tab), node('span', '', tabTitle(tab)), node('small', '', detail));
+  choice.append(tabIcon(tab), summaryText('span', tabTitle(tab)), summaryText('small', detail));
   if (tab === active) choice.setAttribute('aria-current', 'true');
   return choice;
 }
@@ -1249,18 +1502,26 @@ function quickConnectGroup(title, entries) {
 
 function renderQuickConnect(draftTab) {
   const results = $('quick-connect-results');
-  const query = draftTab.query.trim().toLowerCase();
-  const matching = hosts.filter((host) => hostMatches(host, query)).sort(recentFirst);
+  const text = draftTab.query.trim();
+  const query = text.toLowerCase();
+  const target = hostTarget(text);
+  const matching = hosts.filter((host) => hostMatches(host, query, target)).sort((a, b) =>
+    (target ? Number(matchesTarget(b, target)) - Number(matchesTarget(a, target)) : 0) || recentFirst(a, b));
   const visited = query ? [] : matching.filter((host) => recent.has(host.id)).slice(0, 8);
   const groups = [];
   const hostChoice = (host) => {
     const choice = button('', () => openHost(host, { draftTab }), 'tab-choice');
-    choice.append(chromeIcon('terminal'), node('span', '', host.name),
-      node('small', '', [endpoint(host), host.group].filter(Boolean).join(' · ')));
+    choice.append(chromeIcon('server'), summaryText('span', host.name),
+      summaryText('small', [endpoint(host), host.group].filter(Boolean).join(' · ')));
     choice.title = [host.name, endpoint(host), host.group].filter(Boolean).join(' · ');
     return choice;
   };
   if (visited.length) groups.push(quickConnectGroup('最近连接', visited.map(hostChoice)));
+  if (target && !matching.some((host) => matchesTarget(host, target))) {
+    const choice = button('', () => editHost(undefined, draftTab, target), 'tab-choice');
+    choice.append(chromeIcon('new-tab'), summaryText('span', '填写新主机'), summaryText('small', text));
+    groups.push(quickConnectGroup('快速连接', [choice]));
+  }
   const saved = matching.filter((host) => !visited.includes(host));
   if (saved.length) groups.push(quickConnectGroup(query ? '匹配的主机' : '已保存的主机', saved.map(hostChoice)));
   if (query) {
@@ -1296,7 +1557,7 @@ function renderContext() {
   $('session-notice').hidden = true;
   if (!tab?.terminal) return;
   const labels = { idle: '等待连接', connecting: '连接中', trust: '核对主机指纹', ready: '已连接', closed: '已断开', running: '运行中', done: '已完成', stopped: '已停止', failed: '失败' };
-  $('context').replaceChildren(node('strong', '', endpoint(tab.host)), node('span', tab.status === 'ready' ? 'online' : 'muted', labels[tab.status] || tab.status));
+  $('context').replaceChildren(summaryText('strong', endpoint(tab.host)), node('span', tab.status === 'ready' ? 'online' : 'muted', labels[tab.status] || tab.status));
   const controls = $('session-actions');
   controls.replaceChildren();
   if (tab.kind === 'shell' && tab.status === 'closed') controls.append(button(tab.promptForPassword ? '重新输入密码' : '重连', () => connect(tab)));
@@ -1333,6 +1594,7 @@ function renderContext() {
 async function trust(tab, accepted) {
   tab.status = 'connecting';
   renderContext();
+  renderTabs();
   await api.ssh.trust({ id: tab.id, accepted });
 }
 
@@ -1367,6 +1629,7 @@ async function connect(tab, enterPassword = false) {
   tab.message = '';
   tab.passwordSaveError = '';
   renderContext();
+  renderTabs();
   try {
     const passwordAuth = tab.host.auth === 'password';
     const useSaved = passwordAuth && !enterPassword && !tab.promptForPassword && await api.hosts.hasPassword(tab.host.id);
@@ -1404,28 +1667,32 @@ async function openHost(host, { force = false, draftTab } = {}) {
 }
 
 async function closeTab(tab) {
-  if (tab.kind === 'shell') {
-    const ongoing = [...jobs.values()].filter((job) => job.sessionId === tab.id && ['queued', 'running', 'committing'].includes(job.status));
-    if (ongoing.some((job) => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭会话。'); return; }
-    if (ongoing.length && !await confirm('关闭 SSH 会话', `取消「${tab.host.name}」正在传输的 ${ongoing.length} 项任务？`, '取消任务并关闭')) return;
-    await api.ssh.close(tab.id);
-  } else if (tab.kind === 'command') {
-    await api.commands.close(tab.id);
-  }
-  tabs.delete(tab.id);
-  tab.tabRow.remove();
-  refreshTransferActions(tab.id);
-  for (const acknowledge of tab.pendingAcks?.values() || []) acknowledge();
-  tab.terminal?.dispose();
-  tab.view?.remove();
-  if (active === tab) selectTab(tabs.get(tab.sessionId) || [...tabs.values()].sort((a, b) => b.used - a.used)[0]);
-  else {
-    renderTabs();
-    if (active?.sessionId === tab.id || active?.id === tab.sessionId) {
-      renderContext();
-      renderFiles();
+  if (tab.closing || !tabs.has(tab.id)) return;
+  tab.closing = true;
+  try {
+    if (tab.kind === 'shell') {
+      const ongoing = [...jobs.values()].filter((job) => job.sessionId === tab.id && ['queued', 'running', 'committing'].includes(job.status));
+      if (ongoing.some((job) => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭会话。'); return; }
+      if (ongoing.length && !await confirm('关闭 SSH 会话', `取消「${tab.host.name}」正在传输的 ${ongoing.length} 项任务？`, '取消任务并关闭')) return;
+      await api.ssh.close(tab.id);
+    } else if (tab.kind === 'command') {
+      await api.commands.close(tab.id);
     }
-  }
+    tabs.delete(tab.id);
+    tab.tabRow.remove();
+    refreshTransferActions(tab.id);
+    for (const acknowledge of tab.pendingAcks?.values() || []) acknowledge();
+    tab.terminal?.dispose();
+    tab.view?.remove();
+    if (active === tab) selectTab(tabs.get(tab.sessionId) || [...tabs.values()].sort((a, b) => b.used - a.used)[0]);
+    else {
+      renderTabs();
+      if (active?.sessionId === tab.id || active?.id === tab.sessionId) {
+        renderContext();
+        renderFiles();
+      }
+    }
+  } finally { tab.closing = false; }
 }
 
 function updateSession(tab, next, detail = '') {
@@ -1434,18 +1701,19 @@ function updateSession(tab, next, detail = '') {
   if (next === 'ready') {
     recent.set(tab.host.id, Date.now());
     void api.hosts.touch(tab.host.id).catch(() => {});
-    status(`${tab.host.name} · SSH 已连接`);
+    if (active === tab) status(`${tab.host.name} · SSH 已连接`);
     focusTerminal(tab);
     if (active?.kind === 'new') renderQuickConnect(active);
     if (filesOpen && origin() === tab) ensureFiles(tab);
   } else if (next === 'closed') {
     tab.paths.reset();
     tab.terminal.write(`\r\n\x1b[90m${detail.replace(/[\x00-\x1f\x7f]/g, ' ')}\x1b[0m\r\n`);
-    status(`${tab.host.name} · ${detail}`);
+    if (active === tab) status(`${tab.host.name} · ${detail}`);
   }
   if (active === tab || origin() === tab) renderContext();
   if (filesOpen && origin() === tab) renderFiles();
   refreshTransferActions(tab.id);
+  renderTabs();
 }
 
 async function openPalette(scope = 'all') {
@@ -1462,7 +1730,7 @@ async function openPalette(scope = 'all') {
   const update = () => {
     const all = [];
     if (scope !== 'commands') {
-      for (const host of hosts) all.push([host.name, endpoint(host), () => openHost(host)]);
+      for (const host of [...hosts].sort(recentFirst)) all.push([host.name, [endpoint(host), host.group, ...(host.tags || [])].filter(Boolean).join(' · '), () => openHost(host)]);
     }
     if (readySession(session)) {
       for (const [action, label] of Object.entries(actionLabels)) all.push([label, session.host.name, () => configureCommand(session, action)]);
@@ -1471,8 +1739,8 @@ async function openPalette(scope = 'all') {
     const q = search.value.trim().toLowerCase();
     entries = all.filter(([label, detail]) => `${label} ${detail}`.toLowerCase().includes(q));
     choices.replaceChildren(...entries.map(([label, detail, run]) => {
-      const choice = button('', () => choose(run));
-      choice.replaceChildren(node('span', '', label), node('small', '', detail));
+      const choice = button('', () => choose(run), 'palette-choice');
+      choice.replaceChildren(summaryText('span', label), summaryText('small', detail));
       return choice;
     }));
     if (!entries.length) {
@@ -1486,6 +1754,7 @@ async function openPalette(scope = 'all') {
   search.addEventListener('input', update);
   const title = scope === 'commands' ? '快捷命令' : '主机与命令';
   const selection = prompt(title, [search, choices], '打开首项', () => entries[0]?.[2]);
+  wireSearchChoices(search.form, search, choices, '.palette-choice');
   update();
   const first = await selection;
   const run = selected || first;
@@ -1733,6 +2002,7 @@ async function loadFiles(tab, directory) {
     if (files.directory !== result.directory) {
       files.selected.clear();
       files.scrollTop = 0;
+      files.query = '';
     }
     Object.assign(files, result);
   } catch (error) {
@@ -1758,12 +2028,14 @@ function renderFiles() {
   workspace.dataset.files = open ? 'open' : 'closed';
   if (!open) return;
   const files = tab.files;
-  const host = node('small', 'file-host', tab.host.name);
-  host.title = tab.host.name;
+  const host = summaryText('small', tab.host.name);
   const heading = node('header', 'file-heading', chromeIcon('folder'),
     node('div', '', node('strong', '', '远端文件'), host), button('×', toggleFiles, '', '关闭文件区'));
   panel.replaceChildren(heading);
-  if (tab.status !== 'ready') { panel.append(node('p', 'inline-status muted', '连接 SSH 后可浏览文件。')); return; }
+  if (tab.status !== 'ready') {
+    panel.append(node('div', 'empty-state', settingsIcon('folder'), node('p', 'muted', '连接 SSH 后可浏览文件。')));
+    return;
+  }
   const directory = input(files.directory || '');
   directory.placeholder = '远端路径';
   directory.setAttribute('aria-label', '远端路径');
@@ -1791,6 +2063,28 @@ function renderFiles() {
   mkdir.prepend(chromeIcon('folder'));
   const touch = button('新建文件', () => createRemoteItem(tab, false), 'outlined');
   touch.prepend(chromeIcon('file'));
+  const filter = input(files.query || '', 'search');
+  filter.placeholder = '筛选当前目录';
+  filter.setAttribute('aria-label', '筛选当前目录文件名');
+  const sorting = node('select');
+  sorting.setAttribute('aria-label', '文件排序');
+  for (const [value, label] of [['name', '名称 A–Z'], ['size', '文件从大到小']]) {
+    const option = node('option', '', label);
+    option.value = value;
+    sorting.append(option);
+  }
+  sorting.value = files.sort || 'name';
+  const hidden = input('', 'checkbox');
+  hidden.checked = files.showHidden !== false;
+  const all = input('', 'checkbox');
+  all.setAttribute('aria-label', '全选当前可见的可下载项');
+  let visible = [];
+  const visibleEntries = () => files.entries.filter(({ name }) =>
+    (hidden.checked || !name.startsWith('.')) && name.toLowerCase().includes(filter.value.trim().toLowerCase()))
+    .sort((a, b) => Number(b.kind === 'directory') - Number(a.kind === 'directory')
+      || (sorting.value === 'size' && a.kind === 'file' && b.kind === 'file' ? b.size - a.size : 0)
+      || a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
+  const clear = button('清空选择', () => { files.selected.clear(); renderEntries(); });
   const selectedCount = node('small', 'muted');
   const updateSelection = () => {
     const count = selection().length;
@@ -1798,34 +2092,68 @@ function renderFiles() {
     follow.disabled = tail.disabled = !logPath();
     selectedCount.textContent = count ? `已选 ${count} 项` : '';
     selectedCount.hidden = count === 0;
+    clear.hidden = count === 0;
+    const selectableEntries = visible.filter(({ kind }) => selectable(kind));
+    const checked = selectableEntries.filter(({ name }) => files.selected.has(name)).length;
+    all.disabled = selectableEntries.length === 0;
+    all.checked = selectableEntries.length > 0 && checked === selectableEntries.length;
+    all.indeterminate = checked > 0 && checked < selectableEntries.length;
   };
   updateSelection();
   panel.append(node('div', 'file-toolbar', node('div', 'file-tools', upload, download, follow, tail),
-    node('div', 'file-tools file-create', mkdir, touch, selectedCount)));
+    node('div', 'file-tools file-create', mkdir, touch, selectedCount, clear)));
+  panel.append(node('div', 'file-filters', filter, selectControl(sorting)),
+    node('div', 'file-options', node('label', 'checkbox-row', all, '全选可见'), node('label', 'checkbox-row', hidden, '显示隐藏项')));
+  panel.append(node('div', 'file-columns muted', node('span', '', '名称'), node('span', '', '大小 / 类型')));
   const list = node('div', 'file-list');
-  for (const { name, kind, size } of files.entries) {
-    const row = node('div', 'file-row');
-    if (selectable(kind)) {
-      const checkbox = input('', 'checkbox');
-      checkbox.checked = files.selected.has(name);
-      checkbox.setAttribute('aria-label', `选择 ${name}`);
-      checkbox.addEventListener('change', () => {
-        if (checkbox.checked) files.selected.add(name);
-        else files.selected.delete(name);
+  function renderEntries() {
+    const entries = visibleEntries();
+    visible = entries;
+    const rows = [];
+    for (const { name, kind, size } of entries) {
+      const row = node('div', 'file-row');
+      if (selectable(kind)) {
+        const checkbox = input('', 'checkbox');
+        checkbox.checked = files.selected.has(name);
+        checkbox.setAttribute('aria-label', `选择 ${name}`);
+        checkbox.addEventListener('change', () => {
+          if (checkbox.checked) files.selected.add(name);
+          else files.selected.delete(name);
+          row.classList.toggle('selected', checkbox.checked);
+          updateSelection();
+        });
         row.classList.toggle('selected', checkbox.checked);
-        updateSelection();
-      });
-      row.classList.toggle('selected', checkbox.checked);
-      row.append(checkbox);
-      if (kind === 'file') row.append(fileEntry(name, kind, () => checkbox.click()));
+        row.append(checkbox);
+        if (kind === 'file') row.append(fileEntry(name, kind, () => checkbox.click()));
+      }
+      if (kind === 'directory') row.append(fileEntry(name, kind, () => loadFiles(tab, pathOf(tab, name))));
+      if (kind === 'other') row.append(summaryText('span', name));
+      row.append(node('small', '', kind === 'directory' ? '目录' : kind === 'file' ? bytes(size) : '链接或特殊文件'));
+      if (selectable(kind)) row.append(button('↓', () => prepareTransfer(tab, 'down', [name]), 'file-download', `下载 ${name}`));
+      rows.push(row);
     }
-    if (kind === 'directory') row.append(fileEntry(name, kind, () => loadFiles(tab, pathOf(tab, name))));
-    if (kind === 'other') row.append(node('span', 'muted', name));
-    row.append(node('small', '', kind === 'directory' ? '目录' : kind === 'file' ? bytes(size) : '链接或特殊文件'));
-    if (selectable(kind)) row.append(button('↓', () => prepareTransfer(tab, 'down', [name]), 'file-download', `下载 ${name}`));
-    list.append(row);
+    if (!entries.length) rows.push(node('div', 'empty-state', settingsIcon('folder'),
+      node('p', 'muted', files.entries.length ? '没有匹配的文件，请调整筛选或显示隐藏项。' : '空目录')));
+    list.replaceChildren(...rows);
+    updateSelection();
   }
-  if (!files.entries.length) list.append(node('p', 'inline-status muted', '空目录'));
+  const updateView = (clearSelection) => {
+    Object.assign(files, { query: filter.value, showHidden: hidden.checked, sort: sorting.value, scrollTop: 0 });
+    if (clearSelection) files.selected.clear();
+    renderEntries();
+    list.scrollTop = 0;
+  };
+  filter.addEventListener('input', () => updateView(true));
+  hidden.addEventListener('change', () => updateView(true));
+  sorting.addEventListener('change', () => updateView(false));
+  all.addEventListener('change', () => {
+    for (const { name, kind } of visible) if (selectable(kind)) {
+      if (all.checked) files.selected.add(name);
+      else files.selected.delete(name);
+    }
+    renderEntries();
+  });
+  renderEntries();
   panel.append(list);
   list.scrollTop = files.scrollTop || 0;
   list.addEventListener('scroll', () => {
@@ -1835,7 +2163,7 @@ function renderFiles() {
 
 function fileEntry(name, kind, action) {
   const entry = button('', action, `file-entry file-entry-${kind}`, name);
-  entry.replaceChildren(chromeIcon(kind === 'directory' ? 'folder' : 'file'), node('span', '', name));
+  entry.replaceChildren(chromeIcon(kind === 'directory' ? 'folder' : 'file'), summaryText('span', name));
   return entry;
 }
 
@@ -1968,8 +2296,8 @@ function updateJob(event, archived = false) {
   jobs.set(job.id, job);
   let row = jobRows.get(job.id);
   if (!row) {
-    const name = node('strong');
-    const meta = node('small');
+    const name = node('strong', 'text-ellipsis');
+    const meta = node('small', 'text-ellipsis');
     const source = node('code');
     const target = node('code');
     const meter = node('progress');
@@ -1986,8 +2314,8 @@ function updateJob(event, archived = false) {
     jobRows.set(job.id, row);
   }
   const upload = job.direction === 'up';
-  row.name.textContent = job.remote.split('/').pop() || job.remote;
-  row.meta.textContent = [upload ? '上传' : '下载', job.host,
+  row.name.textContent = row.name.title = job.remote.split('/').pop() || job.remote;
+  row.meta.textContent = row.meta.title = [upload ? '上传' : '下载', job.host,
     finished ? new Date(job.finishedAt).toLocaleString() : ''].filter(Boolean).join(' · ');
   row.source.textContent = upload ? job.local : job.remote;
   row.target.textContent = upload ? job.remote : job.local;
@@ -2048,6 +2376,10 @@ api.onEvent((event) => {
     const acknowledge = () => { if (pending.delete(event.ack)) api.ssh.ack(event.ack); };
     pending.set(event.ack, acknowledge);
     tab.paths.invalidate();
+    if ((active !== tab || document.hidden || vaultStatus.locked) && !tab.unread) {
+      tab.unread = true;
+      renderTabs();
+    }
     if (tab.terminal.buffer.active.viewportY < tab.terminal.buffer.active.baseY) tab.newOutput = true;
     tab.terminal.write(event.bytes, acknowledge);
   } else if (event.type === 'transfer') updateJob(event);
@@ -2077,6 +2409,32 @@ tabStrip.addEventListener('wheel', (event) => {
   tabStrip.scrollLeft += event.deltaY * unit;
 }, { passive: false });
 $('host-search').addEventListener('input', renderHosts);
+for (const [id, run] of [
+  ['host-new-session', (host) => openHost(host, { force: true })],
+  ['host-edit-selected', (host) => editHost(host)]
+]) $(id).addEventListener('click', () => {
+  const host = hosts.find((item) => item.id === selectedHostId);
+  if (host) void run(host).catch((error) => status(message(error)));
+});
+document.addEventListener('pointerdown', (event) => {
+  if (hostMenu && !hostMenu.panel.contains(event.target) && !hostMenu.anchor.contains(event.target)) closeHostMenu();
+}, true);
+document.addEventListener('focusin', (event) => {
+  if (hostMenu && !hostMenu.panel.contains(event.target) && event.target !== hostMenu.anchor) closeHostMenu();
+});
+for (const type of ['resize', 'blur']) window.addEventListener(type, () => closeHostMenu());
+$('host-library').addEventListener('scroll', () => closeHostMenu(), { passive: true });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && active?.unread && !vaultStatus.locked) { active.unread = false; renderTabs(); }
+});
+$('host-search-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  hostSearchAction?.().catch((error) => status(message(error)));
+});
+$('library-button').addEventListener('click', () => {
+  if (workspace.dataset.view !== 'hosts') selectTab();
+  $('host-search').focus({ preventScroll: true });
+});
 $('tag-filter').addEventListener('change', renderHosts);
 $('all-hosts').addEventListener('click', () => openGroup(''));
 $('import-hosts').addEventListener('click', () => importHosts().catch((error) => status(message(error))));
@@ -2119,19 +2477,32 @@ if (api.chrome) {
   });
 }
 $('unlock-form').querySelector('.settings-icon').replaceWith(settingsIcon('lock'));
-$('unlock-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const submit = event.submitter;
-  submit.disabled = true;
+async function unlockVault(request) {
+  const submit = $('unlock-submit');
+  const touchId = $('unlock-touch-id');
+  if (submit.disabled) return;
+  submit.disabled = touchId.disabled = true;
   $('unlock-error').textContent = '';
-  const secret = $('unlock-secret');
   try {
-    applyVaultState(await api.vault.unlock({ secret: secret.value, useRecovery: $('unlock-mode').value === 'recovery' }));
+    applyVaultState(await api.vault.unlock(request));
+    $('unlock-secret').value = '';
     await refreshHosts();
     selectTab(active, workspace.dataset.view);
-  } catch (error) { $('unlock-error').textContent = message(error); }
-  finally { submit.disabled = false; secret.value = ''; }
+  } catch (error) {
+    $('unlock-error').textContent = message(error);
+    if (request.useTouchId) void refreshTouchIdAvailability();
+  } finally {
+    submit.disabled = touchId.disabled = false;
+    if (!request.useTouchId) $('unlock-secret').value = '';
+    if (vaultStatus.locked) $('unlock-secret').focus();
+  }
+}
+$('unlock-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  void unlockVault({ secret: $('unlock-secret').value, useRecovery: $('unlock-mode').value === 'recovery' });
 });
+$('unlock-touch-id').addEventListener('click', () => { void unlockVault({ useTouchId: true }); });
+window.addEventListener('focus', refreshTouchIdAvailability);
 let lastActivity = 0;
 for (const type of ['pointerdown', 'keydown', 'wheel']) {
   window.addEventListener(type, () => {
@@ -2170,6 +2541,18 @@ function openGlobalSearch() {
   else void openPalette().catch((error) => status(message(error)));
 }
 
+function wireSearchChoices(region, search, results, selector) {
+  region.addEventListener('keydown', (event) => {
+    if (event.isComposing || event.metaKey || event.ctrlKey || event.altKey || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+    const choices = [search, ...results.querySelectorAll(selector)];
+    const index = choices.indexOf(event.target);
+    if (index === -1 || choices.length < 2) return;
+    event.preventDefault();
+    const step = event.key === 'ArrowDown' ? 1 : -1;
+    choices[(index + step + choices.length) % choices.length].focus();
+  });
+}
+
 function wireTabSearch(formId, resultsId) {
   const form = $(formId);
   const search = form.querySelector('input');
@@ -2178,15 +2561,7 @@ function wireTabSearch(formId, resultsId) {
     event.preventDefault();
     results.querySelector('.tab-choice')?.click();
   });
-  form.parentElement.addEventListener('keydown', (event) => {
-    if (event.isComposing || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
-    const choices = [search, ...results.querySelectorAll('.tab-choice')];
-    const index = choices.indexOf(event.target);
-    if (index === -1 || choices.length < 2) return;
-    event.preventDefault();
-    const step = event.key === 'ArrowDown' ? 1 : -1;
-    choices[(index + step + choices.length) % choices.length].focus();
-  });
+  wireSearchChoices(form.parentElement, search, results, '.tab-choice');
 }
 
 wireTabSearch('quick-connect-form', 'quick-connect-results');
@@ -2239,7 +2614,25 @@ $('close-find').addEventListener('click', () => {
   focusTerminal(active);
 });
 window.addEventListener('keydown', (event) => {
-  if (!event.metaKey || event.isComposing || dialog.open || $('key-dialog').open || sessionSwitcher.open || vaultStatus.locked) return;
+  if (event.defaultPrevented || event.isComposing || dialog.open || $('key-dialog').open || sessionSwitcher.open || vaultStatus.locked || hostMenu) return;
+  if (event.key === 'Escape' && !$('terminal-find').hidden) { event.preventDefault(); $('close-find').click(); return; }
+  if (!event.metaKey || event.ctrlKey || event.altKey) return;
+  const key = event.key.toLowerCase();
+  if (key === 't' && !event.shiftKey) { event.preventDefault(); void addNewTab(); return; }
+  if (key === 'w' && !event.shiftKey && active) { event.preventDefault(); void closeTab(active).catch((error) => status(message(error))); return; }
+  if (!event.shiftKey && /^[1-9]$/.test(key)) {
+    const tab = [...tabs.values()][Number(key) - 1];
+    if (tab) { event.preventDefault(); selectTab(tab); }
+    return;
+  }
+  if (event.shiftKey && ['BracketLeft', 'BracketRight'].includes(event.code) && tabs.size) {
+    event.preventDefault();
+    const entries = [...tabs.values()];
+    const index = entries.indexOf(active);
+    const step = event.code === 'BracketRight' ? 1 : -1;
+    selectTab(entries[(index + step + entries.length) % entries.length]);
+    return;
+  }
   if (event.key.toLowerCase() === 'k') { event.preventDefault(); openGlobalSearch(); }
   if (event.key.toLowerCase() === 'j' && tabs.size > 1) { event.preventDefault(); chooseSession(); }
   if (event.key.toLowerCase() === 'f' && active?.terminal) { event.preventDefault(); $('terminal-find').hidden = false; $('terminal-find').querySelector('input').focus(); }

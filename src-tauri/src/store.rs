@@ -1,5 +1,5 @@
 use crate::{
-    error, ssh,
+    error, ssh, startup_unlock,
     vault::{self, Envelope, Header, Key, MAX_DOCUMENT},
 };
 use serde::{Deserialize, Serialize};
@@ -197,6 +197,19 @@ pub struct GitMigration {
     pub commit: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LockSettings {
+    pub auto_lock_minutes: Option<u32>,
+}
+impl Default for LockSettings {
+    fn default() -> Self {
+        Self {
+            auto_lock_minutes: Some(15),
+        }
+    }
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Data {
@@ -205,6 +218,7 @@ pub struct Data {
     pub recent: BTreeMap<Uuid, u64>,
     pub local_passwords: BTreeMap<Uuid, LocalPassword>,
     pub portable_passwords: BTreeMap<Uuid, Password>,
+    pub lock_settings: LockSettings,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub transfer_history: Vec<Value>,
     pub sync: Option<Binding>,
@@ -302,6 +316,8 @@ pub struct Store {
     pub data: Option<Data>,
     pub envelope: Option<Envelope>,
     pub key: Option<Key>,
+    pub startup_unlock: Option<startup_unlock::Credential>,
+    startup_unlock_error: Option<String>,
     pub epoch: u64,
     pub revision: u64,
 }
@@ -314,6 +330,8 @@ impl Store {
             data: None,
             envelope: None,
             key: None,
+            startup_unlock: None,
+            startup_unlock_error: None,
             epoch: 0,
             revision: 0,
         };
@@ -338,10 +356,53 @@ impl Store {
         } else {
             store.data = Some(Data::default());
         }
+        if let Some(envelope) = store.envelope.as_ref() {
+            store.startup_unlock = vault::bounded_read(&store.startup_unlock_path(), 4096)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<startup_unlock::Credential>(&bytes).ok())
+                .filter(|credential| credential.vault_id == envelope.header.id);
+            if let Some(credential) = &store.startup_unlock {
+                let unlocked = credential
+                    .account(&store.startup_unlock_path())
+                    .and_then(|account| startup_unlock::read(&account))
+                    .and_then(|key| {
+                        envelope
+                            .decode::<Data>(&key, "local")
+                            .map(|data| (key, data))
+                    });
+                match unlocked {
+                    Ok((key, data)) => store.unlock(key, data),
+                    Err(_) => store.startup_unlock_error = Some(startup_unlock::FAILED.into()),
+                }
+            }
+        }
         Ok(store)
     }
     pub fn data(&self) -> Result<&Data, String> {
         self.data.as_ref().ok_or("请先解锁保险库。".into())
+    }
+    pub fn touch_id_path(&self) -> Option<PathBuf> {
+        let id = self.envelope.as_ref()?.header.id;
+        Some(self.file.with_file_name(format!("touch-id-{id}.json")))
+    }
+    pub fn startup_unlock_path(&self) -> PathBuf {
+        self.file.with_file_name("startup-unlock.json")
+    }
+    pub fn set_startup_unlock(
+        &mut self,
+        credential: Option<startup_unlock::Credential>,
+    ) -> Result<(), String> {
+        let path = self.startup_unlock_path();
+        if let Some(credential) = &credential {
+            write_atomic(&path, &serde_json::to_vec(credential).map_err(error)?)?;
+        } else if let Err(err) = fs::remove_file(&path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(error(err));
+            }
+        }
+        self.startup_unlock = credential;
+        self.startup_unlock_error = None;
+        Ok(())
     }
     pub fn status(&self) -> Value {
         let sync = self.data.as_ref().and_then(|data| data.sync.as_ref());
@@ -352,6 +413,11 @@ impl Store {
         json!({
             "enabled": self.envelope.is_some(),
             "locked": self.data.is_none(),
+            "touchIdEnabled": cfg!(target_os = "macos") && self.touch_id_path().is_some_and(|path| path.is_file()),
+            "startupUnlockSupported": cfg!(target_os = "macos"),
+            "startupUnlockRequired": self.startup_unlock.is_none(),
+            "startupUnlockError": self.startup_unlock_error,
+            "autoLockMinutes": self.data.as_ref().map(|data| data.lock_settings.auto_lock_minutes).unwrap_or(Some(15)),
             "remote": sync.map(|s| s.remote.as_str()).unwrap_or(""),
             "branch": sync.map(|s| s.branch.as_str()),
             "gitSsh": cfg!(desktop),
@@ -364,14 +430,7 @@ impl Store {
         if bytes.len() as u64 > MAX_DOCUMENT {
             return Err("工作区文件超过大小上限。".into());
         }
-        let mut tmp =
-            tempfile::NamedTempFile::new_in(self.file.parent().ok_or("工作区路径无效。")?)
-                .map_err(error)?;
-        tmp.write_all(bytes)
-            .and_then(|()| tmp.as_file().sync_all())
-            .map_err(error)?;
-        tmp.persist(&self.file).map_err(error)?;
-        Ok(())
+        write_atomic(&self.file, bytes)
     }
     fn forget_removed_passwords(&self, new: &Data) {
         if let Some(old) = &self.data {
@@ -415,6 +474,7 @@ impl Store {
     pub fn unlock(&mut self, key: Key, data: Data) {
         self.key = Some(key);
         self.data = Some(data);
+        self.startup_unlock_error = None;
         self.epoch += 1;
     }
     pub fn lock(&mut self) -> bool {
@@ -431,6 +491,16 @@ impl Store {
         }
         Ok(())
     }
+}
+
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut tmp =
+        tempfile::NamedTempFile::new_in(path.parent().ok_or("工作区路径无效。")?).map_err(error)?;
+    tmp.write_all(bytes)
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(error)?;
+    tmp.persist(path).map_err(error)?;
+    Ok(())
 }
 
 pub fn write_exclusive(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {

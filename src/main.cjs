@@ -250,7 +250,10 @@ const tickets = new Map();
 let droppedFiles;
 const defaultKeyDirectory = path.join(os.homedir(), '.ssh');
 const keyDirectories = new Set([defaultKeyDirectory]);
-const idleDuration = 15 * 60_000;
+function autoLockMinutes() {
+  const { autoLockMinutes: minutes = 15 } = store.data?.lockSettings || {};
+  return minutes;
+}
 let lastActivity = Date.now();
 let syncTask;
 let pendingConflict;
@@ -329,6 +332,7 @@ function vaultState() {
   const migration = store.data?.gitMigration;
   return {
     enabled: Boolean(store.envelope), locked: !store.data, remote: sync?.remote || '',
+    autoLockMinutes: autoLockMinutes(),
     branch: sync ? sync.branch ?? defaultBranch : undefined,
     lastSynced: sync?.lastSynced,
     gitMigration: migration ? { remote: migration.remote, branch: migration.branch } : undefined
@@ -595,6 +599,14 @@ function registerVaultHandlers() {
     return vaultState();
   });
   handle('vault:lock', lockVault);
+  handle('vault:set-auto-lock', (minutes) => {
+    if (!store.key) throw new Error('请先启用并解锁保险库。');
+    if (minutes !== null && (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440)) {
+      throw new Error('自动锁定时间须为 1–1440 分钟，或关闭自动锁定。');
+    }
+    store.update({ ...store.data, lockSettings: { ...store.data.lockSettings, autoLockMinutes: minutes } });
+    return vaultState();
+  });
   handle('vault:unlock', async ({ secret, useRecovery }) => {
     if (store.data || !store.envelope) return vaultState();
     const envelope = store.envelope;
@@ -797,7 +809,10 @@ async function launch() {
   ssh = new WorkspaceSSH(store, emit);
   transfers = new Transfers(ssh, publishTransfer);
   registerHandlers();
-  setInterval(() => { if (store.key && Date.now() - lastActivity >= idleDuration) lockVault(); }, 5_000).unref();
+  setInterval(() => {
+    const minutes = autoLockMinutes();
+    if (store.key && minutes !== null && Date.now() - lastActivity >= minutes * 60_000) lockVault();
+  }, 5_000).unref();
   createWindow();
   app.on('activate', () => { if (!window) createWindow(); });
 }

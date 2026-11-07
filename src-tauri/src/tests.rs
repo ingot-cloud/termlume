@@ -79,6 +79,198 @@ async fn call(ws: &Workspace, name: &str, value: Value) -> Value {
         .await
         .unwrap_or_else(|e| panic!("{name}: {e}"))
 }
+
+#[tokio::test]
+async fn invalid_touch_id_credential_leaves_vault_locked_and_can_be_removed() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let password = "workspace test password";
+    let state = call(
+        &ws,
+        "vault:enable",
+        json!({"password": password, "recovery": vault::recovery_code()}),
+    )
+    .await;
+    assert_eq!(state["touchIdEnabled"], false);
+    let path = ws.store.lock().unwrap().touch_id_path().unwrap();
+    store::write_atomic(&path, b"invalid credential").unwrap();
+    drop(ws);
+
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert!(dispatch(&ws, "vault:set-touch-id", json!(false)).await.is_err());
+    assert!(dispatch(&ws, "vault:unlock", json!({"useTouchId":true})).await.is_err());
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
+
+    call(&ws, "vault:unlock", json!({"secret":password})).await;
+    let state = call(&ws, "vault:set-touch-id", json!(false)).await;
+    assert_eq!(state["touchIdEnabled"], false);
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn auto_lock_settings_respect_activity_and_survive_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let legacy: Data = serde_json::from_value(json!({"hosts":[],"fingerprints":[]})).unwrap();
+    assert_eq!(legacy.lock_settings.auto_lock_minutes, Some(15));
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["autoLockMinutes"], 15);
+    assert!(dispatch(&ws, "vault:set-auto-lock", json!(5)).await.is_err());
+    let password = "test1234";
+    call(
+        &ws,
+        "vault:enable",
+        json!({"password":password,"recovery":vault::recovery_code()}),
+    )
+    .await;
+    for invalid in [json!(0), json!(1441), json!(-1), json!(1.5), json!("5")] {
+        assert!(dispatch(&ws, "vault:set-auto-lock", invalid).await.is_err());
+    }
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["autoLockMinutes"], 15);
+    *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(14 * 60);
+    assert_eq!(ws.lock(true)["locked"], false);
+    let state = call(&ws, "vault:set-auto-lock", json!(5)).await;
+    assert_eq!(state["autoLockMinutes"], 5);
+    assert_eq!(ws.lock(true)["locked"], false);
+    *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(5 * 60 - 1);
+    assert_eq!(ws.lock(true)["locked"], false);
+    *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(5 * 60);
+    assert_eq!(ws.lock(true)["locked"], true);
+    call(&ws, "vault:unlock", json!({"secret":password})).await;
+    call(&ws, "vault:set-auto-lock", Value::Null).await;
+    *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(2 * 24 * 60 * 60);
+    assert_eq!(ws.lock(true)["locked"], false);
+    {
+        let store = ws.store.lock().unwrap();
+        let snapshot = serde_json::to_value(git::Snapshot {
+            hosts: store.data().unwrap().snapshot(),
+            parent_commit: None,
+        }).unwrap();
+        assert!(snapshot.get("lockSettings").is_none());
+        assert!(snapshot.get("autoLockMinutes").is_none());
+    }
+    let document = std::fs::read_to_string(profile.path().join("workspace.json")).unwrap();
+    assert!(!document.contains("lockSettings"));
+    assert_eq!(call(&ws, "vault:lock", Value::Null).await["locked"], true);
+    assert!(dispatch(&ws, "vault:set-auto-lock", json!(1)).await.is_err());
+    drop(ws);
+
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    let state = call(&ws, "vault:unlock", json!({"secret":password})).await;
+    assert!(state["autoLockMinutes"].is_null());
+    call(&ws, "vault:set-auto-lock", json!(1440)).await;
+    *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(1440 * 60 - 1);
+    assert_eq!(ws.lock(true)["locked"], false);
+    call(&ws, "vault:set-auto-lock", json!(1)).await;
+    *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+    call(&ws, "vault:activity", Value::Null).await;
+    assert_eq!(ws.lock(true)["locked"], false);
+    drop(ws);
+
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    let state = call(&ws, "vault:unlock", json!({"secret":password})).await;
+    assert_eq!(state["autoLockMinutes"], 1);
+    *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+    assert_eq!(ws.lock(true)["locked"], true);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires the macOS login keychain"]
+async fn startup_unlock_preserves_encryption_and_is_local_to_the_workspace() {
+    struct SavedKey(String);
+    impl Drop for SavedKey {
+        fn drop(&mut self) {
+            let _ = startup_unlock::delete(&self.0);
+        }
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let password = "test1234";
+    let recovery = vault::recovery_code();
+    let hosts = call(
+        &ws,
+        "hosts:save",
+        json!({"name":"private startup fixture","address":"private.example.test","username":"ops","port":22,"auth":"agent"}),
+    )
+    .await;
+    let state = call(
+        &ws,
+        "vault:enable",
+        json!({"password":password,"recovery":recovery}),
+    )
+    .await;
+    assert_eq!(state["startupUnlockRequired"], true);
+    let original = std::fs::read(profile.path().join("workspace.json")).unwrap();
+    let state = call(&ws, "vault:set-startup-unlock", json!(false)).await;
+    assert_eq!(state["startupUnlockRequired"], false);
+    let (settings, account) = {
+        let store = ws.store.lock().unwrap();
+        let settings = store.startup_unlock_path();
+        let account = store.startup_unlock.as_ref().unwrap().account(&settings).unwrap();
+        let snapshot = git::Snapshot { hosts: store.data().unwrap().snapshot(), parent_commit: None };
+        let envelope = vault::encode(
+            store.key.as_ref().unwrap(),
+            &store.envelope.as_ref().unwrap().header,
+            "portable",
+            &snapshot,
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&envelope).unwrap();
+        assert!(!encoded.contains("private startup fixture"));
+        assert!(!encoded.contains("private.example.test"));
+        assert!(envelope.unlock::<git::Snapshot>(password, false, "portable").is_ok());
+        assert!(envelope.unlock::<git::Snapshot>(&recovery, true, "portable").is_ok());
+        (settings, account)
+    };
+    let _cleanup = SavedKey(account.clone());
+    assert_eq!(std::fs::read(profile.path().join("workspace.json")).unwrap(), original);
+    let preferences = std::fs::read_to_string(&settings).unwrap();
+    assert!(!preferences.contains(password));
+    assert!(!preferences.contains("private startup fixture"));
+    drop(ws);
+
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], false);
+    assert_eq!(call(&ws, "hosts:list", Value::Null).await, hosts);
+    call(&ws, "vault:lock", Value::Null).await;
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
+    assert!(dispatch(&ws, "vault:set-startup-unlock", json!(true)).await.is_err());
+
+    let copied = tempfile::tempdir().unwrap();
+    std::fs::copy(profile.path().join("workspace.json"), copied.path().join("workspace.json")).unwrap();
+    std::fs::copy(&settings, copied.path().join("startup-unlock.json")).unwrap();
+    let other = Workspace::new(copied.path().into(), home.path().into(), None).unwrap();
+    let state = call(&other, "vault:state", Value::Null).await;
+    assert_eq!(state["locked"], true);
+    assert!(state["startupUnlockError"].is_string());
+
+    startup_unlock::delete(&account).unwrap();
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    let state = call(&ws, "vault:state", Value::Null).await;
+    assert_eq!(state["locked"], true);
+    assert_eq!(state["startupUnlockRequired"], false);
+    assert!(state["startupUnlockError"].is_string());
+    let state = call(&ws, "vault:unlock", json!({"secret":password})).await;
+    assert!(state["startupUnlockError"].is_null());
+    let state = call(&ws, "vault:set-startup-unlock", json!(true)).await;
+    assert_eq!(state["startupUnlockRequired"], true);
+    assert!(!settings.exists());
+
+    call(&ws, "vault:set-startup-unlock", json!(false)).await;
+    let account = {
+        let store = ws.store.lock().unwrap();
+        store.startup_unlock.as_ref().unwrap().account(&settings).unwrap()
+    };
+    let _cleanup = SavedKey(account.clone());
+    call(&ws, "vault:set-startup-unlock", json!(true)).await;
+    assert!(startup_unlock::read(&account).is_err());
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
+}
+
 async fn connect_tab(
     ws: &Workspace,
     rx: &mut mpsc::UnboundedReceiver<Value>,
@@ -111,10 +303,18 @@ async fn vault_and_host_requests_round_trip() {
     assert_eq!(hosts[0]["address"], "::1");
     assert_eq!(hosts[0]["tags"], json!(["one"]));
     let recovery = call(&ws, "vault:recovery-code", Value::Null).await;
+    let rejected = dispatch(
+        &ws,
+        "vault:enable",
+        json!({"password":"vault12", "recovery":recovery}),
+    )
+    .await
+    .unwrap_err();
+    assert!(rejected.contains("至少需要 8 个字符"));
     call(
         &ws,
         "vault:enable",
-        json!({"password":"workspace test password", "recovery":recovery}),
+        json!({"password":"vault123", "recovery":recovery}),
     )
     .await;
     call(&ws, "vault:lock", Value::Null).await;
@@ -122,6 +322,9 @@ async fn vault_and_host_requests_round_trip() {
     assert!(dispatch(&ws, "vault:unlock", json!({"secret":"bad"}))
         .await
         .is_err());
+    call(&ws, "vault:unlock", json!({"secret":"vault123"})).await;
+    assert_eq!(call(&ws, "hosts:list", Value::Null).await, hosts);
+    call(&ws, "vault:lock", Value::Null).await;
     call(
         &ws,
         "vault:unlock",

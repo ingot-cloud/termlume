@@ -29,7 +29,8 @@ test('encrypted OpenSSH keys can be found and existing files survive generation 
 
 test('portable vaults reject invalid credentials and altered ciphertext', async () => {
   const recovery = recoveryCode();
-  const password = 'temporary vault test password';
+  const password = 'vault123';
+  await assert.rejects(createVault('vault12', recovery), /至少需要 8 个字符/);
   const { key, header } = await createVault(password, recovery);
   const data = { hosts: [{ name: 'private name', password: 'private password' }] };
   try {

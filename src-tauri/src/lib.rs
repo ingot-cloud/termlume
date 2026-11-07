@@ -17,9 +17,11 @@ mod git;
 mod git_https;
 mod keys;
 mod ssh;
+mod startup_unlock;
 mod store;
 #[cfg(test)]
 mod tests;
+mod touch_id;
 #[cfg(desktop)]
 mod transfer;
 mod vault;
@@ -43,6 +45,7 @@ struct Inner {
     #[cfg(desktop)]
     transfers: transfer::Transfers,
     sync_gate: tokio::sync::Mutex<()>,
+    unlock_gate: tokio::sync::Mutex<()>,
     sync_cancel: Mutex<Option<CancellationToken>>,
     conflict: Mutex<Option<git::Conflict>>,
     last_activity: Mutex<Instant>,
@@ -70,6 +73,7 @@ impl Workspace {
             #[cfg(desktop)]
             transfers: Default::default(),
             sync_gate: Default::default(),
+            unlock_gate: Default::default(),
             sync_cancel: Mutex::default(),
             conflict: Mutex::default(),
             last_activity: Mutex::new(Instant::now()),
@@ -105,9 +109,19 @@ impl Workspace {
     }
     fn lock(&self, idle_only: bool) -> Value {
         let mut store = self.store.lock().unwrap();
-        if idle_only && self.last_activity.lock().unwrap().elapsed() < Duration::from_secs(15 * 60)
-        {
-            return store.status();
+        if idle_only {
+            let Some(minutes) = store
+                .data
+                .as_ref()
+                .and_then(|data| data.lock_settings.auto_lock_minutes)
+            else {
+                return store.status();
+            };
+            if self.last_activity.lock().unwrap().elapsed()
+                < Duration::from_secs(u64::from(minutes) * 60)
+            {
+                return store.status();
+            }
         }
         if store.lock() {
             #[cfg(desktop)]
@@ -216,6 +230,9 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
     if name == "vault:unlock" {
         return unlock(ws, value).await;
     }
+    if name == "vault:touch-id-available" {
+        return blocking(|| Ok(json!(touch_id::available()))).await;
+    }
     ws.store.lock().unwrap().data()?;
     if !matches!(name, "ssh:resize" | "ssh:input") {
         *ws.last_activity.lock().unwrap() = Instant::now();
@@ -230,6 +247,22 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             blocking(move || keys::copy(&code)).await?;
         }
         "vault:enable" => return enable(ws, value).await,
+        "vault:set-touch-id" => return set_touch_id(ws, parse(value)?).await,
+        "vault:set-startup-unlock" => return set_startup_unlock(ws, parse(value)?).await,
+        "vault:set-auto-lock" => {
+            let minutes: Option<u32> = parse(value)?;
+            if minutes.is_some_and(|minutes| !(1..=1440).contains(&minutes)) {
+                return Err("自动锁定时间须为 1–1440 分钟，或关闭自动锁定。".into());
+            }
+            let mut store = ws.store.lock().unwrap();
+            if store.key.is_none() {
+                return Err("请先启用并解锁保险库。".into());
+            }
+            let mut data = store.data()?.clone();
+            data.lock_settings.auto_lock_minutes = minutes;
+            store.update(data)?;
+            return Ok(store.status());
+        }
         #[cfg(desktop)]
         "vault:export" => return export(ws).await,
         #[cfg(desktop)]
@@ -569,22 +602,117 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
 }
 
 async fn unlock(ws: &Workspace, value: Value) -> Result<Value, String> {
-    let (envelope, epoch) = {
+    let use_touch_id = flag(&value, "useTouchId");
+    let _prompt = use_touch_id
+        .then(|| ws.unlock_gate.try_lock())
+        .transpose()
+        .map_err(|_| "触控 ID 操作正在进行。")?;
+    let (envelope, epoch, touch_id_path) = {
         let store = ws.store.lock().unwrap();
         if store.data.is_some() {
             return Ok(store.status());
         }
-        (store.envelope.clone().ok_or("保险库不存在。")?, store.epoch)
+        (
+            store.envelope.clone().ok_or("保险库不存在。")?,
+            store.epoch,
+            store.touch_id_path(),
+        )
     };
-    let secret = Zeroizing::new(string(&value["secret"])?.to_owned());
-    let recovery = flag(&value, "useRecovery");
-    let (key, data) = blocking(move || envelope.unlock::<Data>(&secret, recovery, "local")).await?;
+    let (key, data) = if use_touch_id {
+        blocking(move || {
+            let path = touch_id_path.ok_or(touch_id::UNLOCK_FAILED)?;
+            let credential = vault::bounded_read(&path, touch_id::MAX_CREDENTIAL)
+                .map_err(|_| touch_id::UNLOCK_FAILED)?;
+            let key = touch_id::open(&credential)?;
+            let data = envelope
+                .decode::<Data>(&key, "local")
+                .map_err(|_| touch_id::UNLOCK_FAILED)?;
+            Ok((key, data))
+        })
+        .await?
+    } else {
+        let secret = Zeroizing::new(string(&value["secret"])?.to_owned());
+        let recovery = flag(&value, "useRecovery");
+        blocking(move || envelope.unlock::<Data>(&secret, recovery, "local")).await?
+    };
     let mut store = ws.store.lock().unwrap();
     if store.epoch == epoch && store.data.is_none() {
         store.unlock(key, data);
     }
+    store.data()?;
     *ws.last_activity.lock().unwrap() = Instant::now();
     Ok(store.status())
+}
+async fn set_touch_id(ws: &Workspace, enabled: bool) -> Result<Value, String> {
+    let _prompt = ws
+        .unlock_gate
+        .try_lock()
+        .map_err(|_| "触控 ID 操作正在进行。")?;
+    let (path, key, epoch) = {
+        let store = ws.store.lock().unwrap();
+        let key = store.key.as_ref().ok_or("请先启用并解锁保险库。")?;
+        let path = store.touch_id_path().ok_or("保险库不存在。")?;
+        (path, enabled.then(|| key.clone()), store.epoch)
+    };
+    let credential = match key {
+        Some(key) => Some(blocking(move || touch_id::enroll(&key)).await?),
+        None => None,
+    };
+    let store = ws.store.lock().unwrap();
+    ensure_epoch(&store, epoch)?;
+    if let Some(credential) = credential {
+        store::write_atomic(&path, &credential)?;
+    } else if let Err(err) = std::fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(error(err));
+        }
+    }
+    Ok(store.status())
+}
+async fn set_startup_unlock(ws: &Workspace, required: bool) -> Result<Value, String> {
+    let _permit = ws
+        .unlock_gate
+        .try_lock()
+        .map_err(|_| "已有解锁设置正在处理，请稍候。")?;
+    let (saved, path, key, epoch, vault_id) = {
+        let store = ws.store.lock().unwrap();
+        let key = store.key.as_ref().ok_or("请先启用并解锁保险库。")?;
+        if required == store.startup_unlock.is_none() {
+            return Ok(store.status());
+        }
+        (
+            store.startup_unlock.clone(),
+            store.startup_unlock_path(),
+            (!required).then(|| key.clone()),
+            store.epoch,
+            store.envelope.as_ref().ok_or("保险库不存在。")?.header.id,
+        )
+    };
+    if let Some(saved) = saved {
+        let account = saved.account(&path)?;
+        blocking(move || startup_unlock::delete(&account)).await?;
+        let mut store = ws.store.lock().unwrap();
+        store.set_startup_unlock(None)?;
+        return Ok(store.status());
+    }
+    let credential = startup_unlock::Credential {
+        vault_id,
+        token: Uuid::new_v4(),
+    };
+    let account = credential.account(&path)?;
+    let saved_account = account.clone();
+    let key = key.ok_or("请先解锁保险库。")?;
+    blocking(move || startup_unlock::save(&saved_account, &key)).await?;
+    let result = {
+        let mut store = ws.store.lock().unwrap();
+        ensure_epoch(&store, epoch)
+            .and_then(|()| store.set_startup_unlock(Some(credential)))
+            .map(|()| store.status())
+    };
+    if result.is_err() {
+        let _ = blocking(move || startup_unlock::delete(&account)).await;
+    }
+    result
 }
 async fn enable(ws: &Workspace, value: Value) -> Result<Value, String> {
     if ws.store.lock().unwrap().envelope.is_some() {
