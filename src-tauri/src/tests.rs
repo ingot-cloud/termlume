@@ -97,8 +97,12 @@ async fn invalid_touch_id_credential_leaves_vault_locked_and_can_be_removed() {
     drop(ws);
 
     let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
-    assert!(dispatch(&ws, "vault:set-touch-id", json!(false)).await.is_err());
-    assert!(dispatch(&ws, "vault:unlock", json!({"useTouchId":true})).await.is_err());
+    assert!(dispatch(&ws, "vault:set-touch-id", json!(false))
+        .await
+        .is_err());
+    assert!(dispatch(&ws, "vault:unlock", json!({"useTouchId":true}))
+        .await
+        .is_err());
     assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
 
     call(&ws, "vault:unlock", json!({"secret":password})).await;
@@ -113,8 +117,13 @@ async fn auto_lock_settings_respect_activity_and_survive_restart() {
     let (profile, ws) = make_workspace(home.path(), None);
     let legacy: Data = serde_json::from_value(json!({"hosts":[],"fingerprints":[]})).unwrap();
     assert_eq!(legacy.lock_settings.auto_lock_minutes, Some(15));
-    assert_eq!(call(&ws, "vault:state", Value::Null).await["autoLockMinutes"], 15);
-    assert!(dispatch(&ws, "vault:set-auto-lock", json!(5)).await.is_err());
+    assert_eq!(
+        call(&ws, "vault:state", Value::Null).await["autoLockMinutes"],
+        15
+    );
+    assert!(dispatch(&ws, "vault:set-auto-lock", json!(5))
+        .await
+        .is_err());
     let password = "test1234";
     call(
         &ws,
@@ -125,7 +134,10 @@ async fn auto_lock_settings_respect_activity_and_survive_restart() {
     for invalid in [json!(0), json!(1441), json!(-1), json!(1.5), json!("5")] {
         assert!(dispatch(&ws, "vault:set-auto-lock", invalid).await.is_err());
     }
-    assert_eq!(call(&ws, "vault:state", Value::Null).await["autoLockMinutes"], 15);
+    assert_eq!(
+        call(&ws, "vault:state", Value::Null).await["autoLockMinutes"],
+        15
+    );
     *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(14 * 60);
     assert_eq!(ws.lock(true)["locked"], false);
     let state = call(&ws, "vault:set-auto-lock", json!(5)).await;
@@ -144,14 +156,17 @@ async fn auto_lock_settings_respect_activity_and_survive_restart() {
         let snapshot = serde_json::to_value(git::Snapshot {
             hosts: store.data().unwrap().snapshot(),
             parent_commit: None,
-        }).unwrap();
+        })
+        .unwrap();
         assert!(snapshot.get("lockSettings").is_none());
         assert!(snapshot.get("autoLockMinutes").is_none());
     }
     let document = std::fs::read_to_string(profile.path().join("workspace.json")).unwrap();
     assert!(!document.contains("lockSettings"));
     assert_eq!(call(&ws, "vault:lock", Value::Null).await["locked"], true);
-    assert!(dispatch(&ws, "vault:set-auto-lock", json!(1)).await.is_err());
+    assert!(dispatch(&ws, "vault:set-auto-lock", json!(1))
+        .await
+        .is_err());
     drop(ws);
 
     let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
@@ -207,8 +222,16 @@ async fn startup_unlock_preserves_encryption_and_is_local_to_the_workspace() {
     let (settings, account) = {
         let store = ws.store.lock().unwrap();
         let settings = store.startup_unlock_path();
-        let account = store.startup_unlock.as_ref().unwrap().account(&settings).unwrap();
-        let snapshot = git::Snapshot { hosts: store.data().unwrap().snapshot(), parent_commit: None };
+        let account = store
+            .startup_unlock
+            .as_ref()
+            .unwrap()
+            .account(&settings)
+            .unwrap();
+        let snapshot = git::Snapshot {
+            hosts: store.data().unwrap().snapshot(),
+            parent_commit: None,
+        };
         let envelope = vault::encode(
             store.key.as_ref().unwrap(),
             &store.envelope.as_ref().unwrap().header,
@@ -219,12 +242,19 @@ async fn startup_unlock_preserves_encryption_and_is_local_to_the_workspace() {
         let encoded = serde_json::to_string(&envelope).unwrap();
         assert!(!encoded.contains("private startup fixture"));
         assert!(!encoded.contains("private.example.test"));
-        assert!(envelope.unlock::<git::Snapshot>(password, false, "portable").is_ok());
-        assert!(envelope.unlock::<git::Snapshot>(&recovery, true, "portable").is_ok());
+        assert!(envelope
+            .unlock::<git::Snapshot>(password, false, "portable")
+            .is_ok());
+        assert!(envelope
+            .unlock::<git::Snapshot>(&recovery, true, "portable")
+            .is_ok());
         (settings, account)
     };
     let _cleanup = SavedKey(account.clone());
-    assert_eq!(std::fs::read(profile.path().join("workspace.json")).unwrap(), original);
+    assert_eq!(
+        std::fs::read(profile.path().join("workspace.json")).unwrap(),
+        original
+    );
     let preferences = std::fs::read_to_string(&settings).unwrap();
     assert!(!preferences.contains(password));
     assert!(!preferences.contains("private startup fixture"));
@@ -235,10 +265,16 @@ async fn startup_unlock_preserves_encryption_and_is_local_to_the_workspace() {
     assert_eq!(call(&ws, "hosts:list", Value::Null).await, hosts);
     call(&ws, "vault:lock", Value::Null).await;
     assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
-    assert!(dispatch(&ws, "vault:set-startup-unlock", json!(true)).await.is_err());
+    assert!(dispatch(&ws, "vault:set-startup-unlock", json!(true))
+        .await
+        .is_err());
 
     let copied = tempfile::tempdir().unwrap();
-    std::fs::copy(profile.path().join("workspace.json"), copied.path().join("workspace.json")).unwrap();
+    std::fs::copy(
+        profile.path().join("workspace.json"),
+        copied.path().join("workspace.json"),
+    )
+    .unwrap();
     std::fs::copy(&settings, copied.path().join("startup-unlock.json")).unwrap();
     let other = Workspace::new(copied.path().into(), home.path().into(), None).unwrap();
     let state = call(&other, "vault:state", Value::Null).await;
@@ -261,7 +297,12 @@ async fn startup_unlock_preserves_encryption_and_is_local_to_the_workspace() {
     call(&ws, "vault:set-startup-unlock", json!(false)).await;
     let account = {
         let store = ws.store.lock().unwrap();
-        store.startup_unlock.as_ref().unwrap().account(&settings).unwrap()
+        store
+            .startup_unlock
+            .as_ref()
+            .unwrap()
+            .account(&settings)
+            .unwrap()
     };
     let _cleanup = SavedKey(account.clone());
     call(&ws, "vault:set-startup-unlock", json!(true)).await;
@@ -655,6 +696,9 @@ async fn macos_transport_migration_and_sync() {
         .decode(ws.store.lock().unwrap().key.as_ref().unwrap(), "local")
         .unwrap();
     assert_eq!(json!(persisted.transfer_history), remaining);
+    let password_attempts_before = std::fs::read(fixture.join("password-attempts"))
+        .unwrap_or_default()
+        .len();
     let password_fixture: Value =
         serde_json::from_slice(&std::fs::read(fixture.join("password-server.json")).unwrap())
             .unwrap();
@@ -687,13 +731,23 @@ async fn macos_transport_migration_and_sync() {
         e["id"] == rejected.to_string() && e["type"] == "trust"
     })
     .await;
-    assert!(!fixture.join("password-attempts").exists());
+    assert_eq!(
+        std::fs::read(fixture.join("password-attempts"))
+            .unwrap_or_default()
+            .len(),
+        password_attempts_before
+    );
     call(&ws, "ssh:trust", json!({"id":rejected, "accepted":false})).await;
     until(&mut rx, |e| {
         e["id"] == rejected.to_string() && e["status"] == "closed"
     })
     .await;
-    assert!(!fixture.join("password-attempts").exists());
+    assert_eq!(
+        std::fs::read(fixture.join("password-attempts"))
+            .unwrap_or_default()
+            .len(),
+        password_attempts_before
+    );
     let offline_saved = connect_tab(&ws, &mut rx, &host3, "", true, false).await;
     call(&ws, "ssh:close", json!(offline_saved)).await;
     let mut renamed = host3.clone();
@@ -1009,4 +1063,368 @@ async fn macos_migrates_legacy_git_snapshot_and_resumes_after_push() {
     restore.as_object_mut().unwrap().remove("syncKey");
     let (_updated, updated) = make_workspace(&fixture, None);
     call(&updated, "vault:restore-git", restore).await;
+}
+
+#[tokio::test]
+async fn jump_routes_validate_references_and_survive_local_and_portable_data() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let legacy: Host = serde_json::from_value(json!({"address":"legacy.test"})).unwrap();
+    assert!(legacy.jump_host_id.is_none());
+    let jump = call(
+        &ws,
+        "hosts:save",
+        json!({"address":"jump.test","port":22,"username":"ops","auth":"agent"}),
+    )
+    .await[0]
+        .clone();
+    let mut target = json!({"address":"target.test","port":22,"username":"ops","auth":"password","jumpHostId":jump["id"]});
+    let host = call(&ws, "hosts:save", target.clone()).await[1].clone();
+    target["id"] = host["id"].clone();
+    for bad in [host["id"].clone(), json!(Uuid::new_v4())] {
+        target["jumpHostId"] = bad;
+        assert!(dispatch(&ws, "hosts:save", target.clone()).await.is_err());
+    }
+    let mut chain = jump.clone();
+    chain["jumpHostId"] = host["id"].clone();
+    assert!(dispatch(&ws, "hosts:save", chain).await.is_err());
+    assert!(dispatch(&ws, "hosts:delete", jump["id"].clone())
+        .await
+        .is_err());
+    assert!(dispatch(
+        &ws,
+        "ssh:connect",
+        json!({"id":Uuid::new_v4(),"expected":host,"secret":"target"})
+    )
+    .await
+    .is_err());
+    {
+        let data = ws.store.lock().unwrap().data().unwrap().clone();
+        let rows = data.snapshot();
+        assert!(serde_json::to_value(&rows)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == host["id"] && row["jumpHostId"] == jump["id"]));
+        let recovery = vault::recovery_code();
+        let (key, header) = vault::create("route test password", &recovery).unwrap();
+        let encrypted = vault::encode(&key, &header, "portable", &rows).unwrap();
+        let (_, decoded) = encrypted
+            .unlock::<Vec<store::Row>>("route test password", false, "portable")
+            .unwrap();
+        assert!(decoded == rows);
+    }
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(
+        call(&ws, "hosts:list", Value::Null).await[1]["jumpHostId"],
+        jump["id"]
+    );
+    // Sync can retain a deleted reference for repair; connection must fail closed.
+    let mut data = ws.store.lock().unwrap().data().unwrap().clone();
+    data.hosts
+        .retain(|h| h.id.to_string() != jump["id"].as_str().unwrap());
+    ws.store.lock().unwrap().update(data).unwrap();
+    assert!(dispatch(&ws, "ssh:connect", json!({"id":Uuid::new_v4(),"expected":host,"secret":"target","jump":{"expected":jump,"secret":""}})).await.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated localhost jump and OpenSSH fixtures"]
+async fn macos_jump_routes_gate_both_hosts_and_carry_all_channels() {
+    let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(), None);
+    let jump_port: Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("jump-server.json")).unwrap()).unwrap();
+    let password_port: Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("password-server.json")).unwrap())
+            .unwrap();
+    let target_port: u16 = std::fs::read_to_string(fixture.join("openssh-port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let jump = call(&ws, "hosts:save", json!({"name":"fixture jump","address":"127.0.0.1","port":jump_port["port"],"username":"jump","auth":"password"})).await[0].clone();
+    let target = call(&ws, "hosts:save", json!({"name":"private target","address":"target.internal.test","port":target_port,"username":std::env::var("USER").unwrap(),"auth":"agent","jumpHostId":jump["id"]})).await[1].clone();
+    let mut rx = events(&ws);
+    let canceled = Uuid::new_v4();
+    call(&ws,"ssh:connect",json!({"id":canceled,"expected":target,"secret":"","jump":{"expected":jump,"secret":"jump-only-secret"}})).await;
+    let pending = until(&mut rx, |e| {
+        e["type"] == "trust" && e["id"] == canceled.to_string()
+    })
+    .await;
+    call(
+        &ws,
+        "ssh:trust",
+        json!({"id":canceled,"accepted":false,"challenge":pending["challenge"]}),
+    )
+    .await;
+    assert_eq!(
+        until(&mut rx, |e| e["type"] == "session"
+            && e["id"] == canceled.to_string())
+        .await["status"],
+        "closed"
+    );
+    assert!(!fixture.join("jump-password-attempts").exists());
+    let tab = Uuid::new_v4();
+    call(&ws,"ssh:connect",json!({"id":tab,"expected":target,"secret":"","jump":{"expected":jump,"secret":"jump-only-secret","remember":true}})).await;
+    let trust = until(&mut rx, |e| {
+        e["type"] == "trust" && e["id"] == tab.to_string()
+    })
+    .await;
+    assert_eq!(trust["stage"], "jump");
+    let jump_challenge = trust["challenge"].clone();
+    assert_eq!(trust["host"]["id"], jump["id"]);
+    assert!(!fixture.join("jump-password-attempts").exists());
+    call(
+        &ws,
+        "ssh:trust",
+        json!({"id":tab,"accepted":true,"challenge":trust["challenge"]}),
+    )
+    .await;
+    let trust = until(&mut rx, |e| {
+        e["type"] == "trust" && e["id"] == tab.to_string()
+    })
+    .await;
+    assert_eq!(trust["stage"], "target");
+    call(
+        &ws,
+        "ssh:trust",
+        json!({"id":tab,"accepted":true,"challenge":jump_challenge}),
+    )
+    .await;
+    assert!(ws.connections.get(tab).unwrap().client.get().is_none());
+    assert_eq!(trust["host"]["id"], target["id"]);
+    call(
+        &ws,
+        "ssh:trust",
+        json!({"id":tab,"accepted":true,"challenge":trust["challenge"]}),
+    )
+    .await;
+    let ready = until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == tab.to_string()
+    })
+    .await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let saved_password = until(&mut rx, |e| {
+        e["type"] == "password" && e["id"] == tab.to_string() && e["host"]["id"] == jump["id"]
+    })
+    .await;
+    assert_eq!(saved_password["failed"], false, "{saved_password}");
+    assert_eq!(
+        call(&ws, "hosts:has-password", jump["id"].clone()).await,
+        true
+    );
+    assert!(std::fs::read_to_string(fixture.join("jump-forwards"))
+        .unwrap()
+        .contains("target.internal.test:"));
+    call(
+        &ws,
+        "ssh:input",
+        json!({"id":tab,"data":"printf 'JUMP_%s\\n' 'TERMINAL'\r"}),
+    )
+    .await;
+    let mut output = String::new();
+    loop {
+        let e = until(&mut rx, |e| {
+            e["type"] == "output" && e["id"] == tab.to_string()
+        })
+        .await;
+        output.push_str(&String::from_utf8_lossy(
+            &STANDARD.decode(e["bytes"].as_str().unwrap()).unwrap(),
+        ));
+        if output.contains("JUMP_TERMINAL") {
+            break;
+        }
+    }
+    let remote = fixture.join("remote");
+    let listing = call(&ws, "files:list", json!({"id":tab,"directory":remote})).await;
+    assert!(listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["name"] == "sample log.txt"));
+    let log = remote.join("sample log.txt");
+    let command = Uuid::new_v4();
+    call(
+        &ws,
+        "commands:start",
+        json!({"id":command,"sessionId":tab,"request":{"action":"tail","argument":log,"lines":2}}),
+    )
+    .await;
+    let out = until(&mut rx, |e| {
+        e["type"] == "output" && e["id"] == command.to_string()
+    })
+    .await;
+    assert!(
+        String::from_utf8_lossy(&STANDARD.decode(out["bytes"].as_str().unwrap()).unwrap())
+            .contains("日志回归")
+    );
+    let session = ws.connections.connected(tab).unwrap();
+    let source = fixture.join("local/jump-input.bin");
+    let downloaded = fixture.join("local/jump-output.bin");
+    let remote_file = remote
+        .join("jump-transfer.bin")
+        .to_string_lossy()
+        .to_string();
+    let bytes = vec![73; 256 * 1024];
+    std::fs::write(&source, &bytes).unwrap();
+    for (up, local) in [(true, source), (false, downloaded.clone())] {
+        let ticket = ws
+            .transfers
+            .stage(session.clone(), up, vec![(remote_file.clone(), local)])
+            .await
+            .unwrap();
+        call(
+            &ws,
+            "files:enqueue",
+            json!({"ticket":ticket["ticket"],"policy":"replace"}),
+        )
+        .await;
+        let transfer = until(&mut rx, |e| {
+            e["type"] == "transfer"
+                && e["sessionId"] == tab.to_string()
+                && matches!(e["status"].as_str(), Some("done" | "failed"))
+        })
+        .await;
+        assert_eq!(transfer["status"], "done", "{transfer}");
+    }
+    assert_eq!(std::fs::read(downloaded).unwrap(), bytes);
+    // Cancel the target's first trust prompt: no target password may be sent.
+    let private_password = call(&ws,"hosts:save",json!({"address":"password.internal.test","port":password_port["port"],"username":"pilot","auth":"password","jumpHostId":jump["id"]})).await.as_array().unwrap().last().unwrap().clone();
+    let rejected = Uuid::new_v4();
+    let attempts = || {
+        std::fs::read(fixture.join("password-attempts"))
+            .unwrap_or_default()
+            .len()
+    };
+    let before = attempts();
+    call(&ws,"ssh:connect",json!({"id":rejected,"expected":private_password,"secret":"pilot-local-only","jump":{"expected":jump,"secret":"","useSaved":true}})).await;
+    let trust = until(&mut rx, |e| {
+        e["type"] == "trust" && e["id"] == rejected.to_string()
+    })
+    .await;
+    assert_eq!(trust["stage"], "target");
+    assert_eq!(attempts(), before);
+    call(
+        &ws,
+        "ssh:trust",
+        json!({"id":rejected,"accepted":false,"challenge":trust["challenge"]}),
+    )
+    .await;
+    assert_eq!(
+        until(&mut rx, |e| e["type"] == "session"
+            && e["id"] == rejected.to_string())
+        .await["status"],
+        "closed"
+    );
+    assert_eq!(attempts(), before);
+    // Target password auth (including a failure) remains independent of jump auth.
+    let wrong = Uuid::new_v4();
+    call(&ws,"ssh:connect",json!({"id":wrong,"expected":private_password,"secret":"wrong-target-password","jump":{"expected":jump,"secret":"","useSaved":true}})).await;
+    let pending = until(&mut rx, |e| {
+        e["type"] == "trust" && e["id"] == wrong.to_string()
+    })
+    .await;
+    call(
+        &ws,
+        "ssh:trust",
+        json!({"id":wrong,"accepted":true,"challenge":pending["challenge"]}),
+    )
+    .await;
+    let failed = until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == wrong.to_string()
+    })
+    .await;
+    assert_eq!(failed["status"], "closed");
+    assert!(failed["message"].as_str().unwrap().contains("目标主机"));
+    let password_tab = Uuid::new_v4();
+    call(&ws,"ssh:connect",json!({"id":password_tab,"expected":private_password,"secret":"pilot-local-only","jump":{"expected":jump,"secret":"","useSaved":true}})).await;
+    let ready = until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == password_tab.to_string()
+    })
+    .await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    call(&ws, "ssh:close", json!(password_tab)).await;
+    let wrong_jump = Uuid::new_v4();
+    let forwards_before = std::fs::read(fixture.join("jump-forwards")).unwrap().len();
+    call(&ws,"ssh:connect",json!({"id":wrong_jump,"expected":target,"secret":"","jump":{"expected":jump,"secret":"wrong-jump-password"}})).await;
+    let failed = until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == wrong_jump.to_string()
+    })
+    .await;
+    assert_eq!(failed["status"], "closed");
+    assert!(failed["message"].as_str().unwrap().contains("跳板机"));
+    assert_eq!(
+        std::fs::read(fixture.join("jump-forwards")).unwrap().len(),
+        forwards_before
+    );
+    // An encrypted private key also authenticates the target through the tunnel.
+    let key_host = call(&ws,"hosts:save",json!({"address":"target.internal.test","port":target_port,"username":std::env::var("USER").unwrap(),"auth":"key","keyPath":fixture.join("client-rsa"),"jumpHostId":jump["id"]})).await.as_array().unwrap().last().unwrap().clone();
+    let key_tab = Uuid::new_v4();
+    call(&ws,"ssh:connect",json!({"id":key_tab,"expected":key_host,"secret":"fixture key passphrase","jump":{"expected":jump,"secret":"","useSaved":true}})).await;
+    let ready = until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == key_tab.to_string()
+    })
+    .await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    call(&ws, "ssh:close", json!(key_tab)).await;
+    let blocked_host = call(&ws,"hosts:save",json!({"address":"blocked.internal.test","port":target_port,"username":"ops","auth":"agent","jumpHostId":jump["id"]})).await.as_array().unwrap().last().unwrap().clone();
+    let blocked = Uuid::new_v4();
+    call(&ws,"ssh:connect",json!({"id":blocked,"expected":blocked_host,"secret":"","jump":{"expected":jump,"secret":"","useSaved":true}})).await;
+    let failed = until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == blocked.to_string()
+    })
+    .await;
+    assert_eq!(failed["status"], "closed");
+    assert!(failed["message"]
+        .as_str()
+        .unwrap()
+        .contains("跳板机无法连接目标"));
+    // A changed jump fingerprint must block saved-password authentication.
+    let before_jump = std::fs::read(fixture.join("jump-password-attempts"))
+        .unwrap()
+        .len();
+    {
+        let mut store = ws.store.lock().unwrap();
+        let mut data = store.data().unwrap().clone();
+        data.fingerprints
+            .iter_mut()
+            .find(|f| f.port == jump_port["port"].as_u64().unwrap() as u16)
+            .unwrap()
+            .fingerprint = format!("SHA256:{}", "A".repeat(43));
+        store.update(data).unwrap();
+    }
+    let changed = Uuid::new_v4();
+    call(&ws,"ssh:connect",json!({"id":changed,"expected":target,"secret":"","jump":{"expected":jump,"secret":"","useSaved":true}})).await;
+    let failure = until(&mut rx, |e| {
+        e["type"] == "session" && e["id"] == changed.to_string()
+    })
+    .await;
+    assert_eq!(failure["status"], "closed");
+    assert!(failure["message"].as_str().unwrap().contains("指纹已变化"));
+    assert_eq!(
+        std::fs::read(fixture.join("jump-password-attempts"))
+            .unwrap()
+            .len(),
+        before_jump
+    );
+    // Transport loss closes the target and all its dependent channels.
+    std::fs::write(fixture.join("jump-disconnect"), b"close").unwrap();
+    assert_eq!(
+        until(&mut rx, |e| e["type"] == "session"
+            && e["id"] == tab.to_string())
+        .await["status"],
+        "closed"
+    );
+    assert!(ws.connections.connected(tab).is_err());
+    assert!(
+        dispatch(&ws, "files:list", json!({"id":tab,"directory":remote}))
+            .await
+            .is_err()
+    );
+    std::fs::remove_file(fixture.join("jump-disconnect")).unwrap();
+    call(&ws, "hosts:clear-password", jump["id"].clone()).await;
+    ws.connections.close_all();
 }

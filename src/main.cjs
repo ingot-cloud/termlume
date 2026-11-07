@@ -36,6 +36,7 @@ function normalizeHost(input, id, { portable = false, allowMissingKey = false } 
     logPath: input.logPath?.trim() ? checkedText(input.logPath, '日志路径', 4096) : '',
     service: input.service?.trim() ? checkedText(input.service, '服务名', 255) : ''
   };
+  if (input.jumpHostId) host.jumpHostId = checkId(input.jumpHostId);
   if (host.logPath) commandFor({ action: 'tail', argument: host.logPath });
   if (host.service) commandFor({ action: 'journal', argument: host.service });
   if (host.auth === 'key' && !portable && (input.keyPath?.trim() || !allowMissingKey)) {
@@ -108,6 +109,11 @@ class HostStore {
     const id = previous?.id ?? randomUUID();
     const host = normalizeHost(input, id, { allowMissingKey: previous?.auth === 'key' && !previous.keyPath });
     const hosts = this.data.hosts.filter((entry) => entry.id !== id);
+    if (host.jumpHostId) {
+      const jump = hosts.find((item) => item.id === host.jumpHostId);
+      if (!jump || jump.jumpHostId || this.sameEndpoint(jump, host)) throw new Error('请选择一台有效的直连主机作为跳板机。');
+      if (hosts.some((item) => item.jumpHostId === id)) throw new Error('该主机被用作跳板机，不能再设置跳板。');
+    }
     const resetPassword = previous && (host.auth !== 'password' || !this.sameEndpoint(previous, host) || previous.username !== host.username);
     const localPasswords = resetPassword ? this.withoutPasswords([id]) : this.data.localPasswords;
     const portablePasswords = resetPassword ? this.withoutPasswords([id], this.data.portablePasswords || {}) : this.data.portablePasswords;
@@ -117,6 +123,7 @@ class HostStore {
   }
 
   remove(id) {
+    if (this.data.hosts.some((host) => host.jumpHostId === id)) throw new Error('该主机仍被用作跳板机，请先修改相关主机的连接路径。');
     const localPasswords = this.withoutPasswords([id]);
     const portablePasswords = this.withoutPasswords([id], this.data.portablePasswords || {});
     this.update({ ...this.data, hosts: this.data.hosts.filter((entry) => entry.id !== id), localPasswords, portablePasswords });
@@ -711,7 +718,8 @@ function registerHandlers() {
   handle('ssh:connect', ({ id, expected, secret, dimensions, useSaved, remember, sharePassword }) => {
     checkId(id);
     const host = store.host(expected?.id);
-    if (['address', 'port', 'username', 'auth', 'keyPath'].some((field) => host[field] !== expected[field])) {
+    if (host.jumpHostId) throw new Error('跳板连接需使用 macOS 应用。');
+    if (['address', 'port', 'username', 'auth', 'keyPath', 'jumpHostId'].some((field) => host[field] !== expected[field])) {
       throw new Error('主机配置已变更，请从主机列表新建会话。');
     }
     if (typeof secret !== 'string' || secret.length > 4096) throw new Error('SSH 凭据无效。');

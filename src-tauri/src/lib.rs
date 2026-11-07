@@ -363,9 +363,11 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             blocking(move || keys::copy(&key)).await?;
         }
         "ssh:connect" => ssh::connect(ws, parse(value)?)?,
-        "ssh:trust" => ws
-            .connections
-            .trust(id(&value["id"])?, flag(&value, "accepted")),
+        "ssh:trust" => ws.connections.trust(
+            id(&value["id"])?,
+            flag(&value, "accepted"),
+            value.get("challenge").map(id).transpose()?,
+        ),
         "ssh:close" => {
             if let Some(session) = ws.connections.get(id(&value)?) {
                 #[cfg(desktop)]
@@ -491,6 +493,9 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
         }
         "hosts:delete" => {
             let id = id(&value)?;
+            if data.hosts.iter().any(|h| h.jump_host_id == Some(id)) {
+                return Err("该主机仍被用作跳板机，请先修改相关主机的连接路径。".into());
+            }
             data.hosts.retain(|host| host.id != id);
             data.local_passwords.remove(&id);
             data.portable_passwords.remove(&id);
@@ -569,6 +574,16 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
     };
     let host =
         host.normalized(previous.is_some_and(|p| p.auth == "key" && p.key_path.is_none()))?;
+    let mut routed_hosts = data.hosts.clone();
+    routed_hosts.retain(|h| h.id != host.id);
+    routed_hosts.push(host.clone());
+    host.jump_host(&routed_hosts)?;
+    for dependent in routed_hosts
+        .iter()
+        .filter(|h| h.jump_host_id == Some(host.id))
+    {
+        dependent.jump_host(&routed_hosts)?;
+    }
     if previous.is_some_and(|p| host.auth != "password" || !p.same_connection(&host)) {
         data.local_passwords.remove(&host.id);
         data.portable_passwords.remove(&host.id);

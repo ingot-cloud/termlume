@@ -15,6 +15,7 @@ cleanup() {
 trap cleanup EXIT
 mkdir "$fixture/remote" "$fixture/local"
 ssh-keygen -q -t ed25519 -N '' -f "$fixture/host"
+ssh-keygen -q -t ed25519 -N '' -f "$fixture/jump-host"
 ssh-keygen -q -t ed25519 -N '' -f "$fixture/client"
 ssh-keygen -q -t rsa -b 2048 -N 'fixture key passphrase' -f "$fixture/client-rsa"
 /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout "$fixture/https.key" -out "$fixture/https.pem" -days 1 -subj '/CN=127.0.0.1' 2>/dev/null
@@ -50,7 +51,8 @@ export SSH_AUTH_SOCK="$fixture/agent.sock"
 /usr/bin/ssh-agent -D -a "$SSH_AUTH_SOCK" > "$fixture/agent.log" 2>&1 &
 pids+=("$!")
 node - "$fixture" <<'NODE' &
-const { appendFileSync, readFileSync, writeFileSync } = require('node:fs');
+const { appendFileSync, readFileSync, writeFileSync, existsSync } = require('node:fs');
+const { connect } = require('node:net');
 const { execFileSync, spawn } = require('node:child_process');
 const { createServer } = require('node:https');
 const { join } = require('node:path');
@@ -131,11 +133,41 @@ const fixture = process.argv[2];
     }));
   });
   server.listen(0, '127.0.0.1', () => writeFileSync(join(fixture, 'password-server.json'), JSON.stringify(server.address())));
+  const jumpClients = new Set();
+  const jump = new Server({ hostKeys: [readFileSync(join(fixture, 'jump-host'))] }, (client) => {
+    jumpClients.add(client);
+    client.on('error', () => {});
+    client.on('close', () => jumpClients.delete(client));
+    client.on('authentication', (ctx) => {
+      if (ctx.method === 'password') appendFileSync(join(fixture, 'jump-password-attempts'), 'attempt\n');
+      if (ctx.method === 'password' && ctx.username === 'jump' && ctx.password === 'jump-only-secret') ctx.accept();
+      else ctx.reject(['password']);
+    });
+    client.on('ready', () => client.on('tcpip', (accept, reject, info) => {
+      appendFileSync(join(fixture, 'jump-forwards'), info.destIP + ':' + info.destPort + '\n');
+      const port = info.destIP === 'target.internal.test' ? Number(readFileSync(join(fixture, 'openssh-port'), 'utf8'))
+        : info.destIP === 'password.internal.test' ? server.address().port : 0;
+      if (!port || port !== info.destPort) { reject(); return; }
+      const socket = connect(port, '127.0.0.1', () => {
+        const stream = accept();
+        if (!stream) { socket.destroy(); return; }
+        stream.on('error', () => socket.destroy());
+        socket.pipe(stream).pipe(socket);
+        stream.on('close', () => socket.destroy());
+      });
+      socket.on('error', () => reject());
+      client.once('close', () => socket.destroy());
+    }));
+  });
+  jump.listen(0, '127.0.0.1', () => writeFileSync(join(fixture, 'jump-server.json'), JSON.stringify(jump.address())));
+  setInterval(() => {
+    if (existsSync(join(fixture, 'jump-disconnect'))) for (const client of jumpClients) client.end();
+  }, 50);
 })().catch((err) => { console.error(err); process.exit(1); });
 NODE
 pids+=("$!")
 for attempt in {1..100}; do
-  if [ -S "$SSH_AUTH_SOCK" ] && [ -s "$fixture/password-server.json" ] && [ -s "$fixture/https-port" ] && /usr/bin/grep -q 'Server listening' "$fixture/sshd.log"; then break; fi
+  if [ -S "$SSH_AUTH_SOCK" ] && [ -s "$fixture/password-server.json" ] && [ -s "$fixture/jump-server.json" ] && [ -s "$fixture/https-port" ] && /usr/bin/grep -q 'Server listening' "$fixture/sshd.log"; then break; fi
   sleep 0.05
 done
 /usr/bin/ssh-add "$fixture/client"

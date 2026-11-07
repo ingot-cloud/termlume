@@ -25,6 +25,8 @@ pub struct Host {
     pub auth: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jump_host_id: Option<Uuid>,
     pub group: String,
     pub tags: Vec<String>,
     pub note: String,
@@ -41,6 +43,7 @@ impl Default for Host {
             username: String::new(),
             auth: "agent".into(),
             key_path: None,
+            jump_host_id: None,
             group: String::new(),
             tags: vec![],
             note: String::new(),
@@ -58,6 +61,26 @@ impl Host {
             && self.username == other.username
             && self.auth == other.auth
             && self.key_path == other.key_path
+            && self.jump_host_id == other.jump_host_id
+    }
+    pub fn jump_host<'a>(&self, hosts: &'a [Host]) -> Result<Option<&'a Host>, String> {
+        let Some(id) = self.jump_host_id else {
+            return Ok(None);
+        };
+        if id == self.id {
+            return Err("不能使用主机自身作为跳板机。".into());
+        }
+        let jump = hosts
+            .iter()
+            .find(|h| h.id == id)
+            .ok_or("跳板机不存在，请编辑主机并重新选择连接路径。")?;
+        if jump.jump_host_id.is_some() {
+            return Err("当前仅支持单跳，请选择一台直连主机作为跳板机。".into());
+        }
+        if self.same_endpoint(jump) {
+            return Err("跳板机与目标主机不能使用相同地址和端口。".into());
+        }
+        Ok(Some(jump))
     }
     pub fn normalized(mut self, allow_missing_key: bool) -> Result<Self, String> {
         self.address = checked(&self.address, "主机地址", 255)?

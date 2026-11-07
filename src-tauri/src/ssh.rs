@@ -29,15 +29,38 @@ pub type Client = client::Handle<Verifier>;
 pub struct ConnectRequest {
     pub id: Uuid,
     expected: Host,
-    secret: String,
+    #[serde(flatten)]
+    credentials: Credentials,
+    #[serde(default)]
+    jump: Option<JumpRequest>,
+    #[serde(default)]
+    dimensions: Size,
+}
+
+#[derive(Deserialize)]
+struct JumpRequest {
+    expected: Host,
+    #[serde(flatten)]
+    credentials: Credentials,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Credentials {
+    #[serde(deserialize_with = "credential_secret")]
+    secret: Zeroizing<String>,
     #[serde(default)]
     use_saved: bool,
     #[serde(default)]
     remember: bool,
     #[serde(default)]
     share_password: bool,
-    #[serde(default)]
-    dimensions: Size,
+}
+
+fn credential_secret<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Zeroizing<String>, D::Error> {
+    String::deserialize(deserializer).map(Zeroizing::new)
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -60,11 +83,28 @@ impl Size {
 pub struct Session {
     pub id: Uuid,
     pub host: Host,
+    jump_host: Option<Host>,
     pub fingerprint: OnceLock<String>,
     pub client: OnceLock<Arc<Client>>,
+    jump_client: OnceLock<Arc<Client>>,
+    jump_fingerprint: OnceLock<String>,
     pub cancel: CancellationToken,
-    trust: Mutex<Option<oneshot::Sender<bool>>>,
+    trust: Mutex<Option<(Uuid, oneshot::Sender<bool>)>>,
     input: OnceLock<mpsc::Sender<TerminalControl>>,
+}
+impl Session {
+    fn check_route(&self, data: &Data) -> Result<(), String> {
+        if !data.host(self.host.id)?.same_connection(&self.host) {
+            return Err("目标主机配置已变更，请重新连接。".into());
+        }
+        if let Some(jump) = &self.jump_host {
+            if !data.host(jump.id)?.same_connection(jump) {
+                return Err("跳板机配置已变更，请重新连接。".into());
+            }
+        }
+        self.host.jump_host(&data.hosts)?;
+        Ok(())
+    }
 }
 pub struct CommandJob {
     pub follow: bool,
@@ -90,7 +130,12 @@ impl Connections {
             .filter(|s| s.client.get().is_some() && !s.cancel.is_cancelled())
             .ok_or("请先连接该主机。".into())
     }
-    pub fn begin(&self, id: Uuid, host: Host) -> Result<Arc<Session>, String> {
+    pub fn begin(
+        &self,
+        id: Uuid,
+        host: Host,
+        jump_host: Option<Host>,
+    ) -> Result<Arc<Session>, String> {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.contains_key(&id) || sessions.len() >= 64 {
             return Err("此标签已在连接，或会话数量已达上限。".into());
@@ -98,8 +143,11 @@ impl Connections {
         let session = Arc::new(Session {
             id,
             host,
+            jump_host,
             fingerprint: OnceLock::new(),
             client: OnceLock::new(),
+            jump_client: OnceLock::new(),
+            jump_fingerprint: OnceLock::new(),
             cancel: CancellationToken::new(),
             trust: Mutex::default(),
             input: OnceLock::new(),
@@ -138,10 +186,15 @@ impl Connections {
             command.close.cancel();
         }
     }
-    pub fn trust(&self, id: Uuid, accepted: bool) {
+    pub fn trust(&self, id: Uuid, accepted: bool, challenge: Option<Uuid>) {
         if let Some(session) = self.get(id) {
-            if let Some(reply) = session.trust.lock().unwrap().take() {
-                let _ = reply.send(accepted);
+            let mut pending = session.trust.lock().unwrap();
+            if pending.as_ref().is_some_and(|(token, _)| {
+                challenge == Some(*token) || (challenge.is_none() && session.jump_host.is_none())
+            }) {
+                if let Some((_, reply)) = pending.take() {
+                    let _ = reply.send(accepted);
+                }
             }
         }
     }
@@ -171,18 +224,22 @@ pub struct Verifier {
     workspace: Workspace,
     session: Arc<Session>,
     fingerprint: Option<String>,
+    host: Host,
+    jump: bool,
     failure: Arc<Mutex<Option<String>>>,
     epoch: u64,
 }
 impl Verifier {
+    fn verified(&self) -> &OnceLock<String> {
+        if self.jump {
+            &self.session.jump_fingerprint
+        } else {
+            &self.session.fingerprint
+        }
+    }
     async fn verify(&self, actual: &str) -> Result<(), String> {
-        if self.session.client.get().is_some() {
-            return if self
-                .session
-                .fingerprint
-                .get()
-                .is_some_and(|fp| fp == actual)
-            {
+        if let Some(verified) = self.verified().get() {
+            return if verified == actual {
                 Ok(())
             } else {
                 Err("会话的服务器指纹已变化。".into())
@@ -192,13 +249,11 @@ impl Verifier {
             let store = self.workspace.store.lock().unwrap();
             crate::ensure_epoch(&store, self.epoch)?;
             let data = store.data()?;
-            if !data
-                .host(self.session.host.id)?
-                .same_connection(&self.session.host)
-            {
+            self.session.check_route(data)?;
+            if !data.host(self.host.id)?.same_connection(&self.host) {
                 return Err("主机配置已变更，请重新连接。".into());
             }
-            Ok(data.fingerprint(&self.session.host).map(str::to_owned))
+            Ok(data.fingerprint(&self.host).map(str::to_owned))
         };
         let saved = current()?;
         for expected in self.fingerprint.iter().chain(saved.iter()) {
@@ -210,16 +265,18 @@ impl Verifier {
         }
         if saved.is_none() {
             let (sender, receiver) = oneshot::channel();
-            *self.session.trust.lock().unwrap() = Some(sender);
+            let challenge = Uuid::new_v4();
+            *self.session.trust.lock().unwrap() = Some((challenge, sender));
             self.workspace
-                .emit(json!({"type":"trust","id":self.session.id,"fingerprint":actual}));
+                .emit(json!({"type":"trust","id":self.session.id,"fingerprint":actual,"challenge":challenge,"host":self.host,"stage":if self.jump {"jump"} else {"target"}}));
             if !receiver.await.unwrap_or(false) || self.session.cancel.is_cancelled() {
                 return Err("已取消主机信任。".into());
             }
             let mut store = self.workspace.store.lock().unwrap();
             crate::ensure_epoch(&store, self.epoch)?;
             let mut data = store.data()?.clone();
-            let host = &self.session.host;
+            self.session.check_route(&data)?;
+            let host = &self.host;
             if !data.host(host.id)?.same_connection(host) {
                 return Err("主机配置已变更，请重新连接。".into());
             }
@@ -238,7 +295,7 @@ impl Verifier {
                 }
             }
         }
-        let _ = self.session.fingerprint.set(actual.into());
+        let _ = self.verified().set(actual.into());
         Ok(())
     }
 }
@@ -272,32 +329,45 @@ pub fn valid_fingerprint(fp: &str) -> bool {
 }
 
 pub fn connect(ws: &Workspace, req: ConnectRequest) -> Result<(), String> {
-    let (host, epoch, previous_password) = {
+    let (host, jump_host, epoch) = {
         let store = ws.store.lock().unwrap();
         let data = store.data()?;
         let host = data.host(req.expected.id)?.clone();
         if !host.same_connection(&req.expected) {
             return Err("主机配置已变更，请从主机列表新建会话。".into());
         }
-        let previous = if req.remember {
-            password_source(data, &host)
-        } else {
-            None
-        };
-        (host, store.epoch, previous)
+        let jump = host.jump_host(&data.hosts)?;
+        match (jump, req.jump.as_ref()) {
+            (Some(host), Some(request))
+                if host.id == request.expected.id && host.same_connection(&request.expected) =>
+            {
+                validate_credentials(host, &request.credentials)?;
+            }
+            (None, None) => {}
+            _ => return Err("跳板机配置已变更，请从主机列表新建会话。".into()),
+        }
+        validate_credentials(&host, &req.credentials)?;
+        let jump = jump.cloned();
+        (host, jump, store.epoch)
     };
-    if req.secret.len() > 16384
-        || (host.auth == "password" && !req.use_saved && req.secret.is_empty())
-    {
-        return Err("SSH 凭据无效。".into());
-    }
-    let session = ws.connections.begin(req.id, host)?;
+    let session = ws.connections.begin(req.id, host, jump_host)?;
     let ws = ws.clone();
     tauri::async_runtime::spawn(async move {
-        let use_saved = req.use_saved;
-        let result = run_session(&ws, &session, req, epoch, previous_password).await;
+        let use_saved =
+            req.credentials.use_saved || req.jump.as_ref().is_some_and(|j| j.credentials.use_saved);
+        let result = run_session(&ws, &session, req, epoch).await;
         let canceled = session.cancel.is_cancelled();
         session.cancel.cancel();
+        for client in [session.client.get(), session.jump_client.get()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.disconnect(Disconnect::ByApplication, "", ""),
+            )
+            .await;
+        }
         session.trust.lock().unwrap().take();
         if ws.connections.remove(&session) && !canceled {
             let failed = result.is_err();
@@ -308,7 +378,17 @@ pub fn connect(ws: &Workspace, req: ConnectRequest) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(PartialEq, Eq)]
+fn validate_credentials(host: &Host, credentials: &Credentials) -> Result<(), String> {
+    if credentials.secret.len() > 16384
+        || (host.auth == "password" && !credentials.use_saved && credentials.secret.is_empty())
+    {
+        Err("SSH 凭据无效。".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 enum PasswordSource {
     Local {
         token: Uuid,
@@ -416,18 +496,16 @@ fn bind_password(
 async fn remember(
     ws: &Workspace,
     session: &Session,
+    host: &Host,
+    fingerprint: &str,
     password: Zeroizing<String>,
     share: bool,
     epoch: u64,
     previous_password: Option<PasswordSource>,
 ) -> Result<(), String> {
     let token = Uuid::new_v4();
-    let fingerprint = session
-        .fingerprint
-        .get()
-        .cloned()
-        .ok_or("主机指纹不可用。")?;
-    let host = session.host.clone();
+    let fingerprint = fingerprint.to_owned();
+    let host = host.clone();
     let ws = ws.clone();
     let cancel = session.cancel.clone();
     crate::blocking(move || {
@@ -470,75 +548,181 @@ async fn remember(
     .await
 }
 
+struct RememberRequest {
+    host: Host,
+    fingerprint: String,
+    password: Zeroizing<String>,
+    share: bool,
+    previous: Option<PasswordSource>,
+}
+
+async fn connect_peer(
+    ws: &Workspace,
+    session: &Arc<Session>,
+    host: &Host,
+    credentials: Credentials,
+    epoch: u64,
+    tunnel: Option<russh::ChannelStream<client::Msg>>,
+    jump: bool,
+) -> Result<(Client, Option<RememberRequest>), String> {
+    let (source, previous) = {
+        let store = ws.store.lock().unwrap();
+        crate::ensure_epoch(&store, epoch)?;
+        let data = store.data()?;
+        session.check_route(data)?;
+        if !data.host(host.id)?.same_connection(host)
+            || !data.host(session.host.id)?.same_connection(&session.host)
+        {
+            return Err("主机配置已变更，请重新连接。".into());
+        }
+        let previous = password_source(data, host);
+        (
+            if credentials.use_saved {
+                Some(previous.as_ref().ok_or("此主机没有已保存的密码。")?)
+            } else {
+                None
+            }
+            .cloned(),
+            previous,
+        )
+    };
+    let saved = match source {
+        Some(source) => Some((read_password(&source).await?, source)),
+        None => None,
+    };
+    let failure = Arc::new(Mutex::new(None));
+    let verifier = Verifier {
+        workspace: ws.clone(),
+        session: session.clone(),
+        host: host.clone(),
+        jump,
+        fingerprint: saved
+            .as_ref()
+            .and_then(|(_, source)| source.fingerprint())
+            .map(str::to_owned),
+        failure: failure.clone(),
+        epoch,
+    };
+    let config = Arc::new(client::Config {
+        keepalive_interval: Some(Duration::from_secs(15)),
+        ..Default::default()
+    });
+    let connected = if let Some(stream) = tunnel {
+        client::connect_stream(config, stream, verifier).await
+    } else {
+        client::connect(config, (host.address.as_str(), host.port), verifier).await
+    };
+    let mut client = connected.map_err(|err| {
+        failure
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| format!("SSH 握手失败：{err}"))
+    })?;
+    let fingerprint = if jump {
+        &session.jump_fingerprint
+    } else {
+        &session.fingerprint
+    }
+    .get()
+    .ok_or("主机指纹不可用。")?;
+    {
+        let store = ws.store.lock().unwrap();
+        crate::ensure_epoch(&store, epoch)?;
+        let data = store.data()?;
+        session.check_route(data)?;
+        if !data.host(host.id)?.same_connection(host)
+            || !data.host(session.host.id)?.same_connection(&session.host)
+            || data.fingerprint(host) != Some(fingerprint)
+        {
+            return Err("主机或信任记录已变化，请重新连接。".into());
+        }
+        if let Some((_, source)) = &saved {
+            check_password(data, host, source)?;
+        }
+    }
+    authenticate(
+        &mut client,
+        host,
+        saved
+            .as_ref()
+            .map(|(password, _)| password.as_str())
+            .unwrap_or(&credentials.secret),
+    )
+    .await?;
+    if let Some((_, source)) = &saved {
+        bind_password(ws, host, epoch, source, fingerprint)?;
+    }
+    let remember = (credentials.remember && !credentials.use_saved && host.auth == "password")
+        .then(|| RememberRequest {
+            host: host.clone(),
+            fingerprint: fingerprint.clone(),
+            password: credentials.secret,
+            share: credentials.share_password,
+            previous,
+        });
+    Ok((client, remember))
+}
+
 async fn run_session(
     ws: &Workspace,
     session: &Arc<Session>,
     req: ConnectRequest,
     epoch: u64,
-    previous_password: Option<PasswordSource>,
 ) -> Result<(), String> {
-    let secret = Zeroizing::new(req.secret);
+    let timeout = if req.jump.is_some() { 130 } else { 65 };
     let handshake = async {
-        let saved = if req.use_saved {
-            let source = {
-                let store = ws.store.lock().unwrap();
-                crate::ensure_epoch(&store, epoch)?;
-                password_source(store.data()?, &session.host).ok_or("此主机没有已保存的密码。")?
-            };
-            let password = read_password(&source).await?;
-            Some((source, password))
+        let mut passwords = Vec::new();
+        let tunnel = if let Some(jump) = req.jump {
+            ws.emit(json!({"type":"progress","id":session.id,"message":format!("正在连接跳板机 {}…", jump.expected.name)}));
+            let (client, remember) = connect_peer(
+                ws,
+                session,
+                &jump.expected,
+                jump.credentials,
+                epoch,
+                None,
+                true,
+            )
+            .await
+            .map_err(|e| format!("跳板机 {}：{e}", jump.expected.name))?;
+            if let Some(remember) = remember {
+                passwords.push(remember);
+            }
+            let client = Arc::new(client);
+            let _ = session.jump_client.set(client.clone());
+            let channel = client
+                .channel_open_direct_tcpip(
+                    session.host.address.clone(),
+                    session.host.port.into(),
+                    "127.0.0.1",
+                    0,
+                )
+                .await
+                .map_err(|e| {
+                    format!(
+                        "跳板机无法连接目标 {}:{}：{e}",
+                        session.host.address, session.host.port
+                    )
+                })?;
+            Some(channel.into_stream())
         } else {
             None
         };
-        let failure = Arc::new(Mutex::new(None));
-        let verifier = Verifier {
-            workspace: ws.clone(),
-            session: session.clone(),
-            fingerprint: saved
-                .as_ref()
-                .and_then(|(source, _)| source.fingerprint())
-                .map(str::to_owned),
-            failure: failure.clone(),
+        ws.emit(json!({"type":"progress","id":session.id,"message":"正在连接目标主机…"}));
+        let (client, remember) = connect_peer(
+            ws,
+            session,
+            &session.host,
+            req.credentials,
             epoch,
-        };
-        let config = Arc::new(client::Config {
-            keepalive_interval: Some(Duration::from_secs(15)),
-            ..Default::default()
-        });
-        let mut client = client::connect(
-            config,
-            (session.host.address.as_str(), session.host.port),
-            verifier,
+            tunnel,
+            false,
         )
         .await
-        .map_err(|err| {
-            failure
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| format!("SSH 握手失败：{err}"))
-        })?;
-        let fingerprint = session.fingerprint.get().ok_or("主机指纹不可用。")?;
-        if let Some((source, _)) = &saved {
-            let store = ws.store.lock().unwrap();
-            crate::ensure_epoch(&store, epoch)?;
-            let data = store.data()?;
-            check_password(data, &session.host, source)?;
-            if data.fingerprint(&session.host) != Some(fingerprint) {
-                return Err("主机的信任记录已变化，请重试。".into());
-            }
-        }
-        authenticate(
-            &mut client,
-            &session.host,
-            saved
-                .as_ref()
-                .map(|(_, password)| password.as_str())
-                .unwrap_or(&secret),
-        )
-        .await?;
-        if let Some((source, _)) = &saved {
-            bind_password(ws, &session.host, epoch, source, fingerprint)?;
+        .map_err(|e| format!("目标主机 {}：{e}", session.host.name))?;
+        if let Some(remember) = remember {
+            passwords.push(remember);
         }
         let mut channel = client.channel_open_session().await.map_err(error)?;
         let (cols, rows) = req.dimensions.dimensions();
@@ -549,11 +733,11 @@ async fn run_session(
         require_success(&mut channel, "PTY").await?;
         channel.request_shell(true).await.map_err(error)?;
         require_success(&mut channel, "Shell").await?;
-        Ok::<_, String>((Arc::new(client), channel))
+        Ok::<_, String>((Arc::new(client), channel, passwords))
     };
-    let (client, channel) = tokio::select! {
+    let (client, channel, passwords) = tokio::select! {
         _ = session.cancel.cancelled() => return Err("连接已取消。".into()),
-        result = tokio::time::timeout(Duration::from_secs(65), handshake) => result.map_err(|_| "SSH 连接超时。")??,
+        result = tokio::time::timeout(Duration::from_secs(timeout), handshake) => result.map_err(|_| "SSH 连接超时。")??,
     };
     if session.cancel.is_cancelled() {
         return Err("连接已取消。".into());
@@ -562,22 +746,25 @@ async fn run_session(
     let _ = session.input.set(send);
     let _ = session.client.set(client.clone());
     ws.emit(json!({"type":"session","id":session.id,"status":"ready"}));
-    if req.remember && !req.use_saved && session.host.auth == "password" {
+    for password in passwords {
         let ws = ws.clone();
         let session = session.clone();
         tauri::async_runtime::spawn(async move {
             let failed = remember(
                 &ws,
                 &session,
-                secret,
-                req.share_password,
+                &password.host,
+                &password.fingerprint,
+                password.password,
+                password.share,
                 epoch,
-                previous_password,
+                password.previous,
             )
             .await
             .is_err();
             if !session.cancel.is_cancelled() {
-                ws.emit(json!({"type":"password","id":session.id,"failed":failed,"message":if failed {"SSH 已连接，密码保存失败，请检查 macOS 钥匙串。"} else {"已加密保存 SSH 密码。"}}));
+                ws.emit(json!({"type":"password","id":session.id,"host":password.host,"failed":failed,
+                    "message":if failed {"SSH 已连接，密码保存失败，请检查 macOS 钥匙串。"} else {"已加密保存 SSH 密码。"}}));
             }
         });
     }
@@ -612,16 +799,20 @@ async fn run_session(
         }
         Ok::<_, String>(())
     };
+    let jump_closed = async {
+        loop {
+            if session.jump_client.get().is_some_and(|c| c.is_closed()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
     let result = tokio::select! {
+        _ = jump_closed => Err("跳板机连接已断开。".into()),
         _ = session.cancel.cancelled() => Ok(()),
         _ = read => Ok(()),
         result = write => result,
     };
-    let _ = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.disconnect(Disconnect::ByApplication, "", ""),
-    )
-    .await;
     result
 }
 

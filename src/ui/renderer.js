@@ -929,6 +929,17 @@ async function editHost(host, draftTab, target) {
     if (!groups.includes(query)) matches.push({ value: query, label: `新建「${query}」` });
     return matches;
   });
+  const jump = node('select');
+  const routeOptions = [{ id: '', name: '直连' }, ...hosts.filter((item) => item.id !== host?.id && !item.jumpHostId && (api.ssh.jumpHosts || item.id === host?.jumpHostId))];
+  if (host?.jumpHostId && !routeOptions.some((item) => item.id === host.jumpHostId)) routeOptions.push({ id: host.jumpHostId, name: '跳板机不可用，请重新选择' });
+  for (const item of routeOptions) {
+    const option = node('option', '', item.id ? `经 ${item.name} · ${item.address ? endpoint(item) : '配置无效'}` : item.name);
+    option.value = item.id;
+    jump.append(option);
+  }
+  jump.value = host?.jumpHostId || '';
+  const jumpPicker = selectControl(jump, '连接路径');
+  const routeHint = node('p', 'muted', api.ssh.jumpHosts ? '单跳连接：SSH、文件和日志共用此路径。跳板机须为已保存的直连主机。' : '跳板连接需使用 macOS 应用。');
   const auth = node('select');
   for (const [value, label] of [['', '请选择认证方式'], ['agent', 'SSH Agent'], ['key', '本机私钥'], ['password', 'SSH 密码']]) {
     const option = node('option', '', label);
@@ -959,7 +970,7 @@ async function editHost(host, draftTab, target) {
   updateAuth();
   for (const required of [addressField, username, port]) required.required = true;
   const draft = () => ({ id: host?.id, name: name.value, address: addressField.value, port: Number(port.value), username: username.value, group: group.value,
-    auth: auth.value, keyPath: key.value || undefined, tags: tags.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean), note: note.value, logPath: logPath.value, service: service.value });
+    auth: auth.value, keyPath: key.value || undefined, jumpHostId: jump.value || undefined, tags: tags.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean), note: note.value, logPath: logPath.value, service: service.value });
   const original = JSON.stringify(draft());
   const duplicate = input('', 'checkbox');
   const duplicateRow = node('label', 'checkbox-row', duplicate, '已有相同地址、端口和用户名，仍保存为另一条配置');
@@ -1009,7 +1020,7 @@ async function editHost(host, draftTab, target) {
       node('section', 'host-form-section', node('h3', '', '地址'), field('主机地址', addressField), pasteHint),
       node('section', 'host-form-section', node('h3', '', '常规'), field('显示名称', name), field('分组', groupPicker)),
       node('section', 'host-form-section', node('h3', '', 'SSH 连接'),
-        node('div', 'dialog-row', field('SSH 用户名', username), field('端口', port)), field('认证方式', authPicker),
+        node('div', 'dialog-row', field('SSH 用户名', username), field('端口', port)), field('认证方式', authPicker), field('连接路径', jumpPicker), routeHint,
         keyRow, ...(editor ? [editor.pane] : []), duplicateRow),
       details, ...(management ? [management] : [])
     ], '保存并连接', async (action) => {
@@ -1360,7 +1371,7 @@ function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session'
   if (tab) tab.used = Date.now();
   if (tab?.kind === 'shell' && tab.status === 'ready') {
     recent.set(tab.host.id, tab.used);
-    status(`${tab.host.name} · SSH 已连接`);
+    status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
   }
   else if (tab?.kind === 'command') status(`${tab.host.name} · ${actionLabels[tab.action]}`);
   else if (view !== 'session') status(({ hosts: '已保存的主机', 'new-tab': '选择要连接的主机', keys: 'SSH 密钥', transfers: '上传和下载记录', vault: '保险库' })[view]);
@@ -1558,6 +1569,7 @@ function renderContext() {
   if (!tab?.terminal) return;
   const labels = { idle: '等待连接', connecting: '连接中', trust: '核对主机指纹', ready: '已连接', closed: '已断开', running: '运行中', done: '已完成', stopped: '已停止', failed: '失败' };
   $('context').replaceChildren(summaryText('strong', endpoint(tab.host)), node('span', tab.status === 'ready' ? 'online' : 'muted', labels[tab.status] || tab.status));
+  if (session?.jumpHost) $('context').append(summaryText('small', `经 ${session.jumpHost.name}`));
   const controls = $('session-actions');
   controls.replaceChildren();
   if (tab.kind === 'shell' && tab.status === 'closed') controls.append(button(tab.promptForPassword ? '重新输入密码' : '重连', () => connect(tab)));
@@ -1580,7 +1592,7 @@ function renderContext() {
   const notice = $('session-notice');
   if (tab.status === 'trust') {
     notice.hidden = false;
-    notice.replaceChildren(node('strong', '', '核对服务器指纹'), node('p', '', `${endpoint(tab.host)} · ${tab.fingerprint}`), node('div', '',
+    notice.replaceChildren(node('strong', '', tab.trustStage === 'jump' ? '核对跳板机指纹' : '核对目标主机指纹'), node('p', '', `${(tab.trustHost || tab.host).name} · ${endpoint(tab.trustHost || tab.host)} · ${tab.fingerprint}`), node('div', '',
       button('信任并连接', () => trust(tab, true), 'primary'), button('取消连接', () => trust(tab, false))));
   } else if ((tab.message && ['closed', 'failed'].includes(tab.status)) || tab.passwordSaveError) {
     notice.hidden = false;
@@ -1592,20 +1604,22 @@ function renderContext() {
 }
 
 async function trust(tab, accepted) {
+  if (tab.status !== 'trust') return;
+  const challenge = tab.trustChallenge;
   tab.status = 'connecting';
   renderContext();
   renderTabs();
-  await api.ssh.trust({ id: tab.id, accepted });
+  await api.ssh.trust({ id: tab.id, accepted, challenge });
 }
 
-async function enterCredential(tab) {
-  const passwordAuth = tab.host.auth === 'password';
+async function enterCredential(host, jump = false) {
+  const passwordAuth = host.auth === 'password';
   const credential = input('', 'password');
   credential.required = passwordAuth;
   const label = passwordAuth ? 'SSH 密码' : '私钥口令（未加密可留空）';
   const remember = input('', 'checkbox');
   const share = input('', 'checkbox');
-  const fields = [node('p', '', endpoint(tab.host)), field(label, credential)];
+  const fields = [node('p', '', `${host.name} · ${endpoint(host)}`), field(label, credential)];
   if (passwordAuth) {
     fields.push(node('label', 'checkbox-row', remember, '在本机记住密码'));
     if (vaultStatus.enabled) {
@@ -1616,7 +1630,7 @@ async function enterCredential(tab) {
     }
   }
   try {
-    return await prompt('SSH 认证', fields, '连接', () => ({ secret: credential.value, remember: remember.checked, sharePassword: share.checked }));
+    return await prompt(jump ? '跳板机认证' : '目标主机认证', fields, '连接', () => ({ secret: credential.value, remember: remember.checked, sharePassword: share.checked }));
   } finally {
     credential.value = '';
   }
@@ -1628,15 +1642,29 @@ async function connect(tab, enterPassword = false) {
   tab.paths.reset();
   tab.message = '';
   tab.passwordSaveError = '';
+  tab.passwordSaveErrors = new Map();
   renderContext();
   renderTabs();
   try {
-    const passwordAuth = tab.host.auth === 'password';
-    const useSaved = passwordAuth && !enterPassword && !tab.promptForPassword && await api.hosts.hasPassword(tab.host.id);
+    const jumpHost = tab.host.jumpHostId ? hosts.find((host) => host.id === tab.host.jumpHostId) : undefined;
+    if (tab.host.jumpHostId && !api.ssh.jumpHosts) throw new Error('跳板连接需使用 macOS 应用。');
+    if (tab.host.jumpHostId && (!jumpHost || jumpHost.jumpHostId)) throw new Error('跳板机不可用，请编辑主机并核对连接路径。');
+    if (jumpHost?.auth === 'key' && !jumpHost.keyPath) throw new Error(`请先为跳板机「${jumpHost.name}」选择本机私钥。`);
+    tab.jumpHost = jumpHost;
+    renderContext();
+    const credentialFor = async (host, isJump = false) => {
+      const useSaved = host.auth === 'password' && !enterPassword && !tab.promptForPassword && await api.hosts.hasPassword(host.id);
+      const credentials = host.auth === 'agent' || useSaved ? { secret: '' } : await enterCredential(host, isJump);
+      return credentials && { ...credentials, useSaved };
+    };
+    const jumpCredentials = jumpHost ? await credentialFor(jumpHost, true) : undefined;
+    if (jumpHost && !jumpCredentials) { updateSession(tab, 'closed', '已取消连接。'); return; }
     if (!tabs.has(tab.id)) return;
-    tab.usedSavedPassword = useSaved;
+    const credentials = await credentialFor(tab.host);
+    const useSaved = credentials?.useSaved;
+    if (!tabs.has(tab.id)) return;
+    tab.usedSavedPassword = useSaved || jumpCredentials?.useSaved;
     if (enterPassword) tab.promptForPassword = true;
-    const credentials = tab.host.auth === 'agent' || useSaved ? { secret: '' } : await enterCredential(tab);
     if (!tabs.has(tab.id)) return;
     if (!credentials) { updateSession(tab, 'closed', '已取消连接。'); return; }
     tab.files.generation = (tab.files.generation || 0) + 1;
@@ -1644,7 +1672,7 @@ async function connect(tab, enterPassword = false) {
     tab.files.error = '';
     tab.files.loading = false;
     if (tab.attempts++) tab.terminal.write('\r\n\x1b[90m── 正在建立新 SSH 会话 ──\x1b[0m\r\n');
-    await api.ssh.connect({ id: tab.id, expected: tab.host, ...credentials, useSaved, dimensions: { rows: tab.terminal.rows, cols: tab.terminal.cols } });
+    await api.ssh.connect({ id: tab.id, expected: tab.host, ...credentials, jump: jumpHost ? { expected: jumpHost, ...jumpCredentials } : undefined, dimensions: { rows: tab.terminal.rows, cols: tab.terminal.cols } });
   } catch (error) {
     if (tabs.has(tab.id)) updateSession(tab, 'closed', message(error));
   }
@@ -1655,7 +1683,8 @@ async function openHost(host, { force = false, draftTab } = {}) {
   if (host.auth === 'key' && !host.keyPath) { await editHost(host, draftTab); return; }
   const sessions = [...tabs.values()].filter((tab) => tab.kind === 'shell' && tab.host.id === host.id);
   const existing = sessions.filter((tab) => ['ready', 'trust', 'connecting'].includes(tab.status)
-    && ['address', 'port', 'username', 'auth', 'keyPath'].every((field) => tab.host[field] === host[field])).sort((a, b) => b.used - a.used)[0];
+    && ['address', 'port', 'username', 'auth', 'keyPath', 'jumpHostId'].every((field) => tab.host[field] === host[field])
+    && (!host.jumpHostId || ['address', 'port', 'username', 'auth', 'keyPath', 'jumpHostId'].every((field) => tab.jumpHost?.[field] === hosts.find((item) => item.id === host.jumpHostId)?.[field]))).sort((a, b) => b.used - a.used)[0];
   if (existing && !force && !draftTab) { selectTab(existing); return; }
   const tab = draftTab || { id: sessionId() };
   Object.assign(tab, { kind: 'shell', host, status: 'idle', number: Math.max(0, ...sessions.map((entry) => entry.number)) + 1,
@@ -1701,7 +1730,7 @@ function updateSession(tab, next, detail = '') {
   if (next === 'ready') {
     recent.set(tab.host.id, Date.now());
     void api.hosts.touch(tab.host.id).catch(() => {});
-    if (active === tab) status(`${tab.host.name} · SSH 已连接`);
+    if (active === tab) status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
     focusTerminal(tab);
     if (active?.kind === 'new') renderQuickConnect(active);
     if (filesOpen && origin() === tab) ensureFiles(tab);
@@ -1940,7 +1969,7 @@ async function uploadDroppedFiles(tab, ticket, count) {
   status('正在核对当前终端目录…');
   let directory = await currentTerminalDirectory(tab);
   if (!readySession(tab, attempt) || active !== tab || dialog.open || $('session-switcher').open) return;
-  status(`${tab.host.name} · SSH 已连接`);
+  status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
   if (!directory) {
     directory = await chooseRemoteDirectory(tab, attempt, count);
   }
@@ -2190,7 +2219,7 @@ async function prepareTransfer(tab, direction, names, { directory = tab.files.di
   try {
     prepared = await api.files.prepare({ id: tab.id, direction, directory, names, dropTicket });
   } finally {
-    if ($('status').textContent === preparing && origin() === tab) status(`${tab.host.name} · SSH 已连接`);
+    if ($('status').textContent === preparing && origin() === tab) status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
   }
   if (!prepared) return;
   const { ticket, files } = prepared;
@@ -2385,12 +2414,22 @@ api.onEvent((event) => {
   } else if (event.type === 'transfer') updateJob(event);
   else if (tab && event.type === 'trust') {
     tab.fingerprint = event.fingerprint;
+    tab.trustHost = event.host;
+    tab.trustStage = event.stage;
+    tab.trustChallenge = event.challenge;
     updateSession(tab, 'trust');
   } else if (tab && event.type === 'password') {
-    tab.passwordSaveError = event.failed ? event.message : '';
+    const errors = tab.passwordSaveErrors ||= new Map();
+    const host = event.host || tab.host;
+    if (event.failed) errors.set(host.id, `${host.name} · ${event.message}`);
+    else errors.delete(host.id);
+    tab.passwordSaveError = [...errors.values()].join('；');
     if (!event.failed) tab.promptForPassword = false;
-    status(`${tab.host.name} · ${event.message}`);
+    if (tab === active) status(`${host.name} · ${event.message}`);
     if (tab === active) renderContext();
+  } else if (tab && event.type === 'progress') {
+    tab.message = event.message;
+    if (tab === active) status(`${tab.host.name} · ${event.message}`);
   } else if (tab) {
     if (event.retryWithPassword) tab.promptForPassword = true;
     updateSession(tab, event.status, event.message);

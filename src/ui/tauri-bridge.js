@@ -19,6 +19,7 @@
     keys: bind({ scan: 'keys:scan', agent: 'keys:agent', directory: 'keys:directory', generate: 'keys:generate', copy: 'keys:copy' }),
     hosts: bind({ list: 'hosts:list', recent: 'hosts:recent', touch: 'hosts:touch', save: 'hosts:save', remove: 'hosts:delete', forget: 'hosts:forget', pickKey: 'hosts:key-picker', hasPassword: 'hosts:has-password', revealPassword: 'hosts:reveal-password', clearPassword: 'hosts:clear-password', removeGroup: 'hosts:remove-group', importPreview: 'hosts:import-preview', import: 'hosts:import' }),
     ssh: {
+      jumpHosts: true,
       connect(value) {
         inputs.set(value.id, { pending: Promise.resolve() });
         return request('ssh:connect', value);

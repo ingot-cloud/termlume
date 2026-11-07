@@ -2,7 +2,7 @@
 
 Termlume 把主机列表、SSH 终端、SFTP 文件和日志输出放在同一个桌面窗口里。项目约定集中在以下文档：
 
-- [产品规划与跟进](PRODUCT_PLAN.md)：功能对比、当前状态、任务编号、优先级和验收条件。下一项建议为 `C-001` 单跳跳板机。
+- [产品规划与跟进](PRODUCT_PLAN.md)：功能对比、当前状态、任务编号、优先级和验收条件。已实现 `C-001` 单跳跳板机，下一项为 `C-002` 本地端口转发。
 - [工作台交互规范](WORKSPACE_UX.md)：主机、会话、文件和命令的操作规则。
 - [视觉与组件规范](STYLE_GUIDE.md)：深色样式基线、颜色与尺寸变量、组件状态、参考图和视觉验收。
 
@@ -27,6 +27,12 @@ npm start
 npm run tauri:build -- --bundles app -- --locked
 codesign --force --sign - 'src-tauri/target/release/bundle/macos/Termlume.app'
 ```
+
+## 单跳跳板机
+
+先保存一台可直连的跳板主机（跳板侧 SSH 服务须允许 TCP 转发），再编辑目标主机，在「SSH 连接 → 连接路径」选择「经 …」。两端可分别选择密码、本机私钥或 Agent；连接时分别核对指纹。终端、文件和日志共用此跳板路径，目标域名在跳板侧解析。已有会话保留建立时的路径，修改配置后从主机列表新建连接。
+
+当前支持一跳。被引用的跳板须先解除关联才能删除；备份或同步恢复后，缺失的跳板或本机私钥须重新配置。OpenSSH 的 ProxyJump/ProxyCommand 暂不自动转换。Electron 原型会保留跳板字段并提示使用 macOS 应用。
 
 ## Electron 原型
 
