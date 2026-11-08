@@ -427,6 +427,13 @@ fn validate_credentials(host: &Host, credentials: &Credentials) -> Result<(), St
     }
 }
 
+pub fn saved_key_passphrase(data: &Data, host: &Host) -> Option<crate::store::KeyPassphrase> {
+    data.key_passphrases
+        .get(&host.id)
+        .filter(|saved| host.auth == "key" && host.key_path.as_ref() == Some(&saved.key_path))
+        .cloned()
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum PasswordSource {
     Local {
@@ -654,7 +661,7 @@ async fn connect_peer(
     tunnel: Option<russh::ChannelStream<client::Msg>>,
     jump: bool,
 ) -> Result<(Client, Option<RememberRequest>), String> {
-    let (source, previous) = {
+    let (source, previous, key_source) = {
         let store = ws.store.lock().unwrap();
         crate::ensure_epoch(&store, epoch)?;
         let data = store.data()?;
@@ -675,7 +682,22 @@ async fn connect_peer(
             }
             .cloned(),
             previous,
+            credentials
+                .secret
+                .is_empty()
+                .then(|| saved_key_passphrase(data, host))
+                .flatten(),
         )
+    };
+    let saved_key = if let Some(source) = &key_source {
+        let token = source.token;
+        Some(Zeroizing::new(
+            crate::blocking(move || keys::get_password(token))
+                .await
+                .map_err(|_| "无法读取已保存的私钥口令，请在编辑主机中重新配置。")?,
+        ))
+    } else {
+        None
     };
     let saved = match source {
         Some(source) => Some((read_password(&source).await?, source)),
@@ -734,6 +756,9 @@ async fn connect_peer(
         if let Some((_, source)) = &saved {
             check_password(data, host, source)?;
         }
+        if key_source.is_some() && saved_key_passphrase(data, host) != key_source {
+            return Err("私钥口令已变更，请重新连接。".into());
+        }
     }
     authenticate(
         &mut client,
@@ -741,6 +766,7 @@ async fn connect_peer(
         saved
             .as_ref()
             .map(|(password, _)| password.as_str())
+            .or_else(|| saved_key.as_ref().map(|secret| secret.as_str()))
             .unwrap_or(&credentials.secret),
     )
     .await?;
@@ -936,7 +962,7 @@ async fn authenticate(client: &mut Client, host: &Host, secret: &str) -> Result<
                 let bytes = Zeroizing::new(bounded_read(&path, 256 * 1024)?);
                 let text = std::str::from_utf8(&bytes).map_err(error)?;
                 russh::keys::decode_secret_key(text, (!pass.is_empty()).then_some(pass.as_str()))
-                    .map_err(error)
+                    .map_err(|_| "无法解锁私钥，请在编辑主机中配置或更新私钥口令。".to_owned())
             })
             .await?;
             let hash = client

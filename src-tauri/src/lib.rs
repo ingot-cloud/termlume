@@ -461,6 +461,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         | "hosts:delete"
         | "hosts:forget"
         | "hosts:has-password"
+        | "hosts:has-key-passphrase"
         | "hosts:clear-password"
         | "hosts:remove-group"
         | "hosts:import" => {
@@ -704,6 +705,10 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
             let host = current.connection_host(id(&value)?)?;
             return Ok(json!(ssh::has_saved_password(current, &host)));
         }
+        "hosts:has-key-passphrase" => {
+            let host = current.connection_host(id(&value)?)?;
+            return Ok(json!(ssh::saved_key_passphrase(current, &host).is_some()));
+        }
         _ => {}
     }
     let mut data = current.clone();
@@ -720,6 +725,7 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
             }
             data.hosts.retain(|host| host.id != id);
             data.local_passwords.remove(&id);
+            data.key_passphrases.remove(&id);
             data.portable_passwords.remove(&id);
             data.recent.remove(&id);
             json!(data.hosts)
@@ -804,6 +810,19 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
 }
 
 fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
+    let key_passphrase = match request
+        .as_object_mut()
+        .and_then(|obj| obj.remove("localKeyPassphrase"))
+    {
+        None | Some(Value::Null) => None,
+        Some(Value::String(secret))
+            if !secret.is_empty() && secret.len() <= 4096 && !secret.contains('\0') =>
+        {
+            Some(Zeroizing::new(secret))
+        }
+        _ => return Err("私钥口令格式无效。".into()),
+    };
+    let clear_key_passphrase = flag(&request, "clearKeyPassphrase");
     let password = match request
         .as_object_mut()
         .and_then(|obj| obj.remove("localPassword"))
@@ -880,6 +899,16 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
         data.local_passwords.remove(&host.id);
         data.portable_passwords.remove(&host.id);
     }
+    if clear_key_passphrase
+        || data.key_passphrases.get(&host.id).is_some_and(|saved| {
+            host.auth != "key" || host.key_path.as_ref() != Some(&saved.key_path)
+        })
+    {
+        data.key_passphrases.remove(&host.id);
+    }
+    if key_passphrase.is_some() && (host.auth != "key" || host.key_path.is_none()) {
+        return Err("请先选择本机私钥，再保存私钥口令。".into());
+    }
     let new_token = if let Some(password) = password {
         if host.auth != "password" || password.is_empty() || password.encode_utf16().count() > 4096
         {
@@ -896,11 +925,33 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
     } else {
         None
     };
+    let new_key_token = if let Some(secret) = key_passphrase {
+        let token = Uuid::new_v4();
+        if keys::set_password(token, &secret).is_err() {
+            if let Some(token) = new_token {
+                keys::delete_password(token);
+            }
+            return Err("无法保存私钥口令，请检查 macOS 钥匙串。".into());
+        }
+        data.key_passphrases.insert(
+            host.id,
+            store::KeyPassphrase {
+                token,
+                key_path: host.key_path.clone().unwrap(),
+            },
+        );
+        Some(token)
+    } else {
+        None
+    };
     data.hosts.retain(|item| item.id != host.id);
     data.hosts.push(host);
     let result = json!(data.connection_hosts());
     if let Err(err) = store.update(data) {
         if let Some(token) = new_token {
+            keys::delete_password(token);
+        }
+        if let Some(token) = new_key_token {
             keys::delete_password(token);
         }
         return Err(err);

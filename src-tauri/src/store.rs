@@ -280,6 +280,13 @@ pub enum LocalPassword {
     Legacy(String),
 }
 
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyPassphrase {
+    pub token: Uuid,
+    pub key_path: PathBuf,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Binding {
@@ -338,6 +345,8 @@ pub struct Data {
     pub fingerprints: Vec<Fingerprint>,
     pub recent: BTreeMap<Uuid, u64>,
     pub local_passwords: BTreeMap<Uuid, LocalPassword>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub key_passphrases: BTreeMap<Uuid, KeyPassphrase>,
     pub portable_passwords: BTreeMap<Uuid, Password>,
     pub lock_settings: LockSettings,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -521,6 +530,19 @@ impl Data {
         self.snippets = snippets;
         self.layouts = layouts;
         crate::assets::migrate_groups(self);
+        let valid_keys: HashSet<_> = self
+            .key_passphrases
+            .iter()
+            .filter_map(|(id, saved)| {
+                self.connection_host(*id)
+                    .ok()
+                    .filter(|host| {
+                        host.auth == "key" && host.key_path.as_ref() == Some(&saved.key_path)
+                    })
+                    .map(|_| *id)
+            })
+            .collect();
+        self.key_passphrases.retain(|id, _| valid_keys.contains(id));
         self.sync = sync;
     }
 }
@@ -680,6 +702,15 @@ impl Store {
     }
     fn forget_removed_passwords(&self, new: &Data) {
         if let Some(old) = &self.data {
+            for (id, saved) in &old.key_passphrases {
+                if !new
+                    .key_passphrases
+                    .get(id)
+                    .is_some_and(|kept| kept.token == saved.token)
+                {
+                    crate::keys::delete_password(saved.token);
+                }
+            }
             for (id, entry) in &old.local_passwords {
                 if let LocalPassword::Native { token, .. } = entry {
                     if !matches!(new.local_passwords.get(id), Some(LocalPassword::Native { token: kept, .. }) if kept == token)
@@ -690,8 +721,21 @@ impl Store {
             }
         }
     }
-    pub fn update(&mut self, data: Data) -> Result<(), String> {
+    pub fn update(&mut self, mut data: Data) -> Result<(), String> {
         self.data()?;
+        let valid_keys: HashSet<_> = data
+            .key_passphrases
+            .iter()
+            .filter_map(|(id, saved)| {
+                data.connection_host(*id)
+                    .ok()
+                    .filter(|host| {
+                        host.auth == "key" && host.key_path.as_ref() == Some(&saved.key_path)
+                    })
+                    .map(|_| *id)
+            })
+            .collect();
+        data.key_passphrases.retain(|id, _| valid_keys.contains(id));
         if let Some(envelope) = &self.envelope {
             let encoded = vault::encode(
                 self.key.as_ref().ok_or("请先解锁保险库。")?,

@@ -25,7 +25,7 @@
     groups: bind({list:'groups:list',save:'groups:save',remove:'groups:delete'}),
     identities: bind({ list:'identities:list', save:'identities:save', remove:'identities:delete' }),
     keys: bind({ scan: 'keys:scan', agent: 'keys:agent', directory: 'keys:directory', generate: 'keys:generate', copy: 'keys:copy' }),
-    hosts: bind({ list: 'hosts:list', recent: 'hosts:recent', touch: 'hosts:touch', save: 'hosts:save', remove: 'hosts:delete', forget: 'hosts:forget', pickKey: 'hosts:key-picker', hasPassword: 'hosts:has-password', revealPassword: 'hosts:reveal-password', clearPassword: 'hosts:clear-password', removeGroup: 'hosts:remove-group', csvPreview:'hosts:csv-preview', importPreview: 'hosts:import-preview', import: 'hosts:import' }),
+    hosts: bind({ list: 'hosts:list', recent: 'hosts:recent', touch: 'hosts:touch', save: 'hosts:save', remove: 'hosts:delete', forget: 'hosts:forget', pickKey: 'hosts:key-picker', hasPassword: 'hosts:has-password', hasKeyPassphrase: 'hosts:has-key-passphrase', revealPassword: 'hosts:reveal-password', clearPassword: 'hosts:clear-password', removeGroup: 'hosts:remove-group', csvPreview:'hosts:csv-preview', importPreview: 'hosts:import-preview', import: 'hosts:import' }),
     ssh: {
       jumpHosts: true,
       connect(value) {

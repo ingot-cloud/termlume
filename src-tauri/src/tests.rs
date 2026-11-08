@@ -337,6 +337,76 @@ async fn connect_tab(
 }
 
 #[tokio::test]
+#[ignore = "requires isolated OpenSSH and macOS keychain fixtures"]
+async fn macos_host_key_passphrase_persists_connects_and_cleans_up() {
+    let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
+    let (profile, ws) = make_workspace(&fixture, None);
+    let port: u16 = std::fs::read_to_string(fixture.join("openssh-port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let secret = "fixture key passphrase";
+    let mut host = call(&ws, "hosts:save", json!({"address":"127.0.0.1", "port":port, "username":std::env::var("USER").unwrap(), "auth":"key", "keyPath":fixture.join("client-rsa"), "localKeyPassphrase":secret})).await[0].clone();
+    let host_id = id(&host["id"]).unwrap();
+    assert_eq!(
+        call(&ws, "hosts:has-key-passphrase", json!(host_id)).await,
+        true
+    );
+    let token = {
+        let store = ws.store.lock().unwrap();
+        let data = store.data().unwrap();
+        let rows = serde_json::to_string(&data.snapshot()).unwrap();
+        assert!(!rows.contains(secret));
+        assert!(!rows.contains("keyPassphrases"));
+        data.key_passphrases[&host_id].token
+    };
+    assert_eq!(keys::get_password(token).unwrap(), secret);
+    assert!(
+        !std::fs::read_to_string(profile.path().join("workspace.json"))
+            .unwrap()
+            .contains(secret)
+    );
+    host["name"] = json!("renamed key host");
+    host = call(&ws, "hosts:save", host).await[0].clone();
+    assert_eq!(
+        ws.store.lock().unwrap().data().unwrap().key_passphrases[&host_id].token,
+        token
+    );
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), fixture.clone(), None).unwrap();
+    let mut rx = events(&ws);
+    let tab = connect_tab(&ws, &mut rx, &host, "", false, false).await;
+    call(&ws, "ssh:close", json!(tab)).await;
+
+    host["localKeyPassphrase"] = json!(secret);
+    host = call(&ws, "hosts:save", host).await[0].clone();
+    assert!(keys::get_password(token).is_err());
+    let replaced = ws.store.lock().unwrap().data().unwrap().key_passphrases[&host_id].token;
+    host["keyPath"] = json!(fixture.join("client"));
+    host = call(&ws, "hosts:save", host).await[0].clone();
+    assert_eq!(
+        call(&ws, "hosts:has-key-passphrase", json!(host_id)).await,
+        false
+    );
+    assert!(keys::get_password(replaced).is_err());
+
+    host["localKeyPassphrase"] = json!(secret);
+    host = call(&ws, "hosts:save", host).await[0].clone();
+    host["clearKeyPassphrase"] = json!(true);
+    host = call(&ws, "hosts:save", host).await[0].clone();
+    assert_eq!(
+        call(&ws, "hosts:has-key-passphrase", json!(host_id)).await,
+        false
+    );
+    host["localKeyPassphrase"] = json!(secret);
+    call(&ws, "hosts:save", host).await;
+    let last = ws.store.lock().unwrap().data().unwrap().key_passphrases[&host_id].token;
+    call(&ws, "hosts:delete", json!(host_id)).await;
+    assert!(keys::get_password(last).is_err());
+}
+
+#[tokio::test]
 async fn vault_and_host_requests_round_trip() {
     let home = tempfile::tempdir().unwrap();
     let (profile, ws) = make_workspace(home.path(), None);
