@@ -2220,6 +2220,39 @@ async fn macos_remote_mutations_upload_directory_and_edit_conflicts() {
         .as_array()
         .unwrap()
         .is_empty());
+    let opened = call(&ws, "files:read-text", json!({"id":tab,"path":target})).await;
+    assert_eq!(opened["text"], "approved local text");
+    let saved = call(
+        &ws,
+        "files:save-text",
+        json!({"id":tab,"path":opened["path"],"revision":opened["revision"],"text":"新内容\r\n"}),
+    )
+    .await;
+    assert_eq!(std::fs::read(&target).unwrap(), "新内容\r\n".as_bytes());
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    let saved = call(
+        &ws,
+        "files:save-text",
+        json!({"id":tab,"path":opened["path"],"revision":saved["revision"],"text":"keep\n"}),
+    )
+    .await;
+    std::fs::write(&target, b"edit\n").unwrap();
+    assert!(dispatch(
+        &ws,
+        "files:save-text",
+        json!({"id":tab,"path":opened["path"],"revision":saved["revision"],"text":"overwrite"}),
+    )
+    .await
+    .unwrap_err()
+    .contains("远端文件已改变"));
+    assert_eq!(std::fs::read(&target).unwrap(), b"edit\n");
+    std::fs::write(&target, b"binary\0").unwrap();
+    assert!(dispatch(&ws, "files:read-text", json!({"id":tab,"path":target}))
+        .await
+        .is_err());
     call(&ws, "ssh:close", json!(tab)).await;
 }
 

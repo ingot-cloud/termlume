@@ -1,5 +1,6 @@
 const { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
+const bundleFileEditor = require('./bundle-file-editor.cjs');
 
 const root = join(__dirname, '..');
 const output = join(root, 'dist', 'tauri-ui');
@@ -21,7 +22,8 @@ mkdirSync(output, { recursive: true });
 for (const [file, source] of Object.entries(assets)) {
   copyFileSync(join(root, source), join(output, file));
 }
+writeFileSync(join(output, 'file-editor.js'), bundleFileEditor());
 const html = readFileSync(join(root, 'src/ui/index.html'), 'utf8')
   .replace(/^[ \t]*<meta http-equiv="Content-Security-Policy".*\n/m, '')
-  .replace('<script defer src="/renderer.js">', '<script defer src="/bridge.js"></script>\n  <script defer src="/renderer.js">');
+  .replace('<script defer src="/renderer.js">', '<script defer src="/bridge.js"></script>\n  <script defer src="/file-editor.js"></script>\n  <script defer src="/renderer.js">');
 writeFileSync(join(output, 'index.html'), html);

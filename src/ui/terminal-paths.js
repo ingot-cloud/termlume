@@ -45,6 +45,23 @@
 
     const links = [];
     const lineText = text.trim();
+    const addLink = (value, index) => {
+      const start = points[index];
+      const end = points[index + value.length - 1];
+      if (row + 1 < start.y || row + 1 > end.y) return;
+      const path = resolve(value, directory(first));
+      links.push({ path, text: value, range: { start, end: { x: end.x + end.width - 1, y: end.y } } });
+    };
+    // Long listings separate the filename from the timestamp with a single space.
+    const listing = /^\s*([bcdlps-])[rwxstST-]{9}[.+@]?\s+\d+\s+\S+\s+\S+\s+\S+\s+(?:\S+\s+\d{1,2}\s+(?:\d{2}:\d{2}|\d{4})|\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+/u.exec(text);
+    if (listing) {
+      const tail = text.slice(listing[0].length).trimEnd();
+      const name = listing[1] === 'l' ? tail.split(' -> ', 1)[0] : tail;
+      if (/^[\p{L}\p{N}_. /-]+$/u.test(name)) {
+        addLink(name, listing[0].length);
+        return links;
+      }
+    }
     for (const match of text.matchAll(/"([^"]+)"|'([^']+)'|[^\s"'`()[\]{}<>=]+/gu)) {
       const quoted = match[1] !== undefined || match[2] !== undefined;
       const value = match[1] ?? match[2] ?? match[0];
@@ -54,12 +71,7 @@
       const column = /\s{2,}$/.test(before) || /^\s{2,}\S/.test(after);
       const simpleName = (lineText === match[0] || column) && /^[\p{L}\p{N}_. -]+$/u.test(value);
       if (!value.includes('/') && !simpleName && !/^[\p{L}\p{N}_.-]+\.[\p{L}\p{N}_-]{1,16}$/u.test(value)) continue;
-      const index = match.index + Number(quoted);
-      const start = points[index];
-      const end = points[index + value.length - 1];
-      if (row + 1 < start.y || row + 1 > end.y) continue;
-      const path = resolve(value, directory(first));
-      links.push({ path, text: value, range: { start, end: { x: end.x + end.width - 1, y: end.y } } });
+      addLink(value, match.index + Number(quoted));
     }
     return links;
   }
@@ -129,7 +141,12 @@
       });
       callback(links.map(({ path, text, range }) => ({
         text, range,
-        activate: (event) => { if (event.metaKey && event.button === 0) activate(path, text); }
+        activate: (event) => {
+          if (event.metaKey && event.button === 0) {
+            const last = directories.at(-1);
+            activate(path, text, !last || range.start.y - 1 >= last.marker.line);
+          }
+        }
       })));
     }
     terminal.registerLinkProvider({ provideLinks });
@@ -140,6 +157,15 @@
       get emptyPrompt() {
         const { baseY, cursorY, cursorX } = terminal.buffer.active;
         return ordinaryBuffer() && prompt?.line === baseY + cursorY && prompt.column === cursorX ? prompt : undefined;
+      },
+      get visiblePrompt() {
+        if (hasInput || !ordinaryBuffer()) return undefined;
+        const buffer = terminal.buffer.active;
+        const { baseY, cursorY, cursorX } = buffer;
+        const line = buffer.getLine(baseY + cursorY);
+        const prefix = line?.translateToString(false, 0, cursorX);
+        if (!prefix || !/[#$%❯➜]\s*$/u.test(prefix) || line.translateToString(true, cursorX)) return undefined;
+        return `${baseY + cursorY}:${cursorX}:${prefix}`;
       },
       invalidate(data = '') {
         prompt = undefined;

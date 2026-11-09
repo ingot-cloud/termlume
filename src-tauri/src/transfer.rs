@@ -867,7 +867,7 @@ impl Job {
             *committing = true;
             self.emit(ws, file, "committing", *bytes, "");
             if file.upload {
-                publish_remote(file, &sftp, &remote_temp, replace).await?;
+                publish_remote(&file.session, &sftp, &remote_temp, &file.remote, replace).await?;
                 created = false;
             } else if replace {
                 fs::rename(&local_temp, &file.local).await.map_err(error)?;
@@ -1215,13 +1215,14 @@ fn publish_folder(source: &Path, target: &Path) -> Result<(), String> {
 }
 
 async fn publish_remote(
-    file: &File,
+    session: &Session,
     sftp: &SftpSession,
     temp: &str,
+    path: &str,
     replace: bool,
 ) -> Result<(), String> {
     let result = if replace {
-        let channel = tokio::time::timeout(Duration::from_secs(15), sftp_channel(&file.session))
+        let channel = tokio::time::timeout(Duration::from_secs(15), sftp_channel(session))
             .await
             .map_err(|_| "打开 SFTP 会话超时。")??;
         let raw = RawSftpSession::new(channel.into_stream());
@@ -1231,7 +1232,7 @@ async fn publish_remote(
             return Err("服务器不支持原子覆盖，请改用另存。".into());
         }
         let mut args = Vec::new();
-        for value in [temp, file.remote.as_str()] {
+        for value in [temp, path] {
             args.extend((value.len() as u32).to_be_bytes());
             args.extend(value.as_bytes());
         }
@@ -1242,7 +1243,7 @@ async fn publish_remote(
             Err(e) => Err(e),
         }
     } else {
-        sftp.rename(temp, &file.remote).await
+        sftp.rename(temp, path).await
     };
     result.map_err(|e| match e {
         SftpError::Status(_) => error(e),
@@ -1462,24 +1463,136 @@ impl Editors {
         Ok(())
     }
 }
-async fn editor_read(sftp: &SftpSession, path: &str) -> Result<(Vec<u8>, Stat), String> {
-    let stat = remote_stat(sftp.symlink_metadata(path).await.map_err(error)?);
-    if !stat.regular || stat.size > 4 * 1024 * 1024 {
-        return Err("外部编辑仅支持不超过 4 MiB 的普通 UTF-8 文本文件。".into());
+const EDITOR_LIMIT: usize = 4 * 1024 * 1024;
+
+async fn read_editor_file(
+    sftp: &SftpSession,
+    path: &str,
+) -> Result<(Vec<u8>, FileAttributes), String> {
+    let attrs = sftp.symlink_metadata(path).await.map_err(error)?;
+    if !attrs.file_type().is_file() || attrs.size.is_some_and(|size| size > EDITOR_LIMIT as u64) {
+        return Err("编辑器支持不超过 4 MiB 的普通 UTF-8 文本文件。".into());
     }
     let mut file = sftp.open(path).await.map_err(error)?;
     let mut bytes = Vec::new();
     let read = (&mut file)
-        .take(4 * 1024 * 1024 + 1)
+        .take(EDITOR_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)
         .await
         .map_err(error);
     let _ = file.close().await;
     read?;
-    if bytes.len() > 4 * 1024 * 1024 || std::str::from_utf8(&bytes).is_err() || bytes.contains(&0) {
-        return Err("请选择 UTF-8 文本文件。".into());
+    if bytes.len() > EDITOR_LIMIT || std::str::from_utf8(&bytes).is_err() || bytes.contains(&0) {
+        return Err("编辑器支持不超过 4 MiB 的普通 UTF-8 文本文件。".into());
     }
-    Ok((bytes, stat))
+    Ok((bytes, attrs))
+}
+
+async fn editor_read(sftp: &SftpSession, path: &str) -> Result<(Vec<u8>, Stat), String> {
+    let (bytes, attrs) = read_editor_file(sftp, path).await?;
+    Ok((bytes, remote_stat(attrs)))
+}
+
+fn text_revision(bytes: &[u8], attrs: &FileAttributes) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}:{:?}:{:?}:{:?}:{:?}",
+        Sha256::digest(bytes),
+        attrs.mtime,
+        attrs.permissions,
+        attrs.uid,
+        attrs.gid
+    )
+}
+
+pub async fn read_text(session: &Session, path: &str) -> Result<Value, String> {
+    let sftp = open(session).await?;
+    let path = canonical_entry(&sftp, path).await?;
+    let (bytes, attrs) = read_editor_file(&sftp, &path).await?;
+    let revision = text_revision(&bytes, &attrs);
+    Ok(
+        json!({"path": path, "text": String::from_utf8(bytes).map_err(error)?, "revision": revision}),
+    )
+}
+
+pub async fn save_text(
+    ws: &Workspace,
+    session: &Session,
+    path: &str,
+    text: &str,
+    expected: &str,
+) -> Result<Value, String> {
+    if text.len() > EDITOR_LIMIT || text.as_bytes().contains(&0) {
+        return Err("编辑结果须为不超过 4 MiB 的 UTF-8 文本。".into());
+    }
+    let _mutation = mutation_guard(ws, session)?;
+    let sftp = open(session).await?;
+    let path = canonical_entry(&sftp, path).await?;
+    let conflict = "远端文件已改变。请重新打开并合并修改。";
+    let (original, attrs) = read_editor_file(&sftp, &path).await?;
+    if text_revision(&original, &attrs) != expected {
+        return Err(conflict.into());
+    }
+    // Verify write permission on the original even when its parent is writable.
+    sftp.open_with_flags(&path, OpenFlags::WRITE)
+        .await
+        .map_err(error)?
+        .close()
+        .await
+        .map_err(error)?;
+    let parent = path.rsplit_once('/').ok_or("路径无效。")?.0;
+    let temporary = remote_join(parent, &format!(".termlume-{}.part", Uuid::new_v4()));
+    let mut create = FileAttributes::empty();
+    create.permissions = Some(0o600);
+    let mut file = sftp
+        .open_with_flags_and_attributes(
+            &temporary,
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
+            create,
+        )
+        .await
+        .map_err(error)?;
+    let result = async {
+        file.write_all(text.as_bytes()).await.map_err(error)?;
+        file.flush().await.map_err(error)?;
+        let mut permissions = FileAttributes::empty();
+        permissions.permissions = attrs.permissions.map(|mode| mode & 0o7777);
+        let staged = file.metadata().await.map_err(error)?;
+        if (staged.uid, staged.gid) != (attrs.uid, attrs.gid) {
+            permissions.uid = attrs.uid;
+            permissions.gid = attrs.gid;
+        }
+        file.set_metadata(permissions).await.map_err(error)?;
+        file.sync_all().await.map_err(error)?;
+        let staged = file.metadata().await.map_err(error)?;
+        file.close().await.map_err(error)?;
+        if (staged.uid, staged.gid, staged.permissions) != (attrs.uid, attrs.gid, attrs.permissions)
+        {
+            return Err("无法保留远端文件的权限或所有者。".into());
+        }
+        let (latest, latest_attrs) = read_editor_file(&sftp, &path).await?;
+        if text_revision(&latest, &latest_attrs) != expected {
+            return Err(conflict.into());
+        }
+        ws.store.lock().unwrap().data()?;
+        if session.cancel.is_cancelled() {
+            return Err("SSH 会话已断开。".into());
+        }
+        publish_remote(session, &sftp, &temporary, &path, true).await?;
+        Ok(json!({"revision": text_revision(text.as_bytes(), &staged)}))
+    }
+    .await;
+    if let Err(failure) = result {
+        if remote_target(&sftp, &temporary)
+            .await
+            .is_ok_and(|entry| entry.is_none())
+            || sftp.remove_file(&temporary).await.is_ok()
+        {
+            return Err(failure);
+        }
+        return Err(format!("{failure} 请检查远端临时文件 {temporary}"));
+    }
+    result
 }
 pub async fn open_editor(
     ws: &Workspace,

@@ -9,16 +9,25 @@ const extract = (from, to) => renderer.slice(renderer.indexOf(from), renderer.in
 function fixture() {
   const session = {id:'production-session',status:'ready',attempts:1,host:{id:'production',name:'生产',username:'ops',address:'example.test',port:22}};
   const calls = [];
+  session.terminal = {
+    buffer: { active: { type: 'normal' } },
+    modes: { mouseTrackingMode: 'none' },
+    paste: data => calls.push(['input', { id: session.id, data }])
+  };
   const scope = {
-    tabs:new Map([[session.id, session]]), vaultStatus:{locked:false},
-    api:{ssh:{input:async value => calls.push(['input',value])},snippets:{run:async value => calls.push(['run',value])}},
+    tabs:new Map([[session.id, session]]), vaultStatus:{locked:false}, active: session,
+    api:{snippets:{run:async value => calls.push(['run',value])}},
     confirm:async (...args) => { calls.push(['confirm',args]); return true; },
     endpoint:host=>`${host.username}@${host.address}`, sessionId:()=> 'command-output',
     attachTerminal:tab=> calls.push(['terminal',tab]), selectTab:tab=> calls.push(['select',tab]),
-    updateSession:()=>{},message:error=>String(error)
+    updateSession:()=>{},focusTerminal:()=>{},status:()=>{},message:error=>String(error)
   };
   vm.createContext(scope);
-  vm.runInContext(extract('function readySession(', '\nfunction renderTerminalDirectory(') + extract('async function useSnippet(', '\nasync function manageGroups('), scope);
+  vm.runInContext([
+    extract('function readySession(', '\nfunction renderTerminalDirectory('),
+    extract('function fillTerminalCommand(', '\nasync function configureCommand('),
+    extract('async function useSnippet(', '\nasync function manageGroups(')
+  ].join('\n'), scope);
   return {scope,session,calls,snippet:{id:'disk',name:'磁盘',command:'df -h',tags:[]}};
 }
 
@@ -30,6 +39,8 @@ test('saved command paste targets only the selected SSH session and never append
   assert.equal(calls[0][1].data, 'df -h');
   assert.equal(calls.some(([type]) => type === 'run'), false);
   await assert.rejects(scope.useSnippet(session,{...snippet,command:'pwd\nuptime'},true,1), /多行命令/);
+  session.terminal.buffer.active.type = 'alternate';
+  await assert.rejects(scope.useSnippet(session,snippet,true,1), /交互程序/);
   assert.equal(calls.filter(([type])=>type==='input').length, 1);
 });
 

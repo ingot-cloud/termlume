@@ -81,13 +81,54 @@
     const search = dialog.querySelector('input'); search.value = 'disk'; search.dispatchEvent(new Event('input'));
     assert(dialog.querySelectorAll('.palette-choice').length === 2, '命令标签搜索包含执行与单行粘贴');
     // Label and target occupy separate spans.
-    [...dialog.querySelectorAll('.palette-choice')].find(b => b.firstElementChild.textContent === '粘贴 · 磁盘巡检')?.click();
+    [...dialog.querySelectorAll('.palette-choice')].find(b => b.firstElementChild.textContent === '填入终端 · 磁盘巡检')?.click();
     await palette;
     assert(previewCalls.some(([type,value]) => type === 'input' && value.id === production.id && value.data === 'df -h'), '粘贴绑定原会话且不追加回车');
     const multi = openPalette('commands'); await tick();
     const multiSearch = dialog.querySelector('input'); multiSearch.value = '服务检查'; multiSearch.dispatchEvent(new Event('input'));
-    assert(dialog.querySelectorAll('.palette-choice').length === 1 && dialog.querySelector('.palette-choice').textContent.startsWith('执行'), '多行命令只提供执行预览');
+    assert(dialog.querySelectorAll('.palette-choice').length === 1 && dialog.querySelector('.palette-choice').textContent.startsWith('独立执行'), '多行命令保留独立执行预览');
     dialog.close(); await multi;
+    const beforeShortcut = tabs.size;
+    const shortcut = configureCommand(production, 'disk');
+    findButton(dialog, '填入终端').click();
+    await shortcut;
+    assert(tabs.size === beforeShortcut && active === production && previewCalls.at(-1)[1].data === 'df -h', '内置快捷命令填入当前会话，不回车或创建标签');
+    const folder = openLinkedTerminalPath(production, undefined, 'config');
+    await tick();
+    assert(dialog.open && !dialog.querySelector('input') && ['在终端进入目录','在文件面板打开','下载目录'].every(label => findButton(dialog, label)), '相对目录直接显示三种操作');
+    const pendingInputs = previewCalls.filter(([type]) => type === 'input').length;
+    findButton(dialog, '在终端进入目录').click();
+    await tick();
+    assert(dialog.open && dialog.querySelector('[role=alert]').textContent.includes('空的 Shell 提示符') &&
+      previewCalls.filter(([type]) => type === 'input').length === pendingInputs, '目录操作保留尚未提交的终端输入');
+    dialog.close();
+    await folder;
+    production.terminal.input('\r', true);
+    await new Promise(resolve => production.terminal.write('\r\n[ops@api ~]$ ', resolve));
+    const enterFolder = openLinkedTerminalPath(production, "/srv/app/it's ready");
+    await tick();
+    findButton(dialog, '在终端进入目录').click();
+    await enterFolder;
+    assert(previewCalls.at(-1)[0] === 'input' && previewCalls.at(-1)[1].id === production.id &&
+      previewCalls.at(-1)[1].data === "cd -- '/srv/app/it'\\''s ready'\r", '目录操作直接执行安全引用的 cd');
+    await openLinkedTerminalPath(production, '/srv/app/config.json');
+    await tick();
+    assert(fileEditor.open && !dialog.open && fileEditor.querySelector('.cm-line span'), `文件直接打开，按 JSON 格式高亮（${fileEditor.querySelector('[role=status]')?.textContent || '无提示'}）`);
+    findButton(fileEditor, '全屏').click();
+    await tick();
+    assert(fileEditor.clientWidth === innerWidth && fileEditor.clientHeight === innerHeight, '编辑器可填满应用窗口');
+    findButton(fileEditor, '下载远端文件').click();
+    await tick();
+    assert(fileEditor.open && previewCalls.at(-1)[0] === 'prepare' && previewCalls.at(-1)[1].names[0] === 'config.json', '下载绑定当前远端文件，保留编辑器');
+    fileEditor.querySelector('.cm-content').focus();
+    document.execCommand('insertText', false, ' ');
+    await tick();
+    findButton(fileEditor, '保存到远端').click();
+    await tick();
+    assert(previewCalls.at(-1)[0] === 'save-text' && previewCalls.at(-1)[1].text.startsWith(' {\r\n') &&
+      previewCalls.at(-1)[1].revision === 'original' && findButton(fileEditor, '保存到远端').disabled, '编辑器保存绑定初始版本并保留 CRLF');
+    findButton(fileEditor, '关闭').click();
+    await tick();
     toggleFiles(); await tick();
     findButton($('files'), 'var').click(); await tick();
     assert(previewCalls.at(-1)[1].id === production.id && previewCalls.at(-1)[1].directory === '/var', '面包屑按原主机的绝对路径跳转');
@@ -104,6 +145,16 @@
     const connectCount = previewCalls.filter(([type]) => type === 'connect').length;
     splitGrip.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));
     assert(splitLayout.ratio === 55 && connectCount === previewCalls.filter(([type]) => type === 'connect').length, '分屏调整保留连接');
+    splitLayout = undefined; selectTab(production);
+    const terminalOverflow = tab => tab.view.querySelector('.xterm-screen').getBoundingClientRect().bottom
+      - tab.view.querySelector('.terminal-surface').getBoundingClientRect().bottom;
+    await new Promise(resolve => production.terminal.write('output\r\n'.repeat(150) + 'prompt$ ', resolve));
+    await tick();
+    assert(terminalOverflow(production) <= 0.5, '输出滚到底后最后一行完整显示');
+    splitLayout = {panes:[production.id,staging.id],direction:'vertical',ratio:50};
+    selectTab(production); await tick();
+    const overflow = [production, staging].map(terminalOverflow);
+    assert(overflow.every(pixels => pixels <= 0.5), `上下分屏各自完整显示最后一行（溢出像素 ${overflow.join(', ')}）`);
     splitLayout = undefined; selectTab(production);
     assert(document.documentElement.scrollWidth <= innerWidth, '工作台无页面横向溢出');
     const report = document.createElement('details');

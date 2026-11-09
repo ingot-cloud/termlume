@@ -603,6 +603,24 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             return transfer::inspect_path(&session, string(&value["path"])?).await;
         }
         #[cfg(desktop)]
+        "files:read-text" | "files:save-text" => {
+            ws.store.lock().unwrap().data()?;
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            let path = string(&value["path"])?;
+            return if name == "files:read-text" {
+                transfer::read_text(&session, path).await
+            } else {
+                transfer::save_text(
+                    ws,
+                    &session,
+                    path,
+                    string(&value["text"])?,
+                    string(&value["revision"])?,
+                )
+                .await
+            };
+        }
+        #[cfg(desktop)]
         "files:mkdir" => {
             let session = ws.connections.connected(id(&value["id"])?)?;
             transfer::mkdir(

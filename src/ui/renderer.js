@@ -6,6 +6,7 @@ const { selectControl, editableControl, close: closeDropdown } = window.dropdown
 const $ = (id) => document.getElementById(id);
 const workspace = $('workspace');
 const dialog = $('dialog');
+const fileEditor = $('file-editor');
 const pageButtons = $('workspace-nav').querySelectorAll('[data-page]');
 const tabs = new Map();
 const jobs = new Map();
@@ -357,7 +358,7 @@ function applyVaultState(state) {
     $('terminal-drop').hidden = true;
     closeDropdown();
     closeHostMenu();
-    for (const pane of [$('key-dialog'), $('session-switcher'), dialog]) if (pane.open) pane.close();
+    for (const pane of [$('key-dialog'), $('session-switcher'), dialog, fileEditor]) if (pane.open) pane.close();
     $('keys-page').replaceChildren();
     leaveSettings();
     hosts = [];
@@ -1124,7 +1125,7 @@ async function editPreferences(page) {
   const p=await api.preferences.get();const theme=node('select');const terminal=node('select');for(const[value,label]of [['dark','深色'],['light','浅色'],['system','跟随系统']]){const o=node('option','',label);o.value=value;theme.append(o);}theme.value=p.theme;
   for(const[value,label]of [['dark','深色终端'],['light','浅色终端']]){const o=node('option','',label);o.value=value;terminal.append(o);}terminal.value=p.terminalTheme;
   const family=input(p.fontFamily);const size=input(p.fontSize,'number');size.min=9;size.max=32;const history=input('','checkbox');history.checked=p.recordCommands;
-  await ask('界面与终端偏好',[field('应用主题',selectControl(theme,'应用主题')),field('终端配色',selectControl(terminal,'终端配色')),field('终端字体',family),field('默认字号（9–32）',size),node('label','checkbox-row',history,'保存通过命令库和快捷命令执行的历史'),node('p','muted','偏好与历史仅保存在此设备；不采集任意终端键入和密码提示中的输入。')],'保存偏好',async()=>{uiPreferences=await api.preferences.save({theme:theme.value,terminalTheme:terminal.value,fontFamily:family.value,fontSize:Number(size.value),recordCommands:history.checked});applyPreferences(true);return uiPreferences;},[],{closeOnSubmit:false,back:false});
+  await ask('界面与终端偏好',[field('应用主题',selectControl(theme,'应用主题')),field('终端配色',selectControl(terminal,'终端配色')),field('终端字体',family),field('默认字号（9–32）',size),node('label','checkbox-row',history,'保存通过独立通道执行的命令历史'),node('p','muted','偏好与历史仅保存在此设备；不采集任意终端键入和密码提示中的输入。')],'保存偏好',async()=>{uiPreferences=await api.preferences.save({theme:theme.value,terminalTheme:terminal.value,fontFamily:family.value,fontSize:Number(size.value),recordCommands:history.checked});applyPreferences(true);return uiPreferences;},[],{closeOnSubmit:false,back:false});
 }
 async function toggleRecording(session){
   if(recordingSessions.has(session.id)){await api.logs.stop(session.id);recordingSessions.delete(session.id);}
@@ -1143,7 +1144,7 @@ async function manageLogs(page){
   }renderContext();
 }
 async function commandHistory(session){const history=await api.history.list();let selected;const list=history.slice().reverse().map(item=>node('section','forward-rule',node('strong','',`${item.host} · ${new Date(item.at).toLocaleString()}`),node('pre','operation-results',item.command),...(session?.status==='ready'?[button('执行到当前会话',()=>{selected=item;dialog.close();},'outlined')]:[])));
-  await prompt('本机命令执行历史',list.length?list:[node('p','muted','在偏好中开启后，仅保存由命令库和快捷命令执行的记录。')],'关闭',()=>true,[button('清空历史',async()=>{if(window.confirm('清空本机命令历史？')){await api.history.clear();dialog.close();}},'outlined danger')]);
+  await prompt('本机命令执行历史',list.length?list:[node('p','muted','在偏好中开启后，仅保存应用通过独立通道执行的命令。')],'关闭',()=>true,[button('清空历史',async()=>{if(window.confirm('清空本机命令历史？')){await api.history.clear();dialog.close();}},'outlined danger')]);
   if(selected&&await confirm('再次执行',`原目标 ${selected.endpoint}\n当前目标 ${endpoint(session.host)}\n${selected.command}`,'执行')){const tab={id:sessionId(),kind:'command',sessionId:session.id,host:session.host,action:'custom',status:'connecting'};attachTerminal(tab);tabs.set(tab.id,tab);selectTab(tab);await api.commands.start({id:tab.id,sessionId:session.id,request:{action:'custom',argument:selected.command,lines:100}});}
 }
 
@@ -1162,8 +1163,14 @@ function renderSplitLayout() {
   container.dataset.split=split?splitLayout.direction:'';container.style.gridTemplateColumns='';container.style.gridTemplateRows='';
   for(const tab of tabs.values()) if(tab.view){tab.view.hidden=split?!splitLayout.panes.includes(tab.id):tab!==active;tab.view.classList.toggle('split-focused',Boolean(split&&tab===active));tab.view.dataset.paneTitle=tabTitle(tab);if(split)tab.view.style.order=String(splitLayout.panes.indexOf(tab.id)*2);else tab.view.style.order='';}
   if(split){
-    const dimension=splitLayout.direction==='vertical'?'gridTemplateRows':'gridTemplateColumns';
-    const resize=()=>{container.style[dimension]=`${splitLayout.ratio}fr 7px ${100-splitLayout.ratio}fr`;splitGrip.setAttribute('aria-valuenow',String(Math.round(splitLayout.ratio)));for(const id of splitLayout.panes)tabs.get(id)?.fit.fit();};
+    const vertical = splitLayout.direction === 'vertical';
+    const dimension = vertical ? 'gridTemplateRows' : 'gridTemplateColumns';
+    const track = (fraction) => vertical ? `minmax(var(--pane-min-height), ${fraction}fr)` : `minmax(0, ${fraction}fr)`;
+    const resize = () => {
+      container.style[dimension] = `${track(splitLayout.ratio)} 7px ${track(100 - splitLayout.ratio)}`;
+      splitGrip.setAttribute('aria-valuenow', String(Math.round(splitLayout.ratio)));
+      for (const id of splitLayout.panes) tabs.get(id)?.fit.fit();
+    };
     splitGrip=node('div','split-grip');splitGrip.style.order='1';splitGrip.tabIndex=0;splitGrip.setAttribute('role','separator');splitGrip.setAttribute('aria-label','调整分屏尺寸');splitGrip.setAttribute('aria-orientation',splitLayout.direction==='vertical'?'horizontal':'vertical');
     splitGrip.setAttribute('aria-valuemin','20');splitGrip.setAttribute('aria-valuemax','80');
     splitGrip.addEventListener('keydown',event=>{if(['ArrowLeft','ArrowUp','ArrowRight','ArrowDown'].includes(event.key)){event.preventDefault();splitLayout.ratio=Math.max(20,Math.min(80,splitLayout.ratio+(['ArrowLeft','ArrowUp'].includes(event.key)?-5:5)));resize();}});
@@ -1218,8 +1225,7 @@ async function useSnippet(session, snippet, paste = false, attempt = session?.at
   if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择目标。');
   if (paste) {
     if (/[\r\n]/.test(snippet.command)) throw new Error('多行命令请使用执行预览。');
-    await api.ssh.input({id: session.id, data: snippet.command});
-    selectTab(session);
+    fillTerminalCommand(session, snippet.command, attempt);
     return;
   }
   if (!await confirm('执行保存的命令', `${session.host.name} · ${endpoint(session.host)}\n以当前 SSH 用户在独立命令通道执行：\n${snippet.command}`, '执行')) return;
@@ -1756,7 +1762,8 @@ async function importHosts(csv=false) {
 }
 
 function attachTerminal(tab) {
-  const view = node('div', 'terminal-view');
+  const surface = node('div', 'terminal-surface');
+  const view = node('div', 'terminal-view', surface);
   view.hidden = true;
   $('terminal-views').append(view);
   const styles = getComputedStyle(document.documentElement);
@@ -1776,10 +1783,9 @@ function attachTerminal(tab) {
   const search = new SearchAddon.SearchAddon();
   terminal.loadAddon(fit);
   terminal.loadAddon(search);
-  terminal.open(view);
-  const paths = terminalPaths.observe(terminal, (path, text) => {
-    const action = path ? openTerminalPath(tab, path) : chooseTerminalPath(tab, text);
-    void action.catch((error) => status(message(error)));
+  terminal.open(surface);
+  const paths = terminalPaths.observe(terminal, (path, text, mayProbe) => {
+    void openLinkedTerminalPath(tab, path, text, mayProbe).catch((error) => status(message(error)));
   }, () => { if (active === tab) renderTerminalDirectory(); }, () => tab.kind === 'shell' && tab.status === 'ready');
   view.addEventListener('contextmenu', (event) => {
     const selected = terminal.getSelection().trim();
@@ -1808,7 +1814,9 @@ function attachTerminal(tab) {
     } catch (error) { status(message(error)); }
   }, true);
   view.addEventListener('pointerdown',()=>{if(active!==tab&&splitLayout?.panes.includes(tab.id)) selectTab(tab);});
-  const resizeObserver=new ResizeObserver(()=>{if(!view.hidden)fit.fit();});resizeObserver.observe(view);tab.resizeObserver=resizeObserver;
+  const resizeObserver = new ResizeObserver(() => { if (surface.clientHeight) fit.fit(); });
+  resizeObserver.observe(surface);
+  tab.resizeObserver = resizeObserver;
   Object.assign(tab, { view, terminal, fit, search, paths });
   applyTerminalPreferences(tab);
 }
@@ -1875,7 +1883,7 @@ function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session'
 }
 
 function focusTerminal(tab) {
-  if (active === tab && !vaultStatus.locked && !dialog.open && !$('key-dialog').open && !$('session-switcher').open) {
+  if (active === tab && !vaultStatus.locked && !dialog.open && !fileEditor.open && !$('key-dialog').open && !$('session-switcher').open) {
     tab?.terminal?.focus();
   }
 }
@@ -2425,8 +2433,10 @@ async function openPalette(scope = 'all') {
       for (const [action, label] of Object.entries(actionLabels).filter(([action]) => action !== 'custom'))
         add('内置动作', label, session.host.name, () => { if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择命令。'); return configureCommand(session, action); });
       for (const snippet of snippets) {
-        add('保存的命令', `执行 · ${snippet.name}`, session.host.name, () => useSnippet(session, snippet, false, attempt), `${snippet.command} ${snippet.tags.join(' ')}`);
-        if (!/[\r\n]/.test(snippet.command)) add('保存的命令', `粘贴 · ${snippet.name}`, `${session.host.name} · 不发送回车`, () => useSnippet(session, snippet, true, attempt), `${snippet.command} ${snippet.tags.join(' ')}`);
+        const keywords = `${snippet.command} ${snippet.tags.join(' ')}`;
+        const multiline = /[\r\n]/.test(snippet.command);
+        if (!multiline) add('保存的命令', `填入终端 · ${snippet.name}`, '按回车后执行', () => useSnippet(session, snippet, true, attempt), keywords);
+        if (multiline || scope !== 'commands') add('保存的命令', `独立执行 · ${snippet.name}`, session.host.name, () => useSnippet(session, snippet, false, attempt), keywords);
       }
       add('会话操作', '在新标签连接', session.host.name, () => openHost(session.host, {force: true}));
     }
@@ -2452,7 +2462,7 @@ async function openPalette(scope = 'all') {
     if (submit) submit.disabled = !entries.length;
   };
   search.addEventListener('input', update);
-  const target = session ? node('p', 'palette-target muted', `命令目标：${session.host.name} · ${endpoint(session.host)}${readySession(session, attempt) ? '' : ' · 连接后可执行命令'}`) : node('p', 'palette-target muted', '连接主机后可粘贴或执行保存的命令');
+  const target = session ? node('p', 'palette-target muted', `命令目标：${session.host.name} · ${endpoint(session.host)}${readySession(session, attempt) ? '' : ' · 连接后可填入命令'}`) : node('p', 'palette-target muted', '连接主机后可粘贴或执行保存的命令');
   const selection = prompt(scope === 'commands' ? '快捷命令' : '快速查找', [search, target, choices], '打开首项', () => entries[0]?.run);
   wireSearchChoices(search.form, search, choices, '.palette-choice');
   update();
@@ -2460,6 +2470,18 @@ async function openPalette(scope = 'all') {
   const run = selected || first;
   if (!vaultStatus.locked && run) await run();
   else focusTerminal(source);
+}
+
+function fillTerminalCommand(session, command, attempt) {
+  if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择命令。');
+  const { terminal } = session;
+  if (terminal.buffer.active.type !== 'normal' || terminal.modes.mouseTrackingMode !== 'none') {
+    throw new Error('请退出终端中的交互程序后再填入命令。');
+  }
+  if (active !== session) selectTab(session);
+  terminal.paste(command);
+  focusTerminal(session);
+  status('已填入当前终端 · 确认输入位置和命令后按回车执行');
 }
 
 async function configureCommand(session, action, file) {
@@ -2485,21 +2507,19 @@ async function configureCommand(session, action, file) {
   void update();
   const fields = [node('p', '', `目标 ${endpoint(session.host)}`)];
   if (action !== 'disk') fields.push(field(action === 'journal' ? '服务名' : '日志文件绝对路径', argument), field('行数', lines));
-  const details = await prompt(actionLabels[action], [...fields, preview], file ? '打开输出标签' : '运行命令', async () => {
+  if (!file) fields.push(node('p', 'muted', '请先让终端停在 Shell 提示符。填入后可修改，再按回车执行。'));
+  const details = await prompt(actionLabels[action], [...fields, preview], file ? '打开输出标签' : '填入终端', async () => {
     if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择命令。');
     const command = request();
     return { request: command, preview: await api.commands.preview(command) };
   });
   if (!details || !readySession(session, attempt)) { focusTerminal(source); return; }
+  if (!file) { fillTerminalCommand(session, details.preview, attempt); return; }
   const tab = { id: sessionId(), kind: 'command', sessionId: session.id, host: session.host, action, status: 'connecting' };
   attachTerminal(tab);
   tab.terminal.write(`\x1b[90m$ ${details.preview}\x1b[0m\r\n`);
   tabs.set(tab.id, tab);
-  if (file) selectTab(tab);
-  else {
-    selectTab(session);
-    status(`已启动「${actionLabels[action]}」 · 查看输出可打开命令标签`);
-  }
+  selectTab(tab);
   try { await api.commands.start({ id: tab.id, sessionId: session.id, request: details.request }); }
   catch (error) {
     if (!tabs.has(tab.id)) return;
@@ -2543,11 +2563,23 @@ async function currentTerminalDirectory(tab) {
   return terminalPaths.absolute(probed) ? probed : undefined;
 }
 
-async function chooseTerminalPath(source = active, selected) {
+async function openLinkedTerminalPath(source, path, text, mayProbe = true) {
+  if (path) return openTerminalPath(source, path);
+  const tab = origin(source);
+  if (active !== source || !readySession(tab) || dialog.open || fileEditor.open) return;
+  const attempt = tab.attempts;
+  const directory = mayProbe && source === tab ? await currentTerminalDirectory(tab) : undefined;
+  if (active !== source || !readySession(tab, attempt) || dialog.open || fileEditor.open) return;
+  const resolved = terminalPaths.resolve(text, directory);
+  if (resolved) return openTerminalPath(source, resolved);
+  return chooseTerminalPath(source, text, directory || '');
+}
+
+async function chooseTerminalPath(source = active, selected, knownDirectory) {
   const tab = origin(source);
   if (!readySession(tab) || active !== source || dialog.open) return;
   const attempt = tab.attempts;
-  const directory = source === tab && !terminalPaths.absolute(selected) ? await currentTerminalDirectory(tab) : undefined;
+  const directory = knownDirectory ?? (source === tab && !terminalPaths.absolute(selected) ? await currentTerminalDirectory(tab) : undefined);
   if (active !== source || !readySession(tab, attempt) || dialog.open) return;
   const value = input(selected ? terminalPaths.resolve(selected, directory) || selected : directory);
   value.placeholder = '/var/log/app.log';
@@ -2573,11 +2605,10 @@ async function chooseTerminalPath(source = active, selected) {
 
 async function openTerminalPath(source, candidate, inspected) {
   const tab = origin(source);
-  if (active !== source || !readySession(tab) || dialog.open) return;
+  if (active !== source || !readySession(tab) || dialog.open || fileEditor.open) return;
   const attempt = tab.attempts;
-  const emptyPrompt = source === tab ? tab.paths.emptyPrompt : undefined;
   const { path, kind, downloadable } = inspected || await api.files.inspect({ id: tab.id, path: candidate });
-  if (active !== source || !readySession(tab, attempt) || dialog.open) return;
+  if (active !== source || !readySession(tab, attempt) || dialog.open || fileEditor.open) return;
 
   const detail = node('p', '', endpoint(tab.host), ' · ', node('code', '', path));
   const downloadPath = async () => {
@@ -2586,25 +2617,26 @@ async function openTerminalPath(source, candidate, inspected) {
     await prepareTransfer(tab, 'down', [path.slice(split + 1)], { directory: path.slice(0, split) || '/' });
   };
   if (kind === 'file') {
-    const download = await prompt('远端文件', [detail], '下载到本机', () => true);
-    if (download) await downloadPath();
+    if (api.files.readText) openRemoteFile(tab, path, downloadPath);
+    else if (await prompt('远端文件', [detail], '下载到本机', () => true)) await downloadPath();
   } else if (kind === 'directory') {
-    const command = `cd -- '${path.replaceAll("'", "'\\''")}'`;
-    if (emptyPrompt && emptyPrompt === tab.paths.emptyPrompt && !tab.pendingAcks?.size) {
-      tab.paths.invalidate('\r');
-      tab.terminal.focus();
-      api.ssh.input({ id: tab.id, data: command + '\r' });
-      return;
-    }
-    const copy = input(command);
-    copy.readOnly = true;
-    let download = false;
-    const actions = path !== '/' && downloadable && api.files.directoryDownloads
-      ? [button('下载目录', () => { download = true; dialog.close(); }, 'outlined')]
-      : [];
-    const browse = await prompt('远端目录', [detail, field('切换目录命令（可复制）', copy)], '在文件面板中打开', () => true, actions);
-    if (download) await downloadPath();
-    if (browse && readySession(tab, attempt) && active === source) {
+    const enter = node('button', 'outlined', '在终端进入目录');
+    const download = node('button', 'outlined', '下载目录');
+    enter.type = download.type = 'submit';
+    enter.value = 'enter';
+    download.value = 'download';
+    download.disabled = path === '/' || !downloadable || !api.files.directoryDownloads;
+    if (download.disabled) download.title = '当前路径不支持目录下载';
+    const choice = await prompt('远端目录', [detail], '在文件面板打开', async (action) => {
+      if (action === 'enter') await enterTerminalDirectory(tab, attempt, path);
+      return action || 'browse';
+    }, [enter, download]);
+    if (!readySession(tab, attempt) || active !== source) return;
+    if (choice === 'download') await downloadPath();
+    else if (choice === 'enter') {
+      if (active !== tab) selectTab(tab);
+      focusTerminal(tab);
+    } else if (choice === 'browse') {
       filesOpen = true;
       renderContext();
       await loadFiles(tab, path);
@@ -2614,13 +2646,122 @@ async function openTerminalPath(source, candidate, inspected) {
   }
 }
 
+async function enterTerminalDirectory(tab, attempt, path) {
+  const { paths } = tab;
+  const unconfirmed = '请让终端停在空的 Shell 提示符，再进入目录。';
+  if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化，请重新选择路径。');
+  if (tab.pendingAcks?.size) throw new Error(unconfirmed);
+  if (!paths.emptyPrompt) {
+    // Without a shell integration marker, verify the foreground shell as well as
+    // the rendered prompt so password prompts and unfinished input stay intact.
+    const prompt = paths.visiblePrompt;
+    if (!prompt || !terminalPaths.absolute(await api.ssh.directory?.(tab.id)) ||
+        prompt !== paths.visiblePrompt || tab.pendingAcks?.size) throw new Error(unconfirmed);
+  }
+  if (!dialog.open || !readySession(tab, attempt)) throw new Error('SSH 会话已变化，请重新选择路径。');
+  const command = `cd -- '${path.replaceAll("'", "'\\''")}'\r`;
+  tab.terminal.input(command, true);
+}
+
+function openRemoteFile(tab, path, downloadPath) {
+  const source = active;
+  const attempt = tab.attempts;
+  let editor, savedDoc, revision, remotePath, busy = false;
+  const title = summaryText('h2', path.split('/').at(-1));
+  title.id = 'file-editor-title';
+  const location = summaryText('p', `${endpoint(tab.host)} · ${path}`);
+  const notice = node('p', 'muted', '正在读取远端文件…');
+  notice.setAttribute('role', 'status');
+  const content = node('div', 'file-editor-content');
+  content.hidden = true;
+  const dirty = () => editor && !editor.state.doc.eq(savedDoc);
+  const refresh = () => {
+    save.disabled = busy || !dirty();
+    close.disabled = download.disabled = busy;
+  };
+  const save = button('保存到远端', async () => {
+    if (busy || !dirty()) return;
+    busy = true;
+    refresh();
+    const doc = editor.state.doc;
+    notice.textContent = '正在保存…';
+    try {
+      if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化。请重新打开文件后合并更改。');
+      const result = await api.files.saveText({ id: tab.id, path: remotePath, text: editor.state.sliceDoc(), revision });
+      savedDoc = doc;
+      revision = result.revision;
+      notice.textContent = dirty() ? '已保存先前版本 · 有新的未保存修改' : '已保存到远端';
+    } catch (error) {
+      notice.textContent = message(error);
+    } finally {
+      busy = false;
+      refresh();
+    }
+  }, 'primary');
+  const requestClose = () => {
+    if (busy || (dirty() && !window.confirm('关闭文件并放弃未保存的修改？'))) return;
+    fileEditor.close();
+  };
+  const close = button('关闭', requestClose);
+  const download = button('下载远端文件', async () => {
+    if (busy) return;
+    busy = true;
+    refresh();
+    try { await downloadPath(); }
+    catch (error) { notice.textContent = message(error); }
+    finally { busy = false; refresh(); }
+  }, 'outlined');
+  const expand = button('全屏', () => {
+    const expanded = fileEditor.classList.toggle('file-editor-expanded');
+    expand.textContent = expanded ? '退出全屏' : '全屏';
+    expand.setAttribute('aria-pressed', String(expanded));
+  }, 'outlined');
+  expand.setAttribute('aria-pressed', 'false');
+  const heading = node('header', 'file-editor-heading', node('div', '', title, location), expand);
+  const grip = node('div', 'file-editor-grip');
+  grip.setAttribute('aria-hidden', 'true');
+  const format = node('span', 'muted');
+  const cancel = (event) => { event.preventDefault(); requestClose(); };
+  fileEditor.addEventListener('cancel', cancel);
+  fileEditor.addEventListener('close', () => {
+    fileEditor.removeEventListener('cancel', cancel);
+    fileEditor.classList.remove('file-editor-expanded');
+    disposePlacement();
+    editor?.destroy();
+    fileEditor.replaceChildren();
+    focusTerminal(source);
+  }, { once: true });
+  fileEditor.replaceChildren(heading, content,
+    node('footer', 'file-editor-footer', node('div', 'file-editor-status', format, notice),
+      node('div', 'actions', close, download, save)), grip);
+  refresh();
+  fileEditor.showModal();
+  const disposePlacement = window.TermlumeFileEditor.moveAndResize(fileEditor, heading, grip);
+  void (async () => {
+    try {
+      const file = await api.files.readText({ id: tab.id, path });
+      if (!fileEditor.open || !content.isConnected) return;
+      if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化。请重新打开文件。');
+      ({ path: remotePath, revision } = file);
+      const view = window.TermlumeFileEditor.open(content, remotePath, file.text, refresh, () => save.click(),
+        document.documentElement.dataset.theme === 'dark');
+      editor = view.editor;
+      savedDoc = editor.state.doc;
+      content.hidden = false;
+      format.textContent = `${view.format} · UTF-8`;
+      notice.textContent = '';
+      editor.focus();
+    } catch (error) { notice.textContent = message(error); }
+  })();
+}
+
 function handleFileDrag({ phase, position, count, ticket }) {
   if (phase === 'enter' || phase === 'drop') draggedFileCount = count;
   if (phase === 'leave') draggedFileCount = 0;
   const overlay = $('terminal-drop');
   const tab = active;
   const rect = $('terminal-stage').getBoundingClientRect();
-  const eligible = draggedFileCount > 0 && readySession(tab) && !dialog.open &&
+  const eligible = draggedFileCount > 0 && readySession(tab) && !dialog.open && !fileEditor.open &&
     !$('session-switcher').open &&
     position && position.x >= rect.left && position.x < rect.right && position.y >= rect.top && position.y < rect.bottom;
   overlay.hidden = phase === 'drop' || !eligible;
@@ -3418,7 +3559,7 @@ $('close-find').addEventListener('click', () => {
   focusTerminal(active);
 });
 window.addEventListener('keydown', (event) => {
-  if (event.defaultPrevented || event.isComposing || dialog.open || $('key-dialog').open || sessionSwitcher.open || vaultStatus.locked || hostMenu) return;
+  if (event.defaultPrevented || event.isComposing || dialog.open || fileEditor.open || $('key-dialog').open || sessionSwitcher.open || vaultStatus.locked || hostMenu) return;
   if (event.key === 'Escape' && !$('terminal-find').hidden) { event.preventDefault(); $('close-find').click(); return; }
   if (!event.metaKey || event.ctrlKey || event.altKey) return;
   const key = event.key.toLowerCase();

@@ -58,6 +58,17 @@ async function main() {
     const { data } = await run('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync(path.join(root, 'dist/ux-review', name), Buffer.from(data, 'base64'));
   };
+  const drag = async (selector, dx, dy) => {
+    const { x, y } = await js(`(() => {
+      const r = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    })()`);
+    await run('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+    await run('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
+    await run('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x + dx, y: y + dy, buttons: 1 });
+    await run('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x + dx, y: y + dy, button: 'left', clickCount: 1 });
+    await tick();
+  };
   await run('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'no-preference'}]});
   for (const [width, height] of [[1140, 740], [550, 490]]) {
     await run('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
@@ -109,6 +120,31 @@ async function main() {
       await shot(`settings-${theme}-${width}.png`);
       await js("selectTab([...tabs.values()].find(tab=>tab.kind==='shell'))"); await tick(); await overflow();
       await shot(`session-${theme}-${width}.png`);
+      if (theme === 'dark') {
+        await js("openTerminalPath(active, '/srv/app/config.json')");
+        await wait("Boolean(fileEditor.querySelector('.cm-content'))");
+        const bounds = () => js('fileEditor.getBoundingClientRect().toJSON()');
+        const initial = await bounds();
+        await drag('.file-editor-grip', -100, -80);
+        const smaller = await bounds();
+        assert.equal(smaller.width, initial.width - 100);
+        assert.equal(smaller.height, initial.height - 80);
+        await drag('.file-editor-heading h2', 40, 30);
+        const moved = await bounds();
+        assert.equal(moved.x, smaller.x + 40);
+        assert.equal(moved.y, smaller.y + 30);
+        await js("fileEditor.querySelector('.file-editor-heading button').click()");
+        await tick();
+        const expanded = await bounds();
+        assert.deepEqual([expanded.x, expanded.y, expanded.width, expanded.height], [0, 0, width, height]);
+        assert(await js("fileEditor.querySelector('h2').getBoundingClientRect().top >= parseFloat(getComputedStyle(fileEditor).getPropertyValue('--titlebar-height'))"));
+        await overflow(); await shot(`file-editor-fullscreen-${width}.png`);
+        await js("fileEditor.querySelector('.file-editor-heading button').click()");
+        await tick();
+        assert.deepEqual(await bounds(), moved);
+        await js("[...fileEditor.querySelectorAll('button')].find(button => button.textContent === '关闭').click()");
+        await tick();
+      }
     }
   }
   await run('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
@@ -117,7 +153,7 @@ async function main() {
   assert.equal(await js('getComputedStyle(dialog).animationName'),'none');
   await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='取消').click()");
   assert.equal(await js('dialog.open'),false);
-  console.log('PASS: page navigation, private-key selection, hover highlighting, drawer motion/reduced motion, and button overflow at both sizes/themes.');
+  console.log('PASS: workspace navigation, hover and drawer behavior, and file-editor drag, resize, fullscreen and restore at both window sizes.');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   clearTimeout(deadline);
