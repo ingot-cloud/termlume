@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
+const { setImmediate: nextTurn } = require('node:timers/promises');
 
 // Exercise the actual renderer actions without a browser or a live SSH connection.
 const renderer = fs.readFileSync(require.resolve('../src/ui/renderer.js'), 'utf8');
@@ -76,4 +77,28 @@ test('canceling or reconnecting during command preview never starts the command'
     else await scope.useSnippet(session,snippet,false,1);
     assert.deepEqual(calls, []);
   }
+});
+
+test('the Tauri bridge sends a pending PTY resize before later terminal input', async () => {
+  const calls = [];
+  let finishResize;
+  const window = { __TAURI__: {
+    core: { invoke: async (_command, { name }) => {
+      calls.push(name);
+      if (name === 'ssh:resize') await new Promise(resolve => { finishResize = resolve; });
+    } },
+    window: { getCurrentWindow() {} }
+  } };
+  const bridge = fs.readFileSync(require.resolve('../src/ui/tauri-bridge.js'), 'utf8');
+  vm.runInNewContext(bridge, { window, navigator: { platform: 'MacIntel' } });
+  const { ssh } = window.termlume;
+  const id = 'session';
+  await ssh.connect({ id });
+  ssh.resize({ id, size: { cols: 210, rows: 46 } });
+  ssh.input({ id, data: 'ls\r' });
+  await nextTurn();
+  assert.deepEqual(calls, ['ssh:connect', 'ssh:resize']);
+  finishResize();
+  await nextTurn();
+  assert.deepEqual(calls, ['ssh:connect', 'ssh:resize', 'ssh:input']);
 });

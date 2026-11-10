@@ -2484,6 +2484,7 @@ async fn macos_commands_logs_remote_and_dynamic_forwards() {
     })
     .await;
     assert_eq!(closed["retryable"], true);
+    assert_eq!(closed["exited"], false);
     let normal = connect_tab(&ws, &mut rx, &host, "", false, false).await;
     call(&ws, "ssh:input", json!({"id":normal,"data":"exit\r"})).await;
     let closed = until(&mut rx, |e| {
@@ -2491,4 +2492,5 @@ async fn macos_commands_logs_remote_and_dynamic_forwards() {
     })
     .await;
     assert_eq!(closed["retryable"], false);
+    assert_eq!(closed["exited"], true);
 }

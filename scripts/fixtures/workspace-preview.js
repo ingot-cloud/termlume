@@ -6,6 +6,7 @@ const previewHosts = [
   {id:'jump',name:'运维跳板',address:'jump.example.test',username:'ops',port:22,auth:'agent',tags:['ops']}
 ];
 const previewCalls = [];
+const previewResizes = [];
 let previewListener;
 const previewKeySecrets = new Map();
 const previewKeys = [
@@ -26,7 +27,7 @@ window.termlume = {
   identities:{list:async()=>[{id:'ops',name:'运维共享身份',username:'ops',auth:'agent',hosts:[]}]},
   keys:{scan:async()=>({directory:'/preview/.ssh',keys:previewKeys}),agent:async()=>({available:true,keys:[]})},
   snippets:{list:async()=>previewSnippets,run:async value=>previewCalls.push(['run',value])},
-  ssh:{jumpHosts:true,connect:async value=>{previewCalls.push(['connect',value]);queueMicrotask(()=>previewListener({type:'session',id:value.id,status:'ready'}));},input:async value=>previewCalls.push(['input',value]),resize(){},ack(){},close:async()=>{},directory:async()=>'/srv/app'},
+  ssh:{jumpHosts:true,connect:async value=>{previewCalls.push(['connect',value]);queueMicrotask(()=>previewListener({type:'session',id:value.id,status:'ready'}));},input:async value=>previewCalls.push(['input',value]),resize:value=>previewResizes.push(value),ack(){},close:async()=>{},directory:async()=>'/srv/app'},
   commands:{preview:async()=> 'df -h',close:async()=>{},stop:async()=>{}},
   files:{
     directoryDownloads:true,directoryUploads:true,mutations:true,history:async()=>[],

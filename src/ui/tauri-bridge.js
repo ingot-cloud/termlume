@@ -7,7 +7,14 @@
   const bind = (names) => Object.fromEntries(Object.entries(names).map(([key, name]) =>
     [key, (value) => request(name, value)]));
   const notify = (name) => (value) => { void request(name, value).catch(() => {}); };
-  const inputs = new Map();
+  const terminalQueues = new Map();
+  const sendTerminal = (name) => (value) => {
+    const queue = terminalQueues.get(value.id);
+    if (!queue) return;
+    queue.pending = queue.pending.then(() => {
+      if (terminalQueues.get(value.id) === queue) return request(name, value);
+    }).catch(() => {});
+  };
   window.termlume = {
     chrome: {
       startDragging: () => appWindow.startDragging(),
@@ -29,22 +36,16 @@
     ssh: {
       jumpHosts: true,
       connect(value) {
-        inputs.set(value.id, { pending: Promise.resolve() });
+        terminalQueues.set(value.id, { pending: Promise.resolve() });
         return request('ssh:connect', value);
       },
       trust: (value) => request('ssh:trust', value),
       close(id) {
-        inputs.delete(id);
+        terminalQueues.delete(id);
         return request('ssh:close', id);
       },
-      input(value) {
-        const queue = inputs.get(value.id);
-        if (!queue) return;
-        queue.pending = queue.pending.then(() => {
-          if (inputs.get(value.id) === queue) return request('ssh:input', value);
-        }).catch(() => {});
-      },
-      resize: notify('ssh:resize'), ack: notify('ssh:ack'), directory: (id) => request('ssh:directory', id)
+      input: sendTerminal('ssh:input'),
+      resize: sendTerminal('ssh:resize'), ack: notify('ssh:ack'), directory: (id) => request('ssh:directory', id)
     },
     editors:bind({list:'editors:list',open:'editors:open',prepare:'editors:prepare',close:'editors:close'}),
     forwards: bind({ list: 'forwards:list', save: 'forwards:save', remove: 'forwards:delete', start: 'forwards:start', stop: 'forwards:stop' }),
@@ -59,7 +60,7 @@
       const events = new Channel();
       events.onmessage = (event) => {
         if (event.type === 'output') event.bytes = Uint8Array.from(atob(event.bytes), (byte) => byte.charCodeAt(0));
-        if (event.type === 'session' && event.status === 'closed') inputs.delete(event.id);
+        if (event.type === 'session' && event.status === 'closed') terminalQueues.delete(event.id);
         if (event.type === 'file-drag' && event.position) {
           // Wry supplies AppKit points on macOS, even though Tauri labels the payload physical.
           const scale = navigator.platform.startsWith('Mac') ? 1 : devicePixelRatio;

@@ -411,7 +411,8 @@ pub fn connect(ws: &Workspace, req: ConnectRequest) -> Result<(), String> {
         if ws.connections.remove(&session) && !canceled {
             let failed = result.is_err();
             ws.emit(json!({"type":"session","id":session.id,"status":"closed",
-                "message":result.err().unwrap_or_else(|| "远端会话已退出。".into()),"retryWithPassword":use_saved && failed,"retryable":failed&&session.client.get().is_some()&&session.allow_reconnect.load(std::sync::atomic::Ordering::SeqCst)}));
+                "message":result.err().unwrap_or_else(|| "远端会话已退出。".into()),"exited":!failed,
+                "retryWithPassword":use_saved && failed,"retryable":failed&&session.client.get().is_some()&&session.allow_reconnect.load(std::sync::atomic::Ordering::SeqCst)}));
         }
     });
     Ok(())
@@ -760,6 +761,7 @@ async fn connect_peer(
             return Err("私钥口令已变更，请重新连接。".into());
         }
     }
+    ws.emit(json!({"type":"progress","id":session.id,"message":format!("正在验证 {} 的 SSH 身份…", host.name)}));
     authenticate(
         &mut client,
         host,
@@ -844,6 +846,7 @@ async fn run_session(
         if let Some(remember) = remember {
             passwords.push(remember);
         }
+        ws.emit(json!({"type":"progress","id":session.id,"message":"正在打开远端终端…"}));
         let mut channel = client.channel_open_session().await.map_err(error)?;
         let (cols, rows) = req.dimensions.dimensions();
         channel
@@ -906,13 +909,17 @@ async fn run_session(
                         break;
                     }
                 }
-                ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. } => exited = true,
+                ChannelMsg::ExitStatus { .. } => exited = true,
+                ChannelMsg::ExitSignal { .. } => {
+                    session.allow_reconnect.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return Err("远端 Shell 被信号终止。".into());
+                }
                 ChannelMsg::Close => break,
                 ChannelMsg::Eof => {}
                 _ => {}
             }
         }
-        exited
+        if exited { Ok(()) } else { Err("SSH 连接已断开，原会话已结束。".into()) }
     };
     let write = async {
         while let Some(control) = input.recv().await {
@@ -942,7 +949,7 @@ async fn run_session(
     let result = tokio::select! {
         _ = jump_closed => Err("跳板机连接已断开。".into()),
         _ = session.cancel.cancelled() => Ok(()),
-        exited = read => if exited {Ok(())}else{Err("SSH 连接已断开，原会话已结束。".into())},
+        result = read => result,
         result = write => result,
     };
     result

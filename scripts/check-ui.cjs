@@ -119,8 +119,32 @@ async function main() {
       await js("openSettings('preferences')"); await wait("document.querySelector('#settings-page .settings-form')");
       await shot(`settings-${theme}-${width}.png`);
       await js("selectTab([...tabs.values()].find(tab=>tab.kind==='shell'))"); await tick(); await overflow();
+      await wait("!$('files').getAnimations().some(animation => animation.playState === 'running')");
+      await js(`(() => {
+        const search = $('files').querySelector('input[type="search"]');
+        search.value = '';
+        search.dispatchEvent(new Event('input'));
+      })()`);
+      assert(await js(`(() => {
+        const panel = $('files').getBoundingClientRect();
+        const list = $('files').querySelector('.file-list').getBoundingClientRect();
+        return list.top - panel.top <= 145 && list.height >= panel.height - 145;
+      })()`), 'File controls should leave the remaining panel height to the list');
       await shot(`session-${theme}-${width}.png`);
       if (theme === 'dark') {
+        const shellId = await js('active.id');
+        await js(`(async () => {
+          const connect = api.ssh.connect;
+          api.ssh.connect = async () => {};
+          try { await openHost(active.host, { force: true }); }
+          finally { api.ssh.connect = connect; }
+        })()`);
+        await tick();
+        await wait("getComputedStyle($('files')).visibility === 'hidden'");
+        await overflow(); await shot(`connection-progress-${width}.png`);
+        await js("previewListener({type:'session',id:active.id,status:'closed',exited:false,message:'SSH 连接超时。请检查网络连接和主机地址。'})");
+        await tick(); await overflow(); await shot(`connection-failed-${width}.png`);
+        await js(`removeTab(active); selectTab(tabs.get(${JSON.stringify(shellId)}))`);
         await js("openTerminalPath(active, '/srv/app/config.json')");
         await wait("Boolean(fileEditor.querySelector('.cm-content'))");
         const bounds = () => js('fileEditor.getBoundingClientRect().toJSON()');
@@ -142,18 +166,24 @@ async function main() {
         await js("fileEditor.querySelector('.file-editor-heading button').click()");
         await tick();
         assert.deepEqual(await bounds(), moved);
-        await js("[...fileEditor.querySelectorAll('button')].find(button => button.textContent === '关闭').click()");
+        await js("[...fileEditor.querySelectorAll('button')].find(button => button.textContent === '取消').click()");
         await tick();
       }
     }
   }
+  await js("if (filesOpen) toggleFiles(); selectTab([...tabs.values()].find(tab=>tab.kind==='shell'))");
+  await tick();
+  const narrowCols = await js("active.terminal.cols");
+  await run('Emulation.setDeviceMetricsOverride', { width: 1920, height: 1050, deviceScaleFactor: 1, mobile: false });
+  await wait(`active.terminal.cols > ${narrowCols} && active.terminal.cols > 150 &&
+    previewResizes.at(-1)?.id === active.id && previewResizes.at(-1)?.size.cols === active.terminal.cols`);
   await run('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
   await js("selectTab(undefined,'hosts');document.querySelector('.host-quick-edit').click()");
   await wait("document.querySelector('dialog[open] .host-form-section')");
   assert.equal(await js('getComputedStyle(dialog).animationName'),'none');
   await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='取消').click()");
   assert.equal(await js('dialog.open'),false);
-  console.log('PASS: workspace navigation, hover and drawer behavior, and file-editor drag, resize, fullscreen and restore at both window sizes.');
+  console.log('PASS: workspace navigation, compact file panel, and file-editor drag, resize, fullscreen and restore at both window sizes.');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   clearTimeout(deadline);

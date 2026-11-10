@@ -255,6 +255,10 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
     dialog.returnValue = '';
     const heading = node('h2', '', title);
     heading.id = 'dialog-title';
+    if (options.focusHeading) {
+      heading.tabIndex = -1;
+      heading.setAttribute('autofocus', '');
+    }
     const error = node('p', 'dialog-error');
     error.setAttribute('role', 'alert');
     const canClose = () => !busy && !drawerCloseAnimation && (!options.canClose || options.canClose());
@@ -262,7 +266,7 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
     const confirm = node('button', 'primary', submit);
     confirm.type = 'submit';
     confirm.value = options.submitValue || '';
-    const controls = node('div', 'actions', ...extra, cancel, confirm);
+    const controls = node('div', 'actions', ...extra, ...(options.cancelLast ? [confirm, cancel] : [cancel, confirm]));
     const form = options.drawer
       ? node('form', '', node('div', 'drawer-fields', ...fields, error), controls)
       : node('form', '', node('div','dialog-fields',...fields,error), controls);
@@ -309,7 +313,8 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
       }
     });
     dialog.showModal();
-    (options.focus || form.querySelector('input:not([hidden]), .dropdown-trigger'))?.focus({ preventScroll: true });
+    const focus = options.focusHeading ? heading : options.focus || form.querySelector('input:not([hidden]), .dropdown-trigger');
+    focus?.focus({ preventScroll: true });
   });
 }
 
@@ -342,6 +347,7 @@ async function refreshTouchIdAvailability() {
 }
 
 function applyVaultState(state) {
+  const wasLocked = vaultStatus.locked;
   const refreshTouchId = state.enabled !== vaultStatus.enabled || state.locked !== vaultStatus.locked;
   vaultStatus = state;
   if(!state.locked&&api.preferences) void api.preferences.get().then(p=>{if(!vaultStatus.locked&&JSON.stringify(p)!==JSON.stringify(uiPreferences)){const fonts=p.fontFamily!==uiPreferences.fontFamily||p.fontSize!==uiPreferences.fontSize;uiPreferences=p;applyPreferences(fonts);}}).catch(()=>{});
@@ -367,7 +373,10 @@ function applyVaultState(state) {
     $('quick-connect-results').replaceChildren();
     $('unlock-error').textContent = state.startupUnlockError || '';
     $('unlock-secret').focus();
-  } else if (transfersSupported && !historyReady) void loadTransferHistory();
+  } else {
+    if (wasLocked) for (const tab of tabs.values()) if (tab.status === 'ready') syncTerminalSize(tab);
+    if (transfersSupported && !historyReady) void loadTransferHistory();
+  }
   if (workspace.dataset.view === 'vault') renderVaultPage();
   if (refreshTouchId) void refreshTouchIdAvailability();
 }
@@ -1517,17 +1526,13 @@ async function editHost(host, draftTab, target) {
 
 function openGroup(group) {
   closeDropdown();
-  const previous = currentGroup;
   currentGroup = group;
-  selectedHostId = '';
-  selectedGroup = group ? '' : previous;
+  selectedHostId = selectedGroup = '';
   $('host-search').value = '';
   $('tag-filter').value = '';
   $('tag-filter').dispatchEvent(new Event('input'));
   renderHosts();
   $('host-library').scrollTop = 0;
-  const returnCard = [...$('host-list').querySelectorAll('.group-open')].find((card) => card.dataset.group === previous);
-  (group ? $('all-hosts') : returnCard || $('host-search')).focus({ preventScroll: true });
 }
 
 function groupCard(group, count) {
@@ -1704,13 +1709,18 @@ function renderHosts() {
   const searching = Boolean(query || tag);
   const matching = scope.filter((host) => (!tag || host.tags?.includes(tag)) && hostMatches(host, query, target));
   const visibleHosts = currentGroup || searching ? matching : matching.filter((host) => !host.group);
-  const recentHosts = !currentGroup && !searching ? [...hosts].filter(h => recent.has(h.id)).sort(recentFirst).slice(0, 4) : [];
-  if (![...visibleHosts, ...recentHosts].some((host) => host.id === selectedHostId)) selectedHostId = '';
+  if (!visibleHosts.some((host) => host.id === selectedHostId)) selectedHostId = '';
   visibleHosts.sort(recentFirst);
   const matchingGroups = new Set(matching.map((host) => host.group));
   const visibleGroups = [...groups]
-    .filter(([group]) => {const asset=groupAssets.find(g=>g.path===group);const parent=groupAssets.find(g=>g.id===asset?.parentId)?.path||'';return searching ? matchingGroups.has(group)||group.toLowerCase().includes(query) : asset ? parent===currentGroup : !currentGroup;})
+    .filter(([group]) => {
+      const asset = groupAssets.find((item) => item.path === group);
+      const parent = groupAssets.find((item) => item.id === asset?.parentId)?.path || '';
+      if (currentGroup && parent !== currentGroup) return false;
+      return searching ? matchingGroups.has(group) || group.toLowerCase().includes(query) : parent === currentGroup;
+    })
     .sort(([a], [b]) => a.localeCompare(b, 'zh-CN'));
+  if (!visibleGroups.some(([group]) => group === selectedGroup)) selectedGroup = '';
   $('host-breadcrumb').hidden = !currentGroup;
   $('current-group').textContent = $('current-group').title = currentGroup;
   $('remove-group').hidden = !currentGroup;
@@ -1720,21 +1730,19 @@ function renderHosts() {
   const draft = target && !exact.length;
   hostSearchMatch = saved ? { run: () => openHost(saved) } : draft ? { draft: true, run: () => editHost(undefined, undefined, target) } : undefined;
   updateHostActions();
-  const list = $('host-list');
-  const sections = [];
-  if (recentHosts.length) sections.push(hostSection('最近连接', recentHosts.map(hostCard)));
-  if (visibleGroups.length) sections.push(hostSection('分组', visibleGroups.map(([group, count]) => groupCard(group, count))));
-  const otherHosts = visibleHosts.filter(host => !recentHosts.includes(host));
-  if (otherHosts.length) sections.push(hostSection(searching ? '匹配的主机' : '主机', otherHosts.map(hostCard)));
-  else if (!searching && visibleGroups.length && !recentHosts.length) sections.push(hostSection('主机', [node('p', 'muted', '暂无未分组的主机')]));
-  if (!sections.length) {
-    sections.push(searching
-      ? node('div', 'empty-state', settingsIcon('server'), node('strong', '', draft ? '新 SSH 地址' : '没有匹配的结果'),
-        node('p', '', draft ? '按回车或点「填写主机」，核对连接信息后保存。' : '试试其他搜索词或清除筛选。'))
-      : node('div', 'empty-state', settingsIcon('server'), node('strong', '', '还没有已保存的主机'),
-        node('p', '', '保存连接信息后，可从这里打开 SSH 会话。'), button('新建主机', () => editHost(), 'primary')));
+  const groupEntries = visibleGroups.map(([group, count]) => groupCard(group, count));
+  const hostEntries = visibleHosts.map(hostCard);
+  if (!currentGroup && !groupEntries.length) groupEntries.push(node('p', 'muted', searching ? '没有匹配的分组' : '暂无分组'));
+  if (!hostEntries.length) {
+    const empty = draft ? '按回车或点「填写主机」，核对连接信息后保存。'
+      : searching ? '没有匹配的主机'
+      : currentGroup ? '分组中暂无主机' : '暂无未分组的主机';
+    hostEntries.push(node('p', 'muted', empty));
   }
-  list.replaceChildren(...sections);
+  const sections = [];
+  if (groupEntries.length) sections.push(hostSection(currentGroup ? '子分组' : '分组', groupEntries));
+  sections.push(hostSection(searching ? '匹配的主机' : '主机', hostEntries));
+  $('host-list').replaceChildren(...sections);
   renderSidebar();
 }
 
@@ -1798,7 +1806,7 @@ function attachTerminal(tab) {
     paths.invalidate(data);
     if (tab.status === 'ready') api.ssh.input({ id: tab.id, data });
   });
-  terminal.onResize((size) => { if (tab.kind === 'shell') api.ssh.resize({ id: tab.id, size }); });
+  terminal.onResize(() => syncTerminalSize(tab));
   for (const event of [terminal.onScroll, terminal.onWriteParsed]) event(() => {
     if (active === tab) renderTerminalBottom();
   });
@@ -1817,8 +1825,20 @@ function attachTerminal(tab) {
   const resizeObserver = new ResizeObserver(() => { if (surface.clientHeight) fit.fit(); });
   resizeObserver.observe(surface);
   tab.resizeObserver = resizeObserver;
-  Object.assign(tab, { view, terminal, fit, search, paths });
+  Object.assign(tab, { view, surface, terminal, fit, search, paths });
+  if (tab.kind === 'shell') {
+    tab.connectionPage = node('section', 'connection-page');
+    tab.connectionPage.setAttribute('aria-label', 'SSH 连接');
+    view.append(tab.connectionPage);
+    renderConnectionPage(tab);
+  }
   applyTerminalPreferences(tab);
+}
+
+function syncTerminalSize(tab) {
+  if (tab.kind === 'shell' && !vaultStatus.locked) {
+    api.ssh.resize({ id: tab.id, size: { rows: tab.terminal.rows, cols: tab.terminal.cols } });
+  }
 }
 
 function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session' : 'hosts') {
@@ -1856,6 +1876,7 @@ function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session'
     recent.set(tab.host.id, tab.used);
     status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
   }
+  else if (tab?.kind === 'shell') status(`${tab.host.name} · ${tab.message || sessionLabels[tab.status]}`);
   else if (tab?.kind === 'command') status(`${tab.host.name} · ${actionLabels[tab.action]}`);
   else if (view !== 'session') status(({ hosts: '已保存的主机', 'new-tab': '选择要连接的主机', keys: 'SSH 密钥', transfers: '上传和下载记录', vault: '保险库', settings: '工具与设置' })[view]);
   $('terminal-find').hidden = true;
@@ -1864,7 +1885,10 @@ function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session'
   renderSplitLayout();
   renderTabs();
   revealActiveTab('smooth');
-  if (view === 'hosts') renderHosts();
+  if (view === 'hosts') {
+    selectedHostId = selectedGroup = '';
+    renderHosts();
+  }
   renderContext();
   renderFiles();
   if (filesOpen) ensureFiles(origin());
@@ -1883,6 +1907,7 @@ function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session'
 }
 
 function focusTerminal(tab) {
+  if (tab?.connectionPage && !tab.connectionPage.hidden) return;
   if (active === tab && !vaultStatus.locked && !dialog.open && !fileEditor.open && !$('key-dialog').open && !$('session-switcher').open) {
     tab?.terminal?.focus();
   }
@@ -2190,20 +2215,79 @@ async function openForwardPanel(host, session) {
   } finally { renderForwardPanel = undefined; }
 }
 
+function renderConnectionPage(tab) {
+  const page = tab.connectionPage;
+  if (!page) return;
+  page.hidden = tab.status === 'ready';
+  tab.surface.inert = !page.hidden;
+  if (page.hidden) return;
+
+  page.dataset.status = tab.status;
+  const title = tab.status === 'closed' ? (tab.connected ? '连接已断开' : '连接失败') : sessionLabels[tab.status];
+  const detail = node('p', tab.status === 'closed' ? 'danger' : 'muted', tab.message || title);
+  detail.setAttribute('role', 'status');
+  const logs = node('pre', 'connection-log', (tab.connectionLog || []).join('\n'));
+  logs.hidden = !tab.connectionLogOpen;
+  const showLogs = button(logs.hidden ? '查看连接日志' : '收起连接日志', () => {
+    logs.hidden = !logs.hidden;
+    tab.connectionLogOpen = !logs.hidden;
+    showLogs.textContent = logs.hidden ? '查看连接日志' : '收起连接日志';
+    showLogs.setAttribute('aria-expanded', String(!logs.hidden));
+  }, 'outlined');
+  showLogs.setAttribute('aria-expanded', String(!logs.hidden));
+  showLogs.disabled = !tab.connectionLog?.length;
+  const actions = node('div', 'connection-actions');
+  const body = node('div', 'connection-body',
+    node('header', 'connection-header', settingsIcon('server'),
+      node('div', 'connection-target', summaryText('strong', tab.host.name),
+        summaryText('small', `SSH · ${endpoint(tab.host)}`)), showLogs),
+    node('div', 'connection-track', node('span', 'connection-start', chromeIcon('server')),
+      node('span', 'connection-line'), node('span', 'connection-end', chromeIcon('terminal'))),
+    node('h2', '', title), detail);
+  if (tab.status === 'trust') {
+    const host = tab.trustHost || tab.host;
+    body.append(node('p', 'connection-fingerprint', tab.trustStage === 'jump' ? '跳板机 ' : '目标主机 ',
+      endpoint(host), ' · ', node('code', '', tab.fingerprint)));
+    actions.append(button('信任并连接', () => trust(tab, true), 'primary'),
+      button('拒绝指纹', () => trust(tab, false), 'outlined'));
+  } else if (tab.status === 'idle' || tab.status === 'closed') {
+    if (tab.reconnectTimer) {
+      actions.append(button('取消自动重连', () => {
+        clearTimeout(tab.reconnectTimer);
+        tab.reconnectTimer = undefined;
+        tab.reconnectCancelled = true;
+        renderConnectionPage(tab);
+      }, 'outlined'));
+    } else {
+      actions.append(button(tab.promptForPassword ? '重新输入密码' : tab.attempts ? '重新连接' : '连接',
+        () => connect(tab, tab.promptForPassword), 'primary'));
+    }
+    if (tab.status === 'closed' && tab.host.auth === 'key') {
+      actions.append(button('编辑主机认证', () => editHost(hosts.find(host => host.id === tab.host.id) || tab.host), 'outlined'));
+    }
+  }
+  actions.append(button(tab.status === 'connecting' ? '取消连接' : '关闭', () => closeTab(tab), 'outlined'));
+  body.append(actions, logs);
+  page.replaceChildren(body);
+}
+
+function addConnectionLog(tab, detail) {
+  const log = tab.connectionLog ||= [];
+  if (detail && log.at(-1) !== detail) log.push(detail);
+}
+
 function renderContext() {
   const tab = active;
   const session = origin(tab);
-  $('toolbar').hidden = !tab?.terminal;
+  $('toolbar').hidden = !tab?.terminal || Boolean(tab.connectionPage && !tab.connectionPage.hidden);
   renderTerminalDirectory();
   $('session-notice').hidden = true;
-  if (!tab?.terminal) return;
+  if ($('toolbar').hidden) return;
   const labels = { idle: '等待连接', connecting: '连接中', trust: '核对主机指纹', ready: '已连接', closed: '已断开', running: '运行中', done: '已完成', stopped: '已停止', failed: '失败' };
   $('context').replaceChildren(summaryText('strong', endpoint(tab.host)), node('span', tab.status === 'ready' ? 'online' : 'muted', labels[tab.status] || tab.status));
   if (session?.jumpHost) $('context').append(summaryText('small', `经 ${session.jumpHost.name}`));
   const controls = $('session-actions');
   controls.replaceChildren();
-  if(tab.reconnectTimer&&tab.status==='closed') controls.append(button('取消自动重连',()=>{clearTimeout(tab.reconnectTimer);tab.reconnectTimer=undefined;tab.reconnectCancelled=true;renderContext();}));
-  if (tab.kind === 'shell' && ['idle', 'closed', 'failed'].includes(tab.status)) controls.append(button(tab.promptForPassword ? '重新输入密码' : tab.attempts ? '重连' : '连接', () => connect(tab)));
   if (tab.kind === 'command') {
     if (session) controls.append(button('返回终端', () => selectTab(session), 'outlined'));
     if (tab.action === 'follow' && ['running', 'connecting'].includes(tab.status)) controls.append(button('停止跟踪', () => api.commands.stop(tab.id)));
@@ -2236,15 +2320,10 @@ function renderContext() {
   }
 
   const notice = $('session-notice');
-  if (tab.status === 'trust') {
-    notice.hidden = false;
-    notice.replaceChildren(node('strong', '', tab.trustStage === 'jump' ? '核对跳板机指纹' : '核对目标主机指纹'), node('p', '', `${(tab.trustHost || tab.host).name} · ${endpoint(tab.trustHost || tab.host)} · ${tab.fingerprint}`), node('div', '',
-      button('信任并连接', () => trust(tab, true), 'primary'), button('取消连接', () => trust(tab, false))));
-  } else if ((tab.message && ['closed', 'failed'].includes(tab.status)) || tab.passwordSaveError) {
+  if ((tab.message && tab.status === 'failed') || tab.passwordSaveError) {
     notice.hidden = false;
     const actions = node('div');
     if (tab.host.auth === 'key') actions.append(button('编辑主机认证', () => editHost(hosts.find(host => host.id === tab.host.id) || tab.host), 'outlined'));
-    if (tab.status === 'closed' && tab.usedSavedPassword && !tab.promptForPassword) actions.append(button('重新输入密码', () => connect(tab, true)));
     actions.append(button('收起提示', () => { tab.passwordSaveError = ''; notice.hidden = true; }));
     notice.replaceChildren(node('div', '', tab.message || tab.passwordSaveError), actions);
   }
@@ -2253,9 +2332,7 @@ function renderContext() {
 async function trust(tab, accepted) {
   if (tab.status !== 'trust') return;
   const challenge = tab.trustChallenge;
-  tab.status = 'connecting';
-  renderContext();
-  renderTabs();
+  updateSession(tab, 'connecting', accepted ? '已确认指纹，正在继续连接…' : '正在取消连接…');
   await api.ssh.trust({ id: tab.id, accepted, challenge });
 }
 
@@ -2289,13 +2366,12 @@ async function connect(tab, enterPassword = false, automatic = false) {
   if(!automatic){tab.retryCount=0;tab.reconnectCancelled=false;}
   if (tab.status === 'connecting' || !tabs.has(tab.id)) return;
   if(!tab.attempts) tab.host=hosts.find(h=>h.id===tab.host.id)||tab.host;
-  tab.status = 'connecting';
   tab.paths.reset();
-  tab.message = '';
+  tab.connected = false;
+  tab.connectionLog = [];
   tab.passwordSaveError = '';
   tab.passwordSaveErrors = new Map();
-  renderContext();
-  renderTabs();
+  updateSession(tab, 'connecting', '正在准备 SSH 连接…');
   try {
     const jumpHost = tab.host.jumpHostId ? hosts.find((host) => host.id === tab.host.jumpHostId) : undefined;
     if (tab.host.jumpHostId && !api.ssh.jumpHosts) throw new Error('跳板连接需使用 macOS 应用。');
@@ -2310,7 +2386,7 @@ async function connect(tab, enterPassword = false, automatic = false) {
       return credentials && { ...credentials, useSaved };
     };
     const jumpCredentials = jumpHost ? await credentialFor(jumpHost, true) : undefined;
-    if (jumpHost && !jumpCredentials) { updateSession(tab, 'closed', '已取消连接。'); return; }
+    if (jumpHost && !jumpCredentials) { updateSession(tab, 'idle', '已取消连接。'); return; }
     if (!tabs.has(tab.id)) return;
     const credentials = await credentialFor(tab.host);
     const useSaved = credentials?.useSaved;
@@ -2318,12 +2394,13 @@ async function connect(tab, enterPassword = false, automatic = false) {
     tab.usedSavedPassword = useSaved || jumpCredentials?.useSaved;
     if (enterPassword) tab.promptForPassword = true;
     if (!tabs.has(tab.id)) return;
-    if (!credentials) { updateSession(tab, 'closed', '已取消连接。'); return; }
+    if (!credentials) { updateSession(tab, 'idle', '已取消连接。'); return; }
     tab.files.generation = (tab.files.generation || 0) + 1;
     tab.files.entries = undefined;
     tab.files.error = '';
     tab.files.loading = false;
     if (tab.attempts++) tab.terminal.write('\r\n\x1b[90m── 正在建立新 SSH 会话 ──\x1b[0m\r\n');
+    if (tab.view.clientHeight) tab.fit.fit();
     await api.ssh.connect({ id: tab.id, expected: tab.host, ...credentials, jump: jumpHost ? { expected: jumpHost, ...jumpCredentials } : undefined, dimensions: { rows: tab.terminal.rows, cols: tab.terminal.cols } });
   } catch (error) {
     if (tabs.has(tab.id)) updateSession(tab, 'closed', message(error));
@@ -2344,7 +2421,8 @@ async function openHost(host, { force = false, draftTab, connectNow = true } = {
   attachTerminal(tab);
   tabs.set(tab.id, tab);
   selectTab(tab);
-  if(connectNow) await connect(tab);else updateSession(tab,'closed','布局已恢复。点击连接建立新的 SSH 会话；不会恢复原进程。');
+  if (connectNow) await connect(tab);
+  else updateSession(tab, 'idle', '布局已恢复。连接后会打开新的 SSH 会话。');
 }
 
 async function closeTab(tab) {
@@ -2356,30 +2434,37 @@ async function closeTab(tab) {
       const ongoing = [...jobs.values()].filter((job) => job.sessionId === tab.id && ['queued', 'running', 'committing'].includes(job.status));
       if (ongoing.some((job) => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭会话。'); return; }
       if (ongoing.length && !await confirm('关闭 SSH 会话', `取消「${tab.host.name}」正在传输的 ${ongoing.length} 项任务？`, '取消任务并关闭')) return;
+      if (!tabs.has(tab.id)) return;
       await api.ssh.close(tab.id);
     } else if (tab.kind === 'command') {
       await api.commands.close(tab.id);
     }
-    const partner=splitLayout?.panes.includes(tab.id) ? tabs.get(splitLayout.panes.find(id=>id!==tab.id)) : undefined;
-    if(partner) splitLayout=undefined;
-    recordingSessions.delete(tab.id);
-    tabs.delete(tab.id);
-    tab.tabRow.remove();
-    refreshTransferActions(tab.id);
-    for (const acknowledge of tab.pendingAcks?.values() || []) acknowledge();
-    tab.resizeObserver?.disconnect();
-    tab.terminal?.dispose();
-    tab.view?.remove();
-    if (active === tab) selectTab(partner || tabs.get(tab.sessionId) || [...tabs.values()].sort((a, b) => b.used - a.used)[0]);
-    else {
-      renderSplitLayout();
-      renderTabs();
-      if (active?.sessionId === tab.id || active?.id === tab.sessionId) {
-        renderContext();
-        renderFiles();
-      }
-    }
+    removeTab(tab);
   } finally { tab.closing = false; }
+}
+
+function removeTab(tab) {
+  if (!tabs.delete(tab.id)) return;
+  clearTimeout(tab.reconnectTimer);
+  clearTimeout(tab.stableTimer);
+  const partner = splitLayout?.panes.includes(tab.id) ? tabs.get(splitLayout.panes.find(id => id !== tab.id)) : undefined;
+  if (partner) splitLayout = undefined;
+  recordingSessions.delete(tab.id);
+  tab.tabRow.remove();
+  refreshTransferActions(tab.id);
+  for (const acknowledge of tab.pendingAcks?.values() || []) acknowledge();
+  tab.resizeObserver?.disconnect();
+  tab.terminal?.dispose();
+  tab.view?.remove();
+  if (active === tab) selectTab(partner || tabs.get(tab.sessionId) || [...tabs.values()].sort((a, b) => b.used - a.used)[0]);
+  else {
+    renderSplitLayout();
+    renderTabs();
+    if (active?.sessionId === tab.id || active?.id === tab.sessionId) {
+      renderContext();
+      renderFiles();
+    }
+  }
 }
 
 function updateSession(tab, next, detail = '') {
@@ -2387,7 +2472,14 @@ function updateSession(tab, next, detail = '') {
   if(next==='closed')recordingSessions.delete(tab.id);
   renderForwardPanel?.();
   tab.message = detail;
+  if (tab.connectionPage) {
+    addConnectionLog(tab, detail);
+    renderConnectionPage(tab);
+  }
   if (next === 'ready') {
+    tab.connected = true;
+    // Resizes sent during the handshake may arrive before the remote PTY exists.
+    syncTerminalSize(tab);
     clearTimeout(tab.stableTimer);tab.stableTimer=setTimeout(()=>{tab.retryCount=0;},30000);
     recent.set(tab.host.id, Date.now());
     void api.hosts.touch(tab.host.id).catch(() => {});
@@ -2399,7 +2491,11 @@ function updateSession(tab, next, detail = '') {
     clearTimeout(tab.stableTimer);
     tab.paths.reset();
     tab.terminal.write(`\r\n\x1b[90m${detail.replace(/[\x00-\x1f\x7f]/g, ' ')}\x1b[0m\r\n`);
-    if (active === tab) status(`${tab.host.name} · ${detail}`);
+  }
+  if (active === tab && tab.connectionPage && !tab.connectionPage.hidden) {
+    status(`${tab.host.name} · ${detail || sessionLabels[next]}`);
+    $('terminal-find').hidden = true;
+    renderTerminalBottom();
   }
   if (active === tab || origin() === tab) renderContext();
   if (filesOpen && origin() === tab) renderFiles();
@@ -2551,7 +2647,8 @@ function renderTerminalDirectory() {
 function renderTerminalBottom() {
   const control = $('terminal-bottom');
   const buffer = active?.terminal?.buffer.active;
-  control.hidden = !buffer || buffer.type !== 'normal' || buffer.viewportY >= buffer.baseY;
+  control.hidden = Boolean(active?.connectionPage && !active.connectionPage.hidden) ||
+    !buffer || buffer.type !== 'normal' || buffer.viewportY >= buffer.baseY;
   if (control.hidden && active) active.newOutput = false;
   control.textContent = active?.newOutput ? '有新输出 · 回到底部 ↓' : '回到底部 ↓';
 }
@@ -2618,19 +2715,19 @@ async function openTerminalPath(source, candidate, inspected) {
   };
   if (kind === 'file') {
     if (api.files.readText) openRemoteFile(tab, path, downloadPath);
-    else if (await prompt('远端文件', [detail], '下载到本机', () => true)) await downloadPath();
+    else if (await prompt('远端文件', [detail], '下载', () => true, [], { focusHeading: true, cancelLast: true })) await downloadPath();
   } else if (kind === 'directory') {
-    const enter = node('button', 'outlined', '在终端进入目录');
-    const download = node('button', 'outlined', '下载目录');
+    const enter = node('button', 'outlined', '进入');
+    const download = node('button', 'outlined', '下载');
     enter.type = download.type = 'submit';
     enter.value = 'enter';
     download.value = 'download';
     download.disabled = path === '/' || !downloadable || !api.files.directoryDownloads;
     if (download.disabled) download.title = '当前路径不支持目录下载';
-    const choice = await prompt('远端目录', [detail], '在文件面板打开', async (action) => {
+    const choice = await prompt('远端目录', [detail], '文件区打开', async (action) => {
       if (action === 'enter') await enterTerminalDirectory(tab, attempt, path);
       return action || 'browse';
-    }, [enter, download]);
+    }, [enter, download], { focusHeading: true, cancelLast: true });
     if (!readySession(tab, attempt) || active !== source) return;
     if (choice === 'download') await downloadPath();
     else if (choice === 'enter') {
@@ -2669,6 +2766,8 @@ function openRemoteFile(tab, path, downloadPath) {
   let editor, savedDoc, revision, remotePath, busy = false;
   const title = summaryText('h2', path.split('/').at(-1));
   title.id = 'file-editor-title';
+  title.tabIndex = -1;
+  title.setAttribute('autofocus', '');
   const location = summaryText('p', `${endpoint(tab.host)} · ${path}`);
   const notice = node('p', 'muted', '正在读取远端文件…');
   notice.setAttribute('role', 'status');
@@ -2679,7 +2778,7 @@ function openRemoteFile(tab, path, downloadPath) {
     save.disabled = busy || !dirty();
     close.disabled = download.disabled = busy;
   };
-  const save = button('保存到远端', async () => {
+  const save = button('保存', async () => {
     if (busy || !dirty()) return;
     busy = true;
     refresh();
@@ -2702,8 +2801,8 @@ function openRemoteFile(tab, path, downloadPath) {
     if (busy || (dirty() && !window.confirm('关闭文件并放弃未保存的修改？'))) return;
     fileEditor.close();
   };
-  const close = button('关闭', requestClose);
-  const download = button('下载远端文件', async () => {
+  const close = button('取消', requestClose);
+  const download = button('下载', async () => {
     if (busy) return;
     busy = true;
     refresh();
@@ -2733,9 +2832,10 @@ function openRemoteFile(tab, path, downloadPath) {
   }, { once: true });
   fileEditor.replaceChildren(heading, content,
     node('footer', 'file-editor-footer', node('div', 'file-editor-status', format, notice),
-      node('div', 'actions', close, download, save)), grip);
+      node('div', 'actions', download, save, close)), grip);
   refresh();
   fileEditor.showModal();
+  title.focus({ preventScroll: true });
   const disposePlacement = window.TermlumeFileEditor.moveAndResize(fileEditor, heading, grip);
   void (async () => {
     try {
@@ -2750,7 +2850,7 @@ function openRemoteFile(tab, path, downloadPath) {
       content.hidden = false;
       format.textContent = `${view.format} · UTF-8`;
       notice.textContent = '';
-      editor.focus();
+      if (document.activeElement === title) editor.focus();
     } catch (error) { notice.textContent = message(error); }
   })();
 }
@@ -2862,39 +2962,48 @@ function bytes(size) {
   return `${size} B`;
 }
 
+async function goToRemoteDirectory(tab) {
+  const attempt = tab.attempts;
+  const directory = input(tab.files.directory || '');
+  directory.required = true;
+  directory.placeholder = '/var/log';
+  const destination = prompt('前往目录', [field('远端路径', directory)], '前往', () => {
+    const path = terminalPaths.resolve(directory.value, tab.files.directory);
+    if (!path) throw new Error('请输入有效的远端目录。');
+    return path;
+  });
+  directory.select();
+  const path = await destination;
+  if (path && filesOpen && origin() === tab && readySession(tab, attempt)) await loadFiles(tab, path);
+}
+
 function renderFiles() {
   const panel = $('files');
   if (hostMenu && panel.contains(hostMenu.anchor)) closeHostMenu();
   const tab = origin();
-  const open = filesOpen && Boolean(tab);
+  const open = filesOpen && Boolean(tab) && (!active.connectionPage || active.connectionPage.hidden);
   panel.inert = !open;
   workspace.dataset.files = open ? 'open' : 'closed';
   if (!open) return;
   const files = tab.files;
   const host = summaryText('small', tab.host.name);
+  const close = button('×', toggleFiles, 'file-icon-button', '关闭文件区');
   const heading = node('header', 'file-heading', chromeIcon('folder'),
-    node('div', '', node('strong', '', '远端文件'), host), button('×', toggleFiles, '', '关闭文件区'));
+    node('div', 'file-heading-title', node('strong', '', '远端文件'), host), close);
   panel.replaceChildren(heading);
   if (tab.status !== 'ready') {
     panel.append(node('div', 'empty-state', settingsIcon('folder'), node('p', 'muted', '连接 SSH 后可浏览文件。')));
     return;
   }
-  const directory = input(files.directory || '');
-  directory.placeholder = '远端路径';
-  directory.setAttribute('aria-label', '远端路径');
-  directory.title = files.directory || '';
-  const form = node('form', '', directory);
-  form.addEventListener('submit', (event) => { event.preventDefault(); void loadFiles(tab, directory.value); });
-  const parent = button('↑', () => loadFiles(tab, (files.directory || '').replace(/\/[^/]+\/?$/, '') || '/'), '', '上一级');
-  parent.disabled = !files.directory || files.directory === '/';
+  close.before(button('前往', () => goToRemoteDirectory(tab), '', '前往目录'),
+    button('↻', () => loadFiles(tab, files.directory), 'file-icon-button', '刷新远端文件'));
   const shellDirectory = button('终端目录', async () => {
     const attempt = tab.attempts;
     const path = await currentTerminalDirectory(tab);
     if (origin() !== tab || !readySession(tab, attempt)) return;
-    if (!path) throw new Error('尚未识别终端目录，可直接输入远端路径。');
+    if (!path) throw new Error('尚未识别终端目录，可点「前往」输入路径。');
     await loadFiles(tab, path);
   }, '', '打开当前终端目录');
-  panel.append(node('div', 'file-address', parent, form, button('↻', () => loadFiles(tab, files.directory), '', '刷新远端文件')));
   const crumbs = node('nav', 'file-breadcrumbs');
   crumbs.setAttribute('aria-label', '远端目录层级');
   for (const {name, path} of pathBreadcrumbs(files.directory)) {
@@ -2904,6 +3013,7 @@ function renderFiles() {
     crumbs.append(crumb);
   }
   panel.append(node('div', 'file-location', crumbs, shellDirectory));
+  crumbs.scrollLeft = crumbs.scrollWidth;
   if (files.loading) { panel.append(node('p', 'inline-status muted', '正在读取目录…')); return; }
   if (files.error) panel.append(node('p', 'inline-status danger', files.error));
   if (!files.directory || !files.entries) return;
@@ -2914,68 +3024,65 @@ function renderFiles() {
     const [entry, other] = selection();
     return entry?.kind === 'file' && !other ? pathOf(tab, entry.name) : undefined;
   };
-  const upload = button('↑ 上传', () => prepareTransfer(tab, 'up'));
-  const uploadFolder=button('↑ 上传目录',()=>prepareTransfer(tab,'up',undefined,{folder:true}),'outlined');
-  const download = button('↓ 下载', () => prepareTransfer(tab, 'down', selection().map(({ name }) => name)));
+  const create = menuButton('新建 / 上传', [
+    button('新建文件', () => createRemoteItem(tab, false)),
+    button('新建目录', () => createRemoteItem(tab, true)),
+    button('上传文件', () => prepareTransfer(tab, 'up')),
+    ...(api.files.directoryUploads ? [button('上传目录', () => prepareTransfer(tab, 'up', undefined, { folder: true }))] : [])
+  ]);
+  const download = button('下载所选项', () => prepareTransfer(tab, 'down', selection().map(({ name }) => name)));
   const follow = button('跟踪日志', () => configureCommand(tab, 'follow', logPath()));
   const tail = button('查看末尾', () => configureCommand(tab, 'tail', logPath()));
-  const mkdir = button('新建文件夹', () => createRemoteItem(tab, true), 'outlined');
-  mkdir.prepend(chromeIcon('folder'));
-  const touch = button('新建文件', () => createRemoteItem(tab, false), 'outlined');
-  touch.prepend(chromeIcon('file'));
-  const operationResults=button('操作结果',()=>showMutationResults(tab),'outlined');operationResults.hidden=!files.lastMutation;
   const edit=button('外部编辑',()=>externalEdit(tab,logPath()),'outlined');
-  const editTasks=button('编辑任务',()=>manageEditorTasks(),'outlined');
   const rename = button('重命名', () => mutateRemote(tab, false, selection()), 'outlined');
   const remove = button('删除', () => mutateRemote(tab, true, selection()), 'outlined danger');
   const filter = input(files.query || '', 'search');
   filter.placeholder = '筛选当前目录';
   filter.setAttribute('aria-label', '筛选当前目录文件名');
-  const sorting = node('select');
-  sorting.setAttribute('aria-label', '文件排序');
-  for (const [value, label] of [['name', '名称 A–Z'], ['size', '文件从大到小']]) {
-    const option = node('option', '', label);
-    option.value = value;
-    sorting.append(option);
-  }
-  sorting.value = files.sort || 'name';
-  const hidden = input('', 'checkbox');
-  hidden.checked = files.showHidden !== false;
+  const sortName = button('按名称排序', () => updateView({ sort: 'name' }));
+  const sortSize = button('按文件大小排序', () => updateView({ sort: 'size' }));
+  const hidden = button('', () => updateView({ showHidden: files.showHidden === false }, true));
+  const more = menuButton('更多 ⋯', [sortName, sortSize, hidden,
+    ...(files.lastMutation ? [button('操作结果', () => showMutationResults(tab))] : []),
+    ...(api.editors ? [button('管理外部编辑副本', manageEditorTasks)] : [])]);
+  more.setAttribute('aria-label', '文件区更多操作');
   const all = input('', 'checkbox');
   all.setAttribute('aria-label', '全选当前可见的可下载项');
+  all.title = '全选可见项';
   let visible = [];
   const visibleEntries = () => files.entries.filter(({ name }) =>
-    (hidden.checked || !name.startsWith('.')) && name.toLowerCase().includes(filter.value.trim().toLowerCase()))
+    (files.showHidden !== false || !name.startsWith('.')) && name.toLowerCase().includes(filter.value.trim().toLowerCase()))
     .sort((a, b) => Number(b.kind === 'directory') - Number(a.kind === 'directory')
-      || (sorting.value === 'size' && a.kind === 'file' && b.kind === 'file' ? b.size - a.size : 0)
+      || (files.sort === 'size' && a.kind === 'file' && b.kind === 'file' ? b.size - a.size : 0)
       || a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
   const clear = button('清空选择', () => { files.selected.clear(); renderEntries(); });
   const selectedCount = node('small', 'muted');
-  const selectedActions = menuButton('所选项 ⋯', [follow, tail, ...(api.files.mutations ? [rename, remove] : []), ...(api.editors ? [edit] : [])]);
+  const nameHeading = node('span', '', '名称');
+  const selectedActions = menuButton('所选项 ⋯', [download, follow, tail, ...(api.editors ? [edit] : []),
+    ...(api.files.mutations ? [rename, remove] : []), clear]);
   const updateSelection = () => {
     const count = selection().length;
-    download.disabled = selectedActions.disabled = count === 0;
+    selectedActions.hidden = count === 0;
+    nameHeading.hidden = count !== 0;
     edit.disabled=!logPath();
     rename.disabled=count!==1;remove.disabled=count===0;
     follow.disabled = tail.disabled = !logPath();
     selectedCount.textContent = count ? `已选 ${count} 项` : '';
     selectedCount.hidden = count === 0;
-    clear.hidden = count === 0;
     const selectableEntries = visible.filter(({ kind }) => selectable(kind));
     const checked = selectableEntries.filter(({ name }) => files.selected.has(name)).length;
     all.disabled = selectableEntries.length === 0;
     all.checked = selectableEntries.length > 0 && checked === selectableEntries.length;
     all.indeterminate = checked > 0 && checked < selectableEntries.length;
   };
-  updateSelection();
-  panel.append(node('div', 'file-toolbar', node('div', 'file-tools', upload, download,
-    menuButton('新建 / 上传', [mkdir, touch, ...(api.files.directoryUploads ? [uploadFolder] : [])]), selectedActions),
-    node('div', 'file-tools file-create', ...(api.editors ? [editTasks] : []), operationResults, selectedCount, clear)));
-  panel.append(node('div', 'file-filters', filter, selectControl(sorting)),
-    node('div', 'file-options', node('label', 'checkbox-row', all, '全选可见'), node('label', 'checkbox-row', hidden, '显示隐藏项')));
-  panel.append(node('div', 'file-columns muted', node('span', '', '名称'), node('span', '', '大小 / 类型')));
+  panel.append(node('div', 'file-toolbar', create, filter, more),
+    node('div', 'file-columns muted', all, node('div', 'file-column-name', nameHeading, selectedActions, selectedCount),
+      node('span', '', '大小 / 类型')));
   const list = node('div', 'file-list');
   function renderEntries() {
+    sortName.setAttribute('aria-current', String(files.sort !== 'size'));
+    sortSize.setAttribute('aria-current', String(files.sort === 'size'));
+    hidden.textContent = files.showHidden === false ? '显示隐藏项' : '不显示隐藏项';
     const entries = visibleEntries();
     visible = entries;
     const rows = [];
@@ -3006,15 +3113,13 @@ function renderFiles() {
     list.replaceChildren(...rows);
     updateSelection();
   }
-  const updateView = (clearSelection) => {
-    Object.assign(files, { query: filter.value, showHidden: hidden.checked, sort: sorting.value, scrollTop: 0 });
+  const updateView = (changes, clearSelection = false) => {
+    Object.assign(files, changes, { scrollTop: 0 });
     if (clearSelection) files.selected.clear();
     renderEntries();
     list.scrollTop = 0;
   };
-  filter.addEventListener('input', () => updateView(true));
-  hidden.addEventListener('change', () => updateView(true));
-  sorting.addEventListener('change', () => updateView(false));
+  filter.addEventListener('input', () => updateView({ query: filter.value }, true));
   all.addEventListener('change', () => {
     for (const { name, kind } of visible) if (selectable(kind)) {
       if (all.checked) files.selected.add(name);
@@ -3087,7 +3192,7 @@ async function createRemoteItem(tab, folder) {
   const attempt = tab.attempts;
   const name = input();
   name.required = true;
-  const created = await prompt(folder ? '新建文件夹' : '新建文件', [
+  const created = await prompt(folder ? '新建目录' : '新建文件', [
     node('p', '', `${tab.host.name} · ${directory}`), field('名称', name)
   ], '创建', async () => {
     if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化，请重新打开文件抽屉。');
@@ -3313,7 +3418,7 @@ api.onEvent((event) => {
     tab.trustHost = event.host;
     tab.trustStage = event.stage;
     tab.trustChallenge = event.challenge;
-    updateSession(tab, 'trust');
+    updateSession(tab, 'trust', event.stage === 'jump' ? '等待核对跳板机指纹。' : '等待核对目标主机指纹。');
   } else if (tab && event.type === 'password') {
     const errors = tab.passwordSaveErrors ||= new Map();
     const host = event.host || tab.host;
@@ -3325,12 +3430,28 @@ api.onEvent((event) => {
     if (tab === active) renderContext();
   } else if (tab && event.type === 'progress') {
     tab.message = event.message;
+    addConnectionLog(tab, event.message);
+    renderConnectionPage(tab);
     if (tab === active) status(`${tab.host.name} · ${event.message}`);
+  } else if (tab?.kind === 'shell' && event.type === 'session' && event.status === 'closed' && event.exited) {
+    removeTab(tab);
   } else if (tab) {
     if (event.retryWithPassword && !event.retryable) tab.promptForPassword = true;
     updateSession(tab, event.status, event.message);
-    if(event.status==='closed'&&event.retryable&&tab.host?.autoReconnect&&!tab.reconnectCancelled&&!vaultStatus.locked){
-      const count=(tab.retryCount||0)+1;const delay=retryDelay(count);if(delay){tab.retryCount=count;tab.message+=` · ${delay/1000} 秒后尝试第 ${count}/3 次重连（将创建新会话）`;tab.reconnectTimer=setTimeout(()=>{tab.reconnectTimer=undefined;if(tabs.has(tab.id)&&tab.status==='closed'&&!vaultStatus.locked&&!dialog.open&&!tab.reconnectCancelled)void connect(tab,false,true);else if(active===tab)renderContext();},delay);if(active===tab)renderContext();}
+    if (event.status === 'closed' && event.retryable && tab.host?.autoReconnect && !tab.reconnectCancelled && !vaultStatus.locked) {
+      const count = (tab.retryCount || 0) + 1;
+      const delay = retryDelay(count);
+      if (delay) {
+        tab.retryCount = count;
+        tab.message += ` · ${delay / 1000} 秒后尝试第 ${count}/3 次重连（将创建新会话）`;
+        tab.reconnectTimer = setTimeout(() => {
+          tab.reconnectTimer = undefined;
+          if (tabs.has(tab.id) && tab.status === 'closed' && !vaultStatus.locked && !dialog.open && !tab.reconnectCancelled && !tab.closing) {
+            void connect(tab, false, true);
+          } else renderConnectionPage(tab);
+        }, delay);
+        renderConnectionPage(tab);
+      }
     }
   }
 });
@@ -3362,10 +3483,7 @@ $('host-search-form').addEventListener('submit', (event) => {
   event.preventDefault();
   hostSearchAction?.().catch((error) => status(message(error)));
 });
-$('library-button').addEventListener('click', () => {
-  selectTab(undefined, libraryView);
-  if (libraryView === 'hosts') $('host-search').focus({ preventScroll: true });
-});
+$('library-button').addEventListener('click', () => selectTab(undefined, libraryView));
 $('tag-filter').addEventListener('change', renderHosts);
 $('all-hosts').addEventListener('click', () => openGroup(''));
 $('import-hosts').addEventListener('click', () => importHosts().catch((error) => status(message(error))));
@@ -3582,7 +3700,11 @@ window.addEventListener('keydown', (event) => {
   }
   if (event.key.toLowerCase() === 'k') { event.preventDefault(); openGlobalSearch(); }
   if (event.key.toLowerCase() === 'j' && tabs.size > 1) { event.preventDefault(); chooseSession(); }
-  if (event.key.toLowerCase() === 'f' && active?.terminal) { event.preventDefault(); $('terminal-find').hidden = false; $('terminal-find').querySelector('input').focus(); }
+  if (key === 'f' && active?.terminal && (!active.connectionPage || active.connectionPage.hidden)) {
+    event.preventDefault();
+    $('terminal-find').hidden = false;
+    $('terminal-find').querySelector('input').focus();
+  }
   if (active?.terminal && ['+', '=', '-', '0'].includes(event.key)) {
     event.preventDefault();
     active.terminal.options.fontSize = event.key === '0' ? uiPreferences.fontSize : Math.min(32, Math.max(9, active.terminal.options.fontSize + (event.key === '-' ? -1 : 1)));

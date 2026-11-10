@@ -60,22 +60,27 @@ class WorkspaceSSH {
       this.sessions.delete(id);
       session.verify = undefined;
       const retryWithPassword = getSavedPassword && (session.authenticationFailed || session.savedPasswordUnavailable);
-      this.emit({ type: 'session', id, status: 'closed', message, retryWithPassword: Boolean(retryWithPassword) });
+      this.emit({ type: 'session', id, status: 'closed', message, exited: Boolean(session.exited), retryWithPassword: Boolean(retryWithPassword) });
     };
     client.on('error', (error) => {
       if (error.level === 'client-authentication') session.authenticationFailed = true;
       session.error ||= session.authenticationFailed ? 'SSH 认证失败，请检查用户和凭据。' : error.message;
     });
-    client.once('close', () => end(session.error || (session.exited ? '远端会话已退出。' : 'SSH 连接已断开。')));
+    client.once('close', () => end(session.exited ? '远端会话已退出。' : session.error || 'SSH 连接已断开。'));
     client.once('ready', async () => {
       client.config.password = undefined;
       try {
+        this.emit({ type: 'progress', id, message: '正在打开远端终端…' });
         const channel = await call(client, 'shell', session.size);
         if (this.sessions.get(id) !== session) { channel.close(); return; }
         session.channel = channel;
         channel.setWindow(session.size.rows, session.size.cols, 0, 0);
         this.pipeOutput(id, channel);
-        channel.once('close', () => { session.exited = true; client.end(); });
+        channel.once('exit', (code, signal) => {
+          session.exited = Number.isInteger(code);
+          if (signal) session.error = '远端 Shell 被信号终止。';
+        });
+        channel.once('close', () => client.end());
         this.emit({ type: 'session', id, status: 'ready' });
         void onAuthenticated?.(session.identity.fingerprint);
       } catch (error) {
