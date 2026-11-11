@@ -11,6 +11,7 @@
   <script defer src="/fit.js"></script>
   <script defer src="/search.js"></script>
   <script defer src="/dropdown.js"></script>
+  <script defer src="/overlays.js"></script>
   <script defer src="/terminal-paths.js"></script>
   <script defer src="/workspace-state.js"></script>
   <script defer src="/renderer.js"></script>
@@ -54,17 +55,12 @@
           <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 20V4m-4 4 4-4 4 4m6-4v16m-4-4 4 4 4-4"/></svg>
           <span class="sidebar-label">传输记录</span>
         </button>
-        <button type="button" data-page="vault" aria-controls="vault-page" aria-label="保险库" title="保险库">
-          <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3"/></svg>
-          <span class="sidebar-label">保险库</span>
-        </button>
-        <button type="button" data-page="settings" aria-controls="settings-page" aria-label="工具与设置" title="工具与设置">
+        <button type="button" data-page="settings" aria-controls="settings-page" aria-label="设置" title="设置">
           <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg>
-          <span class="sidebar-label">工具与设置</span>
+          <span class="sidebar-label">设置</span>
         </button>
       </nav>
       <nav id="workspace-tools" aria-label="设置分类" hidden></nav>
-      <button id="sidebar-sync" type="button" title="保险库与 Git 同步"><span class="sidebar-label">保险库与 Git 同步</span></button>
     </aside>
     <main id="workspace-content">
       <section id="hosts" aria-label="主机列表">
@@ -106,6 +102,7 @@
             <input id="quick-connect-search" type="search" placeholder="搜索主机、标签，或输入 user@host" aria-label="搜索主机或标签" autocomplete="off">
             <kbd>⌘ K</kbd>
           </form>
+          <div id="quick-connect-filters"></div>
           <div id="quick-connect-results"></div>
         </div>
       </section>
@@ -162,8 +159,7 @@
           </section>
         </div>
       </section>
-      <section id="vault-page" class="settings-page" aria-label="保险库" hidden></section>
-      <section id="settings-page" class="settings-page" aria-label="工具与设置" hidden></section>
+      <section id="settings-page" class="settings-page" aria-label="设置" hidden></section>
     </main>
   </div>
   <footer class="footer">
@@ -176,16 +172,17 @@
   <dialog id="session-switcher" aria-labelledby="session-switcher-title">
     <form id="session-switcher-form" class="tab-search">
       <span id="session-switcher-title">切换会话</span>
-      <input id="session-switcher-search" type="search" placeholder="搜索标签" aria-label="搜索标签" autocomplete="off">
+      <input id="session-switcher-search" type="search" placeholder="搜索会话、地址、分组或标签" aria-label="搜索会话、地址、分组或标签" autocomplete="off">
       <kbd>⌘ J</kbd>
       <button id="close-switcher" type="button" aria-label="关闭会话切换" title="关闭">×</button>
     </form>
+    <div id="session-switcher-filters"></div>
     <div id="session-switcher-results"></div>
   </dialog>
   <section id="vault-lock" hidden>
     <form id="unlock-form">
       <span class="settings-icon" aria-hidden="true">◇</span>
-      <h1>保险库已锁定</h1>
+      <h1>Termlume 已锁定</h1>
       <p class="muted">验证身份后重新访问工作台。</p>
       <label>解锁方式<select id="unlock-mode" aria-label="解锁方式"><option value="password">主密码</option><option value="recovery">恢复密钥</option></select></label>
       <label>解锁凭据<input id="unlock-secret" type="password" required autocomplete="off"></label>

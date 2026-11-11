@@ -10,6 +10,7 @@ const sources = {
   '/fit.js':'node_modules/@xterm/addon-fit/lib/addon-fit.js',
   '/search.js':'node_modules/@xterm/addon-search/lib/addon-search.js',
   '/dropdown.js':'src/ui/dropdown.js',
+  '/overlays.js':'src/ui/overlays.js',
   '/terminal-paths.js':'src/ui/terminal-paths.js',
   '/workspace-state.js':'src/ui/workspace-state.js',
   '/renderer.js':'src/ui/renderer.js'

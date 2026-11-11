@@ -2,7 +2,7 @@ use crate::{
     error,
     git_https::HttpsRepo,
     keys, now,
-    store::{portable_rows, Binding, GitMigration, Row},
+    store::{portable_rows, Binding, GitMigration, GitSettings, Row},
     vault::{self, GitEnvelope, Key, MAX_GIT_DOCUMENT},
     Workspace,
 };
@@ -452,7 +452,7 @@ pub struct Conflict {
     local: Vec<Row>,
     migration: Option<(String, String)>,
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct SyncRequest {
     #[serde(default)]
     address: String,
@@ -462,6 +462,8 @@ pub struct SyncRequest {
     auth: Option<GitAuth>,
     #[serde(default, rename = "changeConnection")]
     change_connection: bool,
+    #[serde(default, rename = "pullOnly")]
+    pull_only: bool,
     ticket: Option<Uuid>,
     #[serde(default)]
     choices: BTreeMap<Uuid, String>,
@@ -595,10 +597,67 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
         .sync_gate
         .try_lock()
         .map_err(|_| "已有同步任务正在运行。")?;
+    let mut result = synchronize_inner(ws, input).await?;
+    if let Some(state) = result.get_mut("state") {
+        ws.sync_attention.lock().unwrap().take();
+        state["syncAttention"] = Value::Null;
+    }
+    Ok(result)
+}
+
+pub async fn synchronize_automatically(ws: &Workspace, epoch: u64, settings: GitSettings) -> bool {
+    let Ok(_permit) = ws.sync_gate.try_lock() else {
+        return false;
+    };
+    {
+        let store = ws.store.lock().unwrap();
+        let Ok(data) = store.data() else {
+            return false;
+        };
+        if store.epoch != epoch
+            || data.git_settings != settings
+            || settings.paused
+            || data.git_migration.is_some()
+            || data
+                .sync
+                .as_ref()
+                .is_none_or(|binding| binding.commit.is_none())
+            || ws.conflict.lock().unwrap().is_some()
+            || ws.sync_attention.lock().unwrap().is_some()
+        {
+            return false;
+        }
+    }
+    let result = synchronize_inner(ws, SyncRequest::default()).await;
+    let (attention, updated) = match result {
+        Ok(result) if result.get("conflicts").is_some() => (
+            Some("有同步冲突。点击「立即同步」选择要保留的版本。".into()),
+            false,
+        ),
+        Ok(result) => (None, result["updated"] == true),
+        Err(err) => (
+            Some(format!("自动同步失败：{err} 请点击「立即同步」重试。")),
+            false,
+        ),
+    };
+    let store = ws.store.lock().unwrap();
+    if store.epoch == epoch {
+        let mut state = store.status();
+        state["syncAttention"] = json!(&attention);
+        *ws.sync_attention.lock().unwrap() = attention;
+        ws.emit(json!({"type": "git-auto", "state": state, "updated": updated}));
+    }
+    true
+}
+
+async fn synchronize_inner(ws: &Workspace, input: SyncRequest) -> Result<Value, String> {
     let cancel = CancellationToken::new();
     let (remote, branch, auth, sync_secret, key, header, epoch) = {
         let store = ws.store.lock().unwrap();
         let data = store.data()?;
+        if data.git_settings.paused {
+            return Err("请先恢复 Git 同步。".into());
+        }
         if data.git_migration.is_some() {
             return Err("请先继续或放弃待完成的 Git 迁移。".into());
         }
@@ -612,6 +671,15 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
             return Err("请在同步设置中更改仓库连接。".into());
         }
         let prior = data.sync.as_ref();
+        if input.pull_only
+            && (prior.is_none_or(|p| p.commit.is_none())
+                || !input.address.is_empty()
+                || input.branch.is_some()
+                || input.auth.is_some()
+                || input.change_connection)
+        {
+            return Err("请先完成首次同步，再从已绑定的仓库拉取更新。".into());
+        }
         let branch = branch_name(
             input
                 .branch
@@ -732,7 +800,7 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
                 }
                 (ours, records)
             };
-            let commit = if tip_commit.is_none() || old_format || records != theirs {
+            let commit = if !input.pull_only && (tip_commit.is_none() || old_format || records != theirs) {
                 let envelope = vault::encode(
                     &key,
                     &header,
@@ -757,22 +825,37 @@ pub async fn synchronize(ws: &Workspace, input: SyncRequest) -> Result<Value, St
                 .map(|r| (r.id(), "local".into()))
                 .collect();
             let (local, _) = merge(&ours, &latest, &records, &prefer_newer);
-            let pending = local != records;
+            let updated = local != latest;
+            let base = if input.pull_only { theirs } else { records };
+            let pending = local != base;
+            let last_synced = if input.pull_only {
+                data.last_fetched = Some(now());
+                prior.as_ref().and_then(|binding| binding.last_synced)
+            } else {
+                if prior.as_ref().is_some_and(|p| p.branch != branch) {
+                    data.last_fetched = None;
+                }
+                Some(now())
+            };
             data.apply(
                 local,
                 Some(Binding {
                     remote: remote.clone(),
                     branch: branch.clone(),
-                    sync_key: None,
+                    sync_key: if input.pull_only && old_format {
+                        sync_secret.clone()
+                    } else {
+                        None
+                    },
                     auth: auth.clone(),
                     commit,
-                    base: records,
-                    last_synced: Some(now()),
+                    base,
+                    last_synced,
                 }),
             );
             store.update(data)?;
             *ws.conflict.lock().unwrap() = None;
-            return Ok(json!({"state": store.status(), "pending": pending}));
+            return Ok(json!({"state": store.status(), "pending": pending, "updated": updated}));
         }
         Err("远端同步分支持续更新，请稍后重试。".into())
     }
@@ -798,6 +881,9 @@ pub async fn migrate(ws: &Workspace, input: MigrationRequest) -> Result<Value, S
                 *ws.conflict.lock().unwrap() = None;
             }
             return Ok(json!({"state": store.status()}));
+        }
+        if data.git_settings.paused {
+            return Err("请先恢复 Git 同步。".into());
         }
         let prior = data.sync.clone().ok_or("请先绑定旧 Git 仓库。")?;
         if prior.commit.is_none() {
@@ -991,9 +1077,13 @@ pub async fn migrate(ws: &Workspace, input: MigrationRequest) -> Result<Value, S
             last_synced: Some(now()),
         });
         data.git_migration = None;
+        data.last_fetched = None;
         store.update(data)?;
         *ws.conflict.lock().unwrap() = None;
-        Ok(json!({"state": store.status(), "pending": pending}))
+        ws.sync_attention.lock().unwrap().take();
+        let mut state = store.status();
+        state["syncAttention"] = Value::Null;
+        Ok(json!({"state": state, "pending": pending}))
     }
     .await;
     ws.sync_cancel.lock().unwrap().take();

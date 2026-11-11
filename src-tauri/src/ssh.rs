@@ -615,7 +615,7 @@ async fn remember(
                     .identities
                     .iter_mut()
                     .find(|i| i.id == id)
-                    .ok_or("身份已删除。")?;
+                    .ok_or("登录配置已删除。")?;
                 identity.password = if share && store.key.is_some() {
                     Some(crate::assets::Secret {
                         secret: password.to_string(),

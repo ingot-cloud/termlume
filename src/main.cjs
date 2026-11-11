@@ -52,7 +52,7 @@ function normalizeHost(input, id, { portable = false, allowMissingKey = false } 
   }
   if(input.startupCommand) host.startupCommand=checkedText(input.startupCommand,'启动命令',16384);
   if(input.startupEnabled) host.startupEnabled=true;
-  if (input.identityId) throw new Error('共享身份需使用 macOS Tauri 应用。');
+  if (input.identityId) throw new Error('登录配置需使用 macOS Tauri 应用。');
   if (input.jumpHostId) host.jumpHostId = checkId(input.jumpHostId);
   if (host.logPath) commandFor({ action: 'tail', argument: host.logPath });
   if (host.service) commandFor({ action: 'journal', argument: host.service });
@@ -259,6 +259,7 @@ const resources = new Map([
   ['/workspace-state.js',[path.join(rendererDir,'workspace-state.js'),'text/javascript']],
   ['/renderer.js', [path.join(rendererDir, 'renderer.js'), 'text/javascript']],
   ['/dropdown.js', [path.join(rendererDir, 'dropdown.js'), 'text/javascript']],
+  ['/overlays.js', [path.join(rendererDir, 'overlays.js'), 'text/javascript']],
   ['/terminal-paths.js', [path.join(rendererDir, 'terminal-paths.js'), 'text/javascript']],
   ['/xterm.js', [path.join(dependencies, 'xterm/lib/xterm.js'), 'text/javascript']],
   ['/xterm.css', [path.join(dependencies, 'xterm/css/xterm.css'), 'text/css']],

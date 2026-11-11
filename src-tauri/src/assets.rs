@@ -33,7 +33,7 @@ pub struct Identity {
 }
 impl Identity {
     pub fn normalized(mut self) -> Result<Self, String> {
-        self.name = checked(&self.name, "身份名称", 120)?;
+        self.name = checked(&self.name, "配置名称", 120)?;
         let h = Host {
             address: "identity.test".into(),
             username: self.username.clone(),
@@ -48,14 +48,14 @@ impl Identity {
             self.version = Uuid::new_v4();
         }
         if self.auth != "password" && self.password.is_some() {
-            return Err("仅密码身份可保存密码。".into());
+            return Err("仅使用 SSH 密码的登录配置可保存密码。".into());
         }
         if self
             .password
             .as_ref()
             .is_some_and(|p| p.secret.is_empty() || p.secret.len() > 16384)
         {
-            return Err("身份密码格式无效。".into());
+            return Err("登录配置的密码格式无效。".into());
         }
         Ok(self)
     }
@@ -121,7 +121,7 @@ impl Asset {
     pub fn summary(&self) -> Value {
         match self {
             Self::Layout(l) => {
-                json!({"id":l.id,"name":l.name,"recordType":"layout","tabs":l.tabs,"split":l.split,"direction":l.direction,"ratio":l.ratio})
+                json!({"id":l.id,"name":l.name,"recordType":"layout","tabs":l.tabs,"split":l.split,"direction":l.direction,"ratio":l.ratio,"rowRatio":l.row_ratio})
             }
             Self::Snippet(s) => {
                 json!({"id":s.id,"name":s.name,"recordType":"snippet","command":s.command,"tags":s.tags})
@@ -158,11 +158,11 @@ pub fn save_identity(ws: &Workspace, mut value: Value) -> Result<Value, String> 
         .find(|i| i.id == identity.id)
         .cloned();
     if !identity.id.is_nil() && old.is_none() {
-        return Err("身份已删除，请刷新。".into());
+        return Err("登录配置已删除，请刷新。".into());
     }
     if let Some(old) = &old {
         if old.summary(&data) != value["expected"] {
-            return Err("身份或引用范围已变化，请刷新后重试。".into());
+            return Err("登录配置或关联范围已变化，请刷新后重试。".into());
         }
         identity.version = if old.username == identity.username.trim()
             && old.auth == identity.auth
@@ -192,7 +192,7 @@ pub fn save_identity(ws: &Workspace, mut value: Value) -> Result<Value, String> 
     let mut created = None;
     if let Some(secret) = secret.filter(|s| !s.is_empty()) {
         if identity.auth != "password" || secret.len() > 16384 {
-            return Err("身份密码格式无效。".into());
+            return Err("登录配置的密码格式无效。".into());
         }
         if crate::flag(&value, "sharePassword") && store.key.is_none() {
             return Err("共享密码到备份前请先启用保险库。".into());
@@ -235,14 +235,14 @@ pub fn delete_identity(ws: &Workspace, value: Value) -> Result<Value, String> {
         .identities
         .iter()
         .find(|i| i.id == id)
-        .ok_or("身份已删除。")?;
+        .ok_or("登录配置已删除。")?;
     if identity.summary(&data) != value["expected"] {
-        return Err("身份或引用范围已变化，请刷新。".into());
+        return Err("登录配置或关联范围已变化，请刷新。".into());
     }
     if data.hosts.iter().any(|h| h.identity_id == Some(id))
         || data.groups.iter().any(|g| g.identity_id == Some(id))
     {
-        return Err("身份仍被主机引用，请先解除关联。".into());
+        return Err("登录配置仍被主机或分组使用，请先解除关联。".into());
     }
     data.identities.retain(|i| i.id != id);
     data.local_passwords.remove(&id);
@@ -377,7 +377,7 @@ pub fn validate_groups(data: &Data) -> Result<(), String> {
             .identity_id
             .is_some_and(|id| !data.identities.iter().any(|i| i.id == id))
         {
-            return Err("分组默认身份不存在。".into());
+            return Err("分组默认登录配置不存在。".into());
         }
     }
     Ok(())
@@ -504,6 +504,8 @@ pub struct Layout {
     pub split: Vec<usize>,
     pub direction: String,
     pub ratio: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_ratio: Option<u8>,
 }
 impl Layout {
     fn normalized(mut self) -> Result<Self, String> {
@@ -516,17 +518,26 @@ impl Layout {
         {
             return Err("布局需要 1–16 个有效主机标签。".into());
         }
+        let unique: std::collections::HashSet<_> = self.split.iter().collect();
         if !self.split.is_empty()
-            && (self.split.len() != 2
-                || self.split[0] == self.split[1]
+            && (!(2..=4).contains(&self.split.len())
+                || unique.len() != self.split.len()
                 || self.split.iter().any(|i| *i >= self.tabs.len()))
         {
             return Err("分屏配置无效。".into());
         }
-        if !matches!(self.direction.as_str(), "horizontal" | "vertical") {
+        if (self.split.len() > 2) != (self.direction == "grid") {
+            return Err("四宫格需要 3–4 个不同的会话，双分屏需要 2 个不同的会话。".into());
+        }
+        if !matches!(self.direction.as_str(), "horizontal" | "vertical" | "grid") {
             self.direction = "horizontal".into();
         }
         self.ratio = self.ratio.clamp(20, 80);
+        self.row_ratio = if self.direction == "grid" {
+            Some(self.row_ratio.unwrap_or(50).clamp(20, 80))
+        } else {
+            None
+        };
         Ok(self)
     }
 }

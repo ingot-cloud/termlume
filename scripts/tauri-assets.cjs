@@ -9,6 +9,7 @@ const assets = {
   'workspace-state.js':'src/ui/workspace-state.js',
   'renderer.js': 'src/ui/renderer.js',
   'dropdown.js': 'src/ui/dropdown.js',
+  'overlays.js': 'src/ui/overlays.js',
   'terminal-paths.js': 'src/ui/terminal-paths.js',
   'bridge.js': 'src/ui/tauri-bridge.js',
   'xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js',

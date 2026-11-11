@@ -69,6 +69,33 @@ async function main() {
     await run('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x + dx, y: y + dy, button: 'left', clickCount: 1 });
     await tick();
   };
+  const windowChrome = async pane => {
+    assert(await js(`(() => {
+      const bar = document.querySelector('.titlebar');
+      return !bar.closest('[inert]') && document.elementFromPoint(innerWidth / 2, 6).closest('.titlebar') &&
+        $('workspace').inert && !document.querySelector(${JSON.stringify(pane)}).inert;
+    })()`), 'An open overlay must leave the title bar available and block the workspace');
+    const before = await js("previewCalls.filter(([type]) => type.startsWith('window-')).length");
+    const x = await js('innerWidth / 2');
+    await run('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y: 6 });
+    await run('Input.dispatchMouseEvent', { type: 'mousePressed', x, y: 6, button: 'left', buttons: 1, clickCount: 1 });
+    await run('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x + 12, y: 6, buttons: 1 });
+    await run('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x + 12, y: 6, button: 'left', clickCount: 1 });
+    await run('Input.dispatchMouseEvent', { type: 'mousePressed', x, y: 6, button: 'left', buttons: 1, clickCount: 2 });
+    await run('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y: 6, button: 'left', clickCount: 2 });
+    assert.deepEqual(await js(`previewCalls.filter(([type]) => type.startsWith('window-')).slice(${before}).map(([type]) => type)`),
+      ['window-drag', 'window-maximize'], 'Dragging and double-clicking the title bar should reach native window controls');
+    await js(`(() => {
+      const pane = document.querySelector(${JSON.stringify(pane)});
+      const controls = [...pane.querySelectorAll('button, input, select, textarea, [tabindex]')]
+        .filter(control => control.tabIndex >= 0 && !control.disabled && !control.closest('[inert]') && control.getClientRects().length);
+      controls.at(-1).focus();
+    })()`);
+    await run('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+    await run('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+    assert(await js(`document.querySelector(${JSON.stringify(pane)}).contains(document.activeElement)`),
+      'Keyboard focus must stay inside the active overlay');
+  };
   await run('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'no-preference'}]});
   for (const [width, height] of [[1140, 740], [550, 490]]) {
     await run('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
@@ -98,7 +125,13 @@ async function main() {
       await js("closeHostMenu();document.querySelector('.host-quick-edit').click()");
       await wait("document.querySelector('dialog[open] .host-form-section')");
       await wait("!dialog.getAnimations().some(a=>a.playState==='running')"); await overflow();
+      await windowChrome('#dialog');
       await shot(`host-editor-${theme}-${width}.png`);
+      await js("dialog.querySelector('[aria-label=\"连接路径\"]').scrollIntoView({block:'center'})");
+      await tick();
+      await js("dialog.querySelector('[aria-label=\"连接路径\"]').click()");
+      await tick(); await overflow(); await shot(`jump-search-${theme}-${width}.png`);
+      await js('closeDropdown()');
       await js('dialog.close()'); await tick();
       await js("document.querySelector('.host-open[data-host-id=\"key-host\"]').parentElement.querySelector('.host-quick-edit').click()");
       await wait("document.querySelector('dialog[open] .host-key-selection')");
@@ -107,17 +140,99 @@ async function main() {
       await tick(); await overflow(); await shot(`host-key-${theme}-${width}.png`);
       await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='选择私钥').click()");
       await wait("document.querySelector('#key-dialog[open] [role=radio]')"); await overflow();
+      await windowChrome('#key-dialog');
       await shot(`key-picker-${theme}-${width}.png`);
       await js("[...document.querySelectorAll('#key-dialog .actions button')].find(b=>b.textContent==='关闭').click();dialog.close()"); await tick();
-      for (const page of ['keys','transfers','vault']) {
+      for (const page of ['keys','transfers']) {
         await js(`selectTab(undefined,'${page}')`); await tick(); await overflow();
       }
+      await js("openSettings('security')"); await tick(); await overflow();
+      await shot(`security-off-${theme}-${width}.png`);
+      await js("applyVaultState(previewProtected)"); await tick(); await overflow();
+      await shot(`security-on-${theme}-${width}.png`);
+      await js("api.vault.state().then(applyVaultState)");
       for (const section of ['preferences','groups','identities','snippets','layouts','logs','trust']) {
         await js(`openSettings('${section}')`);
         await wait("document.querySelector('#settings-page .settings-form')"); await tick(); await overflow();
       }
       await js("openSettings('preferences')"); await wait("document.querySelector('#settings-page .settings-form')");
       await shot(`settings-${theme}-${width}.png`);
+      const selectionOrigin = await js('active?.id');
+      await js('addNewTab()'); await tick(); await overflow();
+      await shot(`quick-connect-filters-${theme}-${width}.png`);
+      await js('removeTab(active); selectTab([...tabs.values()].find(tab=>tab.kind===\'shell\'))');
+      await js('chooseSession()'); await tick(); await overflow();
+      await shot(`session-filters-${theme}-${width}.png`);
+      await js("$('session-switcher').close()"); await tick();
+      await js('void openPalette()'); await wait('dialog.open'); await tick(); await overflow();
+      await shot(`palette-filters-${theme}-${width}.png`);
+      await js('dialog.close()'); await tick();
+      await js(`selectTab(tabs.get(${JSON.stringify(selectionOrigin)}) || undefined, 'settings')`);
+      const beforeFourPanes = await js('({ active: active?.id, split: splitLayout, filesOpen, ids: [...tabs.keys()] })');
+      await js(`(async () => {
+        if (filesOpen) toggleFiles();
+        while ([...tabs.values()].filter(tab => tab.kind === 'shell').length < 4) {
+          await openHost(hosts[0], { force: true, connectNow: false });
+        }
+        const panes = [...tabs.values()].filter(tab => tab.kind === 'shell').slice(0, 4);
+        for (const tab of panes) previewListener({ type: 'session', id: tab.id, status: 'ready' });
+        splitLayout = { panes: panes.map(tab => tab.id), direction: 'grid', ratio: 50, rowRatio: 50 };
+        selectTab(panes[0]);
+      })()`);
+      await tick(); await overflow();
+      assert(await js(`(() => {
+        const panes = splitLayout.panes.map(id => tabs.get(id));
+        return panes.every(tab => !tab.view.hidden &&
+          tab.view.querySelector('.xterm-screen').getBoundingClientRect().bottom <=
+          tab.surface.getBoundingClientRect().bottom + .5);
+      })()`), 'All four terminals should fit inside their panes');
+      await shot(`four-panes-${theme}-${width}.png`);
+      for (const axis of ['column', 'row']) {
+        const position = await js(`(() => {
+          const rect = document.querySelector('.split-grip[data-axis="${axis}"]').getBoundingClientRect();
+          return { x: rect.x + rect.width * ${axis === 'row' ? '.75' : '.5'},
+            y: rect.y + rect.height * ${axis === 'column' ? '.25' : '.5'} };
+        })()`);
+        assert.equal(await js(`document.elementFromPoint(${position.x}, ${position.y})?.dataset.axis`), axis,
+          `${axis} separator should receive pointer input`);
+        await run('Input.dispatchMouseEvent', { type: 'mouseMoved', ...position });
+        await run('Input.dispatchMouseEvent', { type: 'mousePressed', ...position, button: 'left', buttons: 1, clickCount: 1 });
+        await run('Input.dispatchMouseEvent', { type: 'mouseMoved', x: position.x + (axis === 'column' ? 20 : 0),
+          y: position.y + (axis === 'row' ? 20 : 0), buttons: 1 });
+        await run('Input.dispatchMouseEvent', { type: 'mouseReleased', x: position.x + (axis === 'column' ? 20 : 0),
+          y: position.y + (axis === 'row' ? 20 : 0), button: 'left', clickCount: 1 });
+      }
+      await tick(); await overflow();
+      const draggedLayout = await js('({ ratio: splitLayout.ratio, rowRatio: splitLayout.rowRatio })');
+      assert(draggedLayout.ratio > 50 && draggedLayout.rowRatio > 50,
+        `Both four-pane separators must respond to pointer dragging: ${JSON.stringify(draggedLayout)}`);
+      await js("[...active.paneHeader.querySelectorAll('button')].find(button => button.textContent === '分屏设置').click()");
+      await windowChrome('#dialog');
+      await tick(); await overflow(); await shot(`four-pane-settings-${theme}-${width}.png`);
+      await js("dialog.querySelector('.split-slot .dropdown-trigger').click()");
+      await tick(); await overflow(); await shot(`four-pane-search-${theme}-${width}.png`);
+      const sourceFilter = await js(`(() => {
+        const rect = dialog.querySelector('.dropdown-sources [data-source="host"]').getBoundingClientRect();
+        return {x:rect.x + rect.width/2, y:rect.y + rect.height/2};
+      })()`);
+      await run('Input.dispatchMouseEvent', {type:'mouseMoved', ...sourceFilter});
+      await run('Input.dispatchMouseEvent', {type:'mousePressed', ...sourceFilter, button:'left', buttons:1, clickCount:1});
+      await run('Input.dispatchMouseEvent', {type:'mouseReleased', ...sourceFilter, button:'left', clickCount:1});
+      assert(await js(`(() => {
+        const picker = dialog.querySelector('.dropdown-searchable');
+        return picker?.querySelector('[data-source="host"]').getAttribute('aria-pressed') === 'true' &&
+          document.activeElement === picker.querySelector('input');
+      })()`), 'Pointer filtering must keep the picker open and preserve search focus');
+      await run('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      await run('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      assert(await js("dialog.open && !dialog.querySelector('.dropdown-searchable')"), 'Escape should close only the searchable picker');
+      await js('dialog.close()'); await tick();
+      await js(`(() => {
+        for (const tab of [...tabs.values()]) if (!${JSON.stringify(beforeFourPanes.ids)}.includes(tab.id)) removeTab(tab);
+        splitLayout = ${JSON.stringify(beforeFourPanes.split)};
+        selectTab(tabs.get(${JSON.stringify(beforeFourPanes.active)}));
+        if (filesOpen !== ${beforeFourPanes.filesOpen}) toggleFiles();
+      })()`);
       await js("selectTab([...tabs.values()].find(tab=>tab.kind==='shell'))"); await tick(); await overflow();
       await wait("!$('files').getAnimations().some(animation => animation.playState === 'running')");
       await js(`(() => {
@@ -160,7 +275,8 @@ async function main() {
         await js("fileEditor.querySelector('.file-editor-heading button').click()");
         await tick();
         const expanded = await bounds();
-        assert.deepEqual([expanded.x, expanded.y, expanded.width, expanded.height], [0, 0, width, height]);
+        assert.deepEqual([expanded.x, expanded.y, expanded.width, expanded.height], [0, 50, width, height - 50]);
+        await windowChrome('#file-editor');
         assert(await js("fileEditor.querySelector('h2').getBoundingClientRect().top >= parseFloat(getComputedStyle(fileEditor).getPropertyValue('--titlebar-height'))"));
         await overflow(); await shot(`file-editor-fullscreen-${width}.png`);
         await js("fileEditor.querySelector('.file-editor-heading button').click()");
@@ -183,7 +299,7 @@ async function main() {
   assert.equal(await js('getComputedStyle(dialog).animationName'),'none');
   await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='取消').click()");
   assert.equal(await js('dialog.open'),false);
-  console.log('PASS: workspace navigation, compact file panel, and file-editor drag, resize, fullscreen and restore at both window sizes.');
+  console.log('PASS: workspace navigation, four-pane layouts and both separators, compact file panel, and file-editor drag, resize, fullscreen and restore at both window sizes.');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   clearTimeout(deadline);

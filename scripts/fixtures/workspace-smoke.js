@@ -87,8 +87,17 @@
     }
     openSettings('preferences'); await tick();
     const preferenceForm=$('settings-page').querySelector('form');
+    const fontPicker = preferenceForm.querySelector('[role="combobox"][aria-label="终端字体"]');
+    assert(fontPicker?.textContent.includes('当前设置（Menlo, monospace）'), '终端字体下拉保留已有的字体设置');
+    fontPicker.click();
+    const fontOptions = $(fontPicker.getAttribute('aria-controls'));
+    assert(fontOptions.textContent.includes('系统默认') && fontOptions.textContent.includes('JetBrains Mono'),
+      '终端字体下拉列出默认和本机字体');
+    [...fontOptions.querySelectorAll('[role="option"]')].find(option => option.querySelector('.dropdown-text').textContent === 'Menlo').click();
     preferenceForm.requestSubmit(); await tick();
     assert($('settings-page').textContent.includes('已保存。') && !dialog.open, '偏好直接在页面保存并显示结果');
+    assert(previewPreferences.fontFamily === '"Menlo", monospace' && production.terminal.options.fontFamily === previewPreferences.fontFamily,
+      '所选字体保存后应用到已打开的终端');
     selectTab(production); $('library-button').click(); await tick();
     assert(workspace.dataset.view === 'settings' && !dialog.open, '切回工作台恢复设置页面，不自动切换主机页');
     openSettings('snippets'); await tick();
@@ -97,16 +106,89 @@
     openSettings('groups'); await tick();
     findButton($('settings-page'),'新建分组').click(); await tick();
     assert($('settings-page').textContent.includes('上级分组') && !dialog.open, '分组编辑直接在设置页面进行');
+    openSettings('identities'); await tick();
+    const identitiesPage = $('settings-page');
+    assert(identitiesPage.textContent.includes('可给多台主机复用'), '登录配置列表说明使用位置');
+    findButton(identitiesPage, '新建登录配置').click(); await tick();
+    const identityForm = identitiesPage.querySelector('form');
+    const identityOption = (label, text) => {
+      const control = identityForm.querySelector(`[role="combobox"][aria-label="${label}"]`);
+      control.click();
+      const options = $(control.getAttribute('aria-controls')).querySelectorAll('[role="option"]');
+      [...options].find(option => option.querySelector('.dropdown-text > span').textContent === text).click();
+    };
+    const keyButton = findButton(identityForm, '选择私钥');
+    const identityPassword = identityForm.querySelector('input[type="password"]');
+    const username = identityForm.querySelector('input[aria-label="SSH 用户名"]');
+    assert(!keyButton.getClientRects().length && !identityPassword.getClientRects().length,
+      'SSH Agent 只显示 Agent 说明');
+    identityOption('从已有主机带入', `${previewHosts[0].name} · ${previewHosts[0].username}`);
+    assert(username.value === previewHosts[0].username, '选择主机后带入用户名');
+    identityForm.querySelector('button[aria-label="选择SSH 用户名"]').click();
+    [...$(username.getAttribute('aria-controls')).querySelectorAll('[role="option"]')]
+      .find(option => option.querySelector('.dropdown-text').textContent === 'ops').click();
+    assert(username.value === 'ops', '用户名可从已有值直接选择');
+    identityOption('认证方式', 'SSH 密码');
+    identityPassword.value = 'discarded-test-draft';
+    identityOption('认证方式', '本机私钥');
+    identityForm.requestSubmit(); await tick();
+    assert(!identityPassword.value && !identityPassword.getClientRects().length &&
+      identityForm.textContent.includes('请选择要用于此登录配置的私钥'),
+      '切换认证会清理旧密码，缺少私钥时不能保存');
+    keyButton.click(); await tick();
+    $('key-dialog').querySelector('[data-path="/preview/second-key"]').click();
+    findButton($('key-dialog'), '确定').click(); await tick();
+    assert(identityForm.querySelector('.selected-key-name').textContent === 'second-key', '登录配置从私钥列表选择文件');
+    identityForm.requestSubmit(); await tick();
+    const identitySave = previewCalls.find(([action]) => action === 'save-identity')?.[1];
+    assert(identitySave?.identity.name === 'ops · second-key' && identitySave.identity.keyPath === '/preview/second-key' &&
+      !identitySave.localPassword && !identitySave.sourceHostId, '保存时自动命名，只提交所选认证且不关联原主机');
+    $('workspace-tools').querySelector('[data-section="security"]').click(); await tick();
+    const security = $('settings-page');
+    assert(security.querySelector('h1').textContent === '安全与同步' && !document.querySelector('[data-page="vault"]') &&
+      !$('vault-protection').checked && !$('vault-startup-unlock') && !$('vault-git-enabled') &&
+      findButton(security, '从 Git 恢复'), '主密码保护默认关闭，安全设置保留恢复入口');
+    applyVaultState(previewProtected); await tick();
+    assert($('vault-auto-lock') && $('security-touch-id').hidden, '应用锁开启时显示闲置策略；不支持触控 ID 时隐藏');
+    api.vault.touchIdAvailable = async () => true;
+    await refreshTouchIdAvailability();
+    assert(!$('security-touch-id').hidden && $('vault-touch-id'), '检测到已录入的触控 ID 后显示解锁选项');
+    $('vault-startup-unlock').click(); await tick();
+    assert(!$('vault-auto-lock') && !$('vault-touch-id') && $('vault-git-enabled').checked, '关闭应用锁只隐藏锁定策略，Git 同步保持开启');
+    findButton(security, '拉取更新').click(); await tick();
+    assert(previewCalls.some(([type, request]) => type === 'git-sync' && request.pullOnly) &&
+      $('security-git-summary').textContent.includes('最近拉取'), '拉取更新发起只读同步并显示时间');
+    $('vault-git-enabled').click(); await tick();
+    assert(!$('vault-git-enabled').checked && !findButton(security, '立即同步') && !findButton(security, '保存同步策略'),
+      '暂停 Git 后保留绑定，隐藏同步操作与策略');
+    $('vault-git-enabled').click(); await tick();
+    assert($('vault-git-enabled').checked && findButton(security, '保存同步策略'), '恢复 Git 后重新显示自动同步策略');
+    const autoUnlock = security.querySelector('.vault-policy input');
+    autoUnlock.click();
+    previewListener({ type: 'git-auto', state: { ...vaultStatus, syncAttention: '需要处理冲突。' } });
+    assert(autoUnlock.isConnected && autoUnlock.checked && $('security-git-attention').textContent.includes('冲突'),
+      '后台状态会更新提示，且保留未保存的策略');
+    findButton(security, '保存同步策略').click(); await tick();
+    assert(vaultStatus.gitSettings.onUnlock, '自动同步策略保存到当前设备');
+    $('vault-protection').click(); await tick();
+    assert(dialog.open && dialog.textContent.includes('不加密保存'), '关闭主密码保护前说明影响并要求验证');
+    findButton(dialog, '取消').click(); await tick();
+    assert($('vault-protection').checked && $('vault-git-enabled').checked, '取消关闭后保留保护和 Git 同步');
+    api.vault.touchIdAvailable = async () => false;
+    applyVaultState(await api.vault.state());
     selectTab(undefined,'hosts'); await tick();
     const quickEdit=$('host-list').querySelector('.host-quick-edit');
     assert(quickEdit?.getAttribute('aria-label').startsWith('编辑主机'), '主机卡片提供独立快捷编辑按钮');
     quickEdit.click(); await tick();
     assert(dialog.open && dialog.textContent.includes('编辑主机'), '快捷编辑直接打开主机表单');
+    assert(!dialog.matches(':modal') && workspace.inert && !document.querySelector('.titlebar').inert &&
+      document.elementFromPoint(innerWidth / 2, 6).closest('.titlebar'), '抽屉只阻止内容操作，标题栏仍可接收窗口操作');
     assert(getComputedStyle(dialog).animationName === 'host-drawer-enter', '主机抽屉打开时具有滑入动画');
     const drawerClosed = new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
     findButton(dialog,'取消').click();
     assert(dialog.open && dialog.dataset.closing === 'true', '抽屉关闭时先滑出，再结束对话框');
     await drawerClosed; await tick();
+    assert(!workspace.inert && !document.body.classList.contains('overlay-open'), '关闭抽屉恢复工作区交互');
     const more=$('host-list').querySelector('.host-edit:last-child'); more.click(); await tick();
     assert(hostMenu.panel.querySelectorAll('button').length >= 5 && [...hostMenu.panel.querySelectorAll('button')].every(b=>b.scrollWidth<=b.clientWidth+1 && b.scrollHeight<=b.clientHeight+1), '主机更多菜单文字完整容纳在按钮内');
     assert([...hostMenu.panel.querySelectorAll('button'), $('import-hosts'), ...$('import-hosts').parentElement.querySelectorAll('button')].every(b=>!/(?:…|\.{3})$/.test(b.textContent.trim())), '导入及主机操作菜单使用完整文字，不带省略号后缀');
@@ -117,12 +199,14 @@
     assert(dialog.querySelector('.selected-key-name').textContent === 'key' && !dialog.querySelector('.host-key-selection').textContent.includes('/preview/'), '主机编辑器只显示私钥名称');
     findButton(dialog,'选择私钥').click(); await tick();
     const picker=$('key-dialog');
+    assert(dialog.inert && !picker.inert && picker.getAttribute('aria-modal') === 'true', '嵌套选择器只允许操作最上层弹窗');
     assert(picker.querySelectorAll('[role="radio"]').length === 2 && !picker.querySelector('.key-detail,.key-generator,.key-directories,.settings-switcher'), '私钥选择器只列出已有私钥，不含管理及详情面板');
     assert([...picker.querySelectorAll('.actions button')].map(b=>b.textContent).join('/') === '确定/关闭' && getComputedStyle(findButton(picker,'确定')).backgroundColor !== getComputedStyle(findButton(picker,'关闭')).backgroundColor, '确定按钮位于关闭左侧，使用不同颜色');
     picker.querySelectorAll('[role="radio"]')[1].click();
     assert(picker.open && dialog.querySelector('.selected-key-name').textContent === 'key', '点击私钥只更新选择，确认前不应用');
     findButton(picker,'关闭').click(); await tick();
-    assert(dialog.querySelector('.selected-key-name').textContent === 'key', '取消选择保留原有私钥');
+    assert(dialog.querySelector('.selected-key-name').textContent === 'key' && !dialog.inert && workspace.inert,
+      '取消选择保留原有私钥，并恢复下层表单');
     findButton(dialog,'选择私钥').click(); await tick();
     picker.querySelector('[role="radiogroup"]').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));
     assert(picker.querySelector('[aria-checked="true"]').dataset.path === '/preview/second-key', '方向键可切换已有私钥');
@@ -140,6 +224,14 @@
     assert(!dialog.open && previewCalls.some(([type,value])=>type==='connect'&&value.expected.id===keyHost.id&&value.secret===''), '密钥连接不弹出口令输入框');
     selectTab(production);
     const palette = openPalette(); await tick();
+    const resultsList = dialog.querySelector('.palette-list');
+    const choice = resultsList.querySelector('.palette-choice');
+    const detail = choice.querySelector('small');
+    detail.textContent = 'ops@api.production.example.test · 生产环境 · 后台服务 · 只读运维';
+    assert(resultsList.scrollHeight > resultsList.clientHeight &&
+      resultsList.getBoundingClientRect().right - choice.getBoundingClientRect().right >= 12 &&
+      detail.scrollWidth <= detail.clientWidth + 1 && detail.scrollHeight <= detail.clientHeight + 1,
+      '快速查找滚动时为滚动条留出空间，较长的说明可完整换行');
     const search = dialog.querySelector('input'); search.value = 'disk'; search.dispatchEvent(new Event('input'));
     assert(dialog.querySelectorAll('.palette-choice').length === 2, '命令标签搜索包含执行与单行粘贴');
     // Label and target occupy separate spans.
@@ -190,7 +282,8 @@
     assert(fileEditor.open && !dialog.open && fileEditor.querySelector('.cm-line span'), `文件直接打开，按 JSON 格式高亮（${fileEditor.querySelector('[role=status]')?.textContent || '无提示'}）`);
     findButton(fileEditor, '全屏').click();
     await tick();
-    assert(fileEditor.clientWidth === innerWidth && fileEditor.clientHeight === innerHeight, '编辑器可填满应用窗口');
+    assert(fileEditor.clientWidth === innerWidth && fileEditor.clientHeight === innerHeight - 50 &&
+      fileEditor.getBoundingClientRect().top === 50, '编辑器填满内容区并保留窗口标题栏');
     findButton(fileEditor, '下载').click();
     await tick();
     assert(fileEditor.open && previewCalls.at(-1)[0] === 'prepare' && previewCalls.at(-1)[1].names[0] === 'config.json', '下载绑定当前远端文件，保留编辑器');
@@ -239,16 +332,179 @@
     const connectCount = previewCalls.filter(([type]) => type === 'connect').length;
     splitGrip.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));
     assert(splitLayout.ratio === 55 && connectCount === previewCalls.filter(([type]) => type === 'connect').length, '分屏调整保留连接');
+    splitLayout.panes = [staging.id, production.id];
+    selectTab(staging);
+    const savedTabIds = [...tabs.keys()];
+    findButton($('session-actions'), '保存布局').click(); await tick();
+    assert(dialog.open && dialog.querySelector('h2').textContent === '保存会话布局',
+      '终端分屏操作旁可直接保存会话布局');
+    dialog.querySelector('input').value = '生产巡检布局';
+    dialog.querySelector('form').requestSubmit(); await tick();
+    const savedLayout = previewLayouts[0];
+    assert(savedLayout.name === '生产巡检布局' && savedLayout.tabs.length === 2 && savedLayout.ratio === 55 &&
+      savedLayout.tabs[savedLayout.split[0]].hostId === staging.host.id &&
+      savedLayout.tabs[savedLayout.split[1]].hostId === production.host.id,
+      '只保存当前分屏两端及比例，额外标签不加入布局');
+    openSettings('layouts'); await tick();
+    assert(!$('settings-page').textContent.includes('保存当前布局') &&
+      findButton($('settings-page'), '重命名') && findButton($('settings-page'), '删除'),
+      '会话布局设置页只提供管理操作');
+    findButton($('settings-page'), '重命名').click(); await tick();
+    $('settings-page').querySelector('input').value = '巡检双会话';
+    $('settings-page').querySelector('form').requestSubmit(); await tick();
+    assert(previewLayouts[0].name === '巡检双会话', '会话布局可在管理页重命名');
+    const beforeLayoutOpen = previewCalls.filter(([type]) => type === 'connect').length;
+    const layoutPalette = openPalette(); await tick();
+    const layoutSearch = dialog.querySelector('input');
+    layoutSearch.value = '巡检双会话'; layoutSearch.dispatchEvent(new Event('input'));
+    const layoutChoice = dialog.querySelector('.palette-choice');
+    assert(layoutChoice.textContent.includes('打开布局 · 巡检双会话'), '快速查找直接列出匹配的已保存会话布局');
+    layoutChoice.click(); await layoutPalette; await tick();
+    const openedLayoutTabs = [...tabs.values()].filter(tab => !savedTabIds.includes(tab.id));
+    assert(openedLayoutTabs.length === savedLayout.tabs.length && openedLayoutTabs.every(tab => tab.status === 'idle') &&
+      savedTabIds.every(id => tabs.has(id)) && splitLayout.ratio === 55 &&
+      splitLayout.panes.map(id => tabs.get(id).host.id).join() === [staging.host.id, production.host.id].join() &&
+      active.id === splitLayout.panes[0] &&
+      beforeLayoutOpen === previewCalls.filter(([type]) => type === 'connect').length,
+      '快速打开布局新建空闲标签并还原分屏，不自动发起 SSH');
+    for (const tab of openedLayoutTabs) removeTab(tab);
+    openSettings('layouts'); await tick();
+    findButton($('settings-page'), '删除').click(); await tick();
+    findButton(dialog, '删除').click(); await tick();
+    assert(previewLayouts.length === 0 && $('settings-page').textContent.includes('还没有会话布局'),
+      '删除后返回会话布局管理空状态');
+    const unavailableLayout = { ...savedLayout, id: 'unavailable-layout',
+      tabs: [...savedLayout.tabs, { hostId: 'deleted-host', title: '' }] };
+    previewLayouts.push(unavailableLayout);
+    const beforeUnavailableLayout = tabs.size;
+    let unavailableLayoutError;
+    try { await openSessionLayout(unavailableLayout); } catch (error) { unavailableLayoutError = error; }
+    assert(unavailableLayoutError?.message.includes('主机已删除') && tabs.size === beforeUnavailableLayout,
+      '包含已删除主机的布局会提示问题，并在创建标签前停止');
+    previewLayouts.length = 0;
+    splitLayout = undefined; selectTab(production);
+    const unrelated = await openHost(previewHosts[3], { force: true, connectNow: false });
+    selectTab(production);
+    const beforeGridConnections = previewCalls.filter(([type]) => type === 'connect').length;
+    const beforeGridTabs = new Set(tabs.keys());
+    const beforeSearchHosts = hosts;
+    const manyHosts = Array.from({ length: 120 }, (_, index) => ({ ...previewHosts[0], id: `split-search-${index}`,
+      name: `批量主机 ${index}`, address: `batch-${index}.example.test`, group: index % 2 ? '测试甲组' : '测试乙组', tags: ['巡检'] }));
+    hosts = [...hosts, ...manyHosts];
+    const gridPrompt = configureSplit(production); await tick();
+    dialog.querySelector('[aria-label="四宫格"]').click(); await tick();
+    const gridSelectors = dialog.querySelectorAll('.split-slot select');
+    assert(gridSelectors.length === 4, '四宫格提供四个位置的会话选择器');
+    const firstSlot = dialog.querySelector('.split-slot');
+    const firstSlotValue = gridSelectors[0].value;
+    firstSlot.querySelector('.dropdown-trigger').click(); await tick();
+    let splitPicker = dialog.querySelector('.dropdown-searchable');
+    const splitSearch = splitPicker.querySelector('input');
+    assert(document.activeElement === splitSearch && splitPicker.querySelectorAll('[role="option"]').length > 120,
+      '大量会话选择提供自动聚焦的搜索入口');
+    splitPicker.querySelector('[data-source="host"]').click();
+    const groupFilter = splitPicker.querySelector('select');
+    groupFilter.value = 'group:测试甲组'; groupFilter.dispatchEvent(new Event('change'));
+    splitSearch.value = 'BATCH-119 巡检'; splitSearch.dispatchEvent(new Event('input')); await tick();
+    const match = splitPicker.querySelector('[role="option"]');
+    assert(splitPicker.querySelectorAll('[role="option"]').length === 1 && match.title.includes('batch-119.example.test') &&
+      match.title.includes('测试甲组'), '搜索支持地址、标签、多词匹配及来源和分组组合筛选');
+    splitSearch.value = '不存在的会话'; splitSearch.dispatchEvent(new Event('input'));
+    assert(splitPicker.textContent.includes('没有匹配') && !splitPicker.querySelector('[role="option"]'), '筛选无结果时明确说明');
+    splitSearch.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    assert(dialog.open && !dialog.querySelector('.dropdown-searchable') && document.activeElement === firstSlot.querySelector('.dropdown-trigger'),
+      'Escape 只收起会话选择，不关闭分屏配置并返回焦点');
+    firstSlot.querySelector('.dropdown-trigger').click(); await tick();
+    splitPicker = dialog.querySelector('.dropdown-searchable');
+    const availableSearch = splitPicker.querySelector('input');
+    availableSearch.value = 'batch-119'; availableSearch.dispatchEvent(new Event('input'));
+    availableSearch.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); await tick();
+    assert(gridSelectors[0].value === 'host:split-search-119' && !dialog.querySelector('.dropdown-searchable') &&
+      firstSlot.querySelector('.split-slot-detail').textContent.includes('batch-119'), '回车选中搜索结果并显示完整连接资料');
+    gridSelectors[0].value = firstSlotValue; gridSelectors[0].dispatchEvent(new Event('change'));
+    hosts = beforeSearchHosts;
+    gridSelectors[3].value = `host:${production.host.id}`;
+    gridSelectors[3].dispatchEvent(new Event('change', { bubbles: true }));
+    dialog.querySelector('form').requestSubmit(); await gridPrompt; await tick();
+    const gridCreated = [...tabs.values()].find(tab => !beforeGridTabs.has(tab.id));
+    assert(splitLayout.direction === 'grid' && splitLayout.panes.length === 4 &&
+      !splitLayout.panes.includes(unrelated.id) && gridCreated?.status === 'idle' &&
+      beforeGridConnections === previewCalls.filter(([type]) => type === 'connect').length,
+      '四宫格可组合已有会话和新的空闲会话，保留额外标签');
+    const panes = splitLayout.panes.map(id => tabs.get(id));
+    const rectangles = panes.map(tab => tab.view.getBoundingClientRect());
+    assert(rectangles[0].left < rectangles[1].left && rectangles[0].top < rectangles[2].top &&
+      rectangles[2].left < rectangles[3].left &&
+      panes.every(tab => !tab.view.hidden) && unrelated.view.hidden,
+      '四个会话按左上、右上、左下、右下显示');
+    panes[3].view.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    splitGrip.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    splitRowGrip.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    assert(active === panes[3] && splitLayout.ratio === 55 && splitLayout.rowRatio === 55,
+      '点击切换四屏焦点，可分别调整列宽和行高');
+    const saveGrid = saveSessionLayout(); await tick();
+    dialog.querySelector('input').value = '四屏巡检';
+    dialog.querySelector('form').requestSubmit(); await saveGrid; await tick();
+    const savedGrid = previewLayouts[0];
+    assert(savedGrid.tabs.length === 4 && savedGrid.split.length === 4 &&
+      savedGrid.rowRatio === 55 && !savedGrid.tabs.some(tab => tab.hostId === unrelated.host.id),
+      '四屏布局只保存本组会话及行列比例');
+    await openSessionLayout(savedGrid); await tick();
+    const restoredGrid = splitLayout.panes.map(id => tabs.get(id));
+    assert(restoredGrid.length === 4 && restoredGrid.every(tab => tab.status === 'idle') &&
+      splitLayout.ratio === 55 && splitLayout.rowRatio === 55 &&
+      beforeGridConnections === previewCalls.filter(([type]) => type === 'connect').length,
+      '打开四屏布局还原行列尺寸，并等待用户连接');
+    removeTab(restoredGrid[0]); await tick();
+    assert(splitLayout.panes.length === 3 && splitLayout.direction === 'grid' &&
+      restoredGrid.slice(1).every(tab => !tab.view.hidden), '四屏关闭一屏后保留其余三屏');
+    removeTab(restoredGrid[1]); await tick();
+    assert(splitLayout.panes.length === 2 && splitLayout.direction === 'horizontal',
+      '剩余两个会话自动整理为双分屏');
+    restoredGrid[2].paneHeader.querySelector('button:last-child').click(); await tick();
+    assert(!splitLayout && tabs.has(restoredGrid[2].id) && active === restoredGrid[3],
+      '移出分屏保留会话标签，并聚焦剩余会话');
+    const saveSingle = saveSessionLayout(); await tick();
+    dialog.querySelector('input').value = '单会话';
+    dialog.querySelector('form').requestSubmit(); await saveSingle;
+    const savedSingle = previewLayouts.at(-1);
+    assert(savedSingle.tabs.length === 1 && !savedSingle.split.length &&
+      savedSingle.tabs[0].hostId === active.host.id, '单屏保存只包含当前会话');
+    for (const tab of restoredGrid.slice(2)) removeTab(tab);
+    removeTab(unrelated); removeTab(gridCreated);
+    previewLayouts.length = 0;
     splitLayout = undefined; selectTab(production);
     const terminalOverflow = tab => tab.view.querySelector('.xterm-screen').getBoundingClientRect().bottom
       - tab.view.querySelector('.terminal-surface').getBoundingClientRect().bottom;
     await new Promise(resolve => production.terminal.write('output\r\n'.repeat(150) + 'prompt$ ', resolve));
     await tick();
     assert(terminalOverflow(production) <= 0.5, '输出滚到底后最后一行完整显示');
+    const terminalBackgroundMatches = tab => {
+      const rendered = getComputedStyle(tab.view.querySelector('.xterm-scrollable-element')).backgroundColor;
+      return getComputedStyle(tab.view.querySelector('.xterm-viewport')).backgroundColor === rendered &&
+        getComputedStyle(tab.view).backgroundColor === rendered;
+    };
+    const previousTerminalTheme = uiPreferences.terminalTheme;
+    const previousHostThemes = [production, staging].map(tab => [tab, tab.host.terminalTheme]);
+    for (const theme of ['dark', 'light']) {
+      delete production.host.terminalTheme;
+      uiPreferences.terminalTheme = theme; applyPreferences(); await tick();
+      assert(terminalBackgroundMatches(production), `${theme} 终端底部余量与渲染内容同色，没有默认黑条`);
+    }
+    uiPreferences.terminalTheme = 'dark';
+    production.host.terminalTheme = 'dark'; staging.host.terminalTheme = 'light'; applyPreferences();
     splitLayout = {panes:[production.id,staging.id],direction:'vertical',ratio:50};
     selectTab(production); await tick();
     const overflow = [production, staging].map(terminalOverflow);
     assert(overflow.every(pixels => pixels <= 0.5), `上下分屏各自完整显示最后一行（溢出像素 ${overflow.join(', ')}）`);
+    assert(terminalBackgroundMatches(production) && terminalBackgroundMatches(staging) &&
+      getComputedStyle(production.view).backgroundColor !== getComputedStyle(staging.view).backgroundColor,
+      '混合深浅配色分屏的底部余量分别跟随主机配色');
+    for (const [tab, theme] of previousHostThemes) {
+      if (theme === undefined) delete tab.host.terminalTheme;
+      else tab.host.terminalTheme = theme;
+    }
+    uiPreferences.terminalTheme = previousTerminalTheme; applyPreferences();
     splitLayout = undefined; selectTab(production);
     assert(document.documentElement.scrollWidth <= innerWidth, '工作台无页面横向溢出');
     api.ssh.connect = async value => previewCalls.push(['connect', value]);
@@ -269,6 +525,136 @@
     selectTab(retryTab);
     previewListener({ type: 'session', id: retryTab.id, status: 'closed', exited: true });
     assert(!tabs.has(retryTab.id) && active === production && !splitLayout, '远端 Shell 正常退出关闭标签并返回另一分屏');
+
+    const resourceHostCount = previewHosts.length;
+    const resourceIdentityCount = previewIdentities.length;
+    const resourceHosts = Array.from({ length: 120 }, (_, index) => ({
+      id: `resource-host-${index}`, name: index > 116 ? '同名主机' : `批量资源 ${index}`,
+      address: `resource-${index}.example.test`, port: 2222, username: `operator-${index}`, auth: 'agent',
+      group: index % 2 ? '批量甲组' : '批量乙组', tags: ['audit', '批量验证'],
+      ...(index === 119 ? { jumpHostId: production.host.id } : {})
+    }));
+    const resourceIdentities = Array.from({ length: 80 }, (_, index) => ({
+      id: `resource-identity-${index}`, name: `批量登录配置 ${index}`, username: `account-${index}`,
+      auth: index % 2 ? 'password' : 'agent', hosts: [], groups: []
+    }));
+    previewHosts.push(...resourceHosts); previewIdentities.push(...resourceIdentities);
+    await refreshHosts();
+    const resourceCalls = previewCalls.length;
+    const setResourceFilter = (root, label, value) => {
+      const select = root.querySelector(`[role="combobox"][aria-label="${label}"]`).closest('.dropdown').querySelector('select');
+      select.value = value; select.dispatchEvent(new Event('change'));
+    };
+    const searchResourcePicker = async (root, label, query) => {
+      root.querySelector(`[role="combobox"][aria-label="${label}"]`).click(); await tick();
+      const panel = root.querySelector('.dropdown-searchable') || document.querySelector('.dropdown-searchable');
+      const search = panel.querySelector('input');
+      search.value = query; search.dispatchEvent(new Event('input')); await tick();
+      return { panel, search };
+    };
+    const chooseResource = search => search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+
+    const routeForm = editHost(production.host); await tick();
+    let resourcePicker = await searchResourcePicker(dialog, '连接路径', 'RESOURCE-118 audit');
+    const routeSelect = dialog.querySelector('[aria-label="连接路径"]').closest('.dropdown').querySelector('select');
+    assert(![...routeSelect.options].some(option => [production.host.id, resourceHosts[119].id].includes(option.value)),
+      '可搜索的跳板列表仍排除当前主机和已使用跳板的主机');
+    const resourceGroup = resourcePicker.panel.querySelector('select');
+    resourceGroup.value = 'group:批量乙组'; resourceGroup.dispatchEvent(new Event('change'));
+    assert(resourcePicker.panel.querySelectorAll('[role="option"]').length === 1 &&
+      resourcePicker.panel.querySelector('[role="option"]').title.includes('operator-118@resource-118'),
+      '跳板机可按地址、标签和分组组合筛选，区分同名主机');
+    chooseResource(resourcePicker.search); await tick();
+    assert(routeSelect.value === resourceHosts[118].id, '跳板搜索结果按原主机 ID 选中');
+    resourcePicker = await searchResourcePicker(dialog, '连接路径', '直连');
+    chooseResource(resourcePicker.search); await tick();
+    assert(!routeSelect.value, '搜索选择仍可恢复直连');
+    resourcePicker = await searchResourcePicker(dialog, '登录配置', 'account-79');
+    resourcePicker.panel.querySelector('[data-source="password"]').click();
+    assert(resourcePicker.panel.querySelectorAll('[role="option"]').length === 1 &&
+      resourcePicker.panel.textContent.includes('SSH 密码'), '登录配置支持用户名搜索和认证方式筛选');
+    chooseResource(resourcePicker.search); await tick();
+    assert(dialog.querySelector('[aria-label="登录配置"]').closest('.dropdown').querySelector('select').value === 'resource-identity-79',
+      '选择登录配置保留其 ID 关联');
+    dialog.close(); await routeForm;
+
+    const importIdentity = editIdentity(undefined, undefined, undefined, previewIdentities); await tick();
+    resourcePicker = await searchResourcePicker(dialog, '从已有主机带入', 'resource-118 audit');
+    assert(!resourcePicker.panel.textContent.includes('其他位置'), '主机带入选择器不显示分屏专用提示');
+    chooseResource(resourcePicker.search); await tick();
+    assert(dialog.querySelector('input[aria-label="SSH 用户名"]').value === 'operator-118',
+      '从大量主机搜索带入登录资料，未混入同名主机');
+    dialog.close(); await importIdentity;
+
+    openSettings('groups'); await tick();
+    findButton($('settings-page'), '新建分组').click(); await tick();
+    resourcePicker = await searchResourcePicker($('settings-page'), '分组登录配置', 'account-79');
+    assert(resourcePicker.panel.querySelectorAll('[role="option"]').length === 1,
+      '分组默认登录配置同样支持搜索');
+    chooseResource(resourcePicker.search); await tick();
+    resourcePicker = await searchResourcePicker($('settings-page'), '上级分组', '生产环境');
+    assert(resourcePicker.panel.querySelectorAll('[role="option"]').length === 1, '上级分组可按名称和路径搜索');
+    closeDropdown(); selectTab(production); await tick();
+
+    const resourceSession = await openHost(resourceHosts[118], { force: true, connectNow: false });
+    resourceSession.title = '巡检窗口';
+    selectTab(production); chooseSession(); await tick();
+    $('session-switcher-search').value = 'RESOURCE-118 audit';
+    $('session-switcher-search').dispatchEvent(new Event('input'));
+    setResourceFilter($('session-switcher'), '会话切换主机分组', 'group:批量乙组');
+    setResourceFilter($('session-switcher'), '会话切换状态', 'idle');
+    assert($('session-switcher-results').querySelectorAll('.tab-choice').length === 1 &&
+      $('session-switcher-results').textContent.includes('巡检窗口'), '会话切换支持地址与标签搜索、分组与状态组合筛选');
+    setResourceFilter($('session-switcher'), '会话切换状态', 'ready');
+    assert(!$('session-switcher-results').querySelector('.tab-choice'), '状态筛选排除不匹配的空闲会话');
+    previewListener({ type: 'session', id: resourceSession.id, status: 'ready' });
+    assert($('session-switcher-results').querySelectorAll('.tab-choice').length === 1,
+      '会话状态变化后自动更新筛选结果');
+    $('session-switcher-results').querySelector('.tab-choice').click(); await tick();
+    assert(active === resourceSession && !$('session-switcher').open, '会话搜索切换复用原连接');
+
+    await addNewTab(); await tick(); const resourceDraft = active;
+    $('quick-connect-search').value = 'RESOURCE-118 audit';
+    $('quick-connect-search').dispatchEvent(new Event('input'));
+    setResourceFilter($('quick-connect-filters'), '新建标签类型', 'host');
+    setResourceFilter($('quick-connect-filters'), '新建标签主机分组', 'group:批量乙组');
+    setResourceFilter($('quick-connect-filters'), '新建标签标签', 'tag:audit');
+    assert($('quick-connect-results').querySelectorAll('.tab-choice').length === 1 &&
+      $('quick-connect-results').textContent.includes('resource-118'), '新建标签可组合筛选保存的主机');
+    setResourceFilter($('quick-connect-filters'), '新建标签类型', 'session');
+    assert($('quick-connect-results').querySelectorAll('.tab-choice').length === 1 &&
+      $('quick-connect-results').textContent.includes('巡检窗口'), '新建标签可切换到已有会话搜索');
+    $('quick-connect-results').querySelector('.tab-choice').click(); await tick();
+    selectTab(resourceDraft); await tick();
+    assert(quickConnectFilters.values.type === 'session' && quickConnectFilters.values.group === 'group:批量乙组' &&
+      $('quick-connect-search').value === 'RESOURCE-118 audit', '新建标签保留各自的搜索和筛选条件');
+
+    selectTab(production);
+    const resourcePalette = openPalette(); await tick();
+    const resourceQuery = dialog.querySelector('input[type="search"]');
+    resourceQuery.value = 'RESOURCE-118 audit'; resourceQuery.dispatchEvent(new Event('input'));
+    setResourceFilter(dialog, '快捷查找类型', 'host');
+    assert(dialog.querySelectorAll('.palette-choice').length === 1, '快捷查找可只筛选主机');
+    setResourceFilter(dialog, '快捷查找主机分组', 'group:批量甲组');
+    assert(!dialog.querySelector('.palette-choice') && dialog.querySelector('button[type="submit"]').disabled,
+      '组合筛选无结果时不允许打开其他目标');
+    setResourceFilter(dialog, '快捷查找主机分组', 'group:批量乙组');
+    setResourceFilter(dialog, '快捷查找类型', 'session');
+    assert(dialog.querySelectorAll('.palette-choice').length === 1 && dialog.textContent.includes('巡检窗口'),
+      '快捷查找的已有会话也可按原主机地址、标签和分组匹配');
+    dialog.querySelector('.palette-choice').click(); await resourcePalette; await tick();
+    assert(active === resourceSession && !previewCalls.slice(resourceCalls).some(([type]) =>
+      ['connect','input','run','save-host','save-identity','save-layout'].includes(type)),
+      '搜索与筛选不连接、不发命令、不写入配置，选中会话沿用原目标');
+    selectTab(resourceDraft); await tick();
+    const staleResourceChoice = $('quick-connect-results').querySelector('.tab-choice');
+    removeTab(resourceSession); await tick();
+    assert(!$('quick-connect-results').querySelector('.tab-choice'), '后台会话关闭后立即更新选择结果');
+    staleResourceChoice.click(); await tick();
+    assert(active === resourceDraft && $('status').textContent.includes('会话已关闭'), '过期的选择操作不能打开已关闭会话');
+    removeTab(resourceDraft);
+    previewHosts.splice(resourceHostCount); previewIdentities.splice(resourceIdentityCount);
+    await refreshHosts(); selectTab(production); await tick();
     const report = document.createElement('details');
     report.id = 'smoke-results'; report.style = 'position:fixed;bottom:32px;right:8px;z-index:20;max-width:420px;background:var(--raise);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font-size:11px;max-height:70vh;overflow:auto';
     const summary = document.createElement('summary'); summary.textContent = `✓ ${results.length} 项界面检查通过（模拟数据）`; report.append(summary);

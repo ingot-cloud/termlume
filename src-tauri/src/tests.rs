@@ -188,6 +188,85 @@ async fn auto_lock_settings_respect_activity_and_survive_restart() {
     assert_eq!(ws.lock(true)["locked"], true);
 }
 
+#[tokio::test]
+async fn disabling_protection_requires_credentials_and_keeps_workspace() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let recovery = vault::recovery_code();
+    let hosts = call(&ws, "hosts:save", json!({
+        "name":"test host","address":"example.test","username":"ops","port":22,"auth":"agent"
+    })).await;
+    call(&ws, "vault:enable", json!({"password":"fixture password","recovery":recovery})).await;
+    assert!(dispatch(&ws, "vault:disable", json!({"secret":"wrong password"})).await.is_err());
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["enabled"], true);
+    let state = call(&ws, "vault:disable", json!({"secret":recovery,"useRecovery":true})).await;
+    assert_eq!(state["enabled"], false);
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "hosts:list", Value::Null).await, hosts);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires the isolated HTTPS Git fixture"]
+async fn git_pull_only_and_automatic_sync_respect_local_changes_and_conflicts() {
+    let fixture = PathBuf::from(std::env::var_os("TERMLUME_TEST_FIXTURE").unwrap());
+    let port = std::fs::read_to_string(fixture.join("https-port")).unwrap();
+    let remote = format!("https://127.0.0.1:{port}/repo.git");
+    let auth = json!({"username":"fixture","token":"test-repository-token"});
+    let branch = "vault/auto-pull";
+    let password = "fixture sync password";
+    let (_profile, ws) = make_workspace(&fixture, None);
+    let (_other_profile, other) = make_workspace(&fixture, None);
+    let host = |name: &str| json!({"name":name,"address":"example.test","username":"ops","port":22,"auth":"agent"});
+    let shared = call(&ws, "hosts:save", host("shared")).await[0].clone();
+    call(&ws, "vault:enable", json!({"password":password,"recovery":vault::recovery_code()})).await;
+    call(&ws, "vault:sync", json!({"address":remote,"branch":branch,"auth":auth})).await;
+    call(&other, "vault:restore-git", json!({"address":remote,"branch":branch,"auth":auth,"secret":password})).await;
+    call(&ws, "hosts:save", host("local change")).await;
+    call(&other, "hosts:save", host("remote change")).await;
+    call(&other, "vault:sync", json!({})).await;
+    let pulled = call(&ws, "vault:sync", json!({"pullOnly":true})).await;
+    assert_eq!(pulled["pending"], true);
+    assert!(pulled["state"]["lastFetched"].is_u64());
+    assert_eq!(call(&ws, "hosts:list", Value::Null).await.as_array().unwrap().len(), 3);
+    call(&other, "vault:sync", json!({"pullOnly":true})).await;
+    assert_eq!(call(&other, "hosts:list", Value::Null).await.as_array().unwrap().len(), 2);
+
+    let state = call(&ws, "vault:set-git-settings", json!({"paused":true,"onUnlock":true})).await;
+    assert_eq!(state["remote"], remote);
+    assert!(dispatch(&ws, "vault:sync", json!({"pullOnly":true})).await.is_err());
+    call(&ws, "vault:set-git-settings", json!({"onUnlock":true})).await;
+    let mut rx = events(&ws);
+    let worker = tokio::spawn(git_auto::run(ws.clone()));
+    let result = until(&mut rx, |e| e["type"] == "git-auto").await;
+    worker.abort();
+    assert!(result["state"]["syncAttention"].is_null(), "{result}");
+    call(&other, "vault:sync", json!({"pullOnly":true})).await;
+    assert_eq!(call(&other, "hosts:list", Value::Null).await.as_array().unwrap().len(), 3);
+
+    let mut ours = shared.clone();
+    let mut theirs = shared.clone();
+    ours["note"] = json!("local edit");
+    theirs["note"] = json!("remote edit");
+    call(&ws, "hosts:save", ours).await;
+    call(&other, "hosts:save", theirs).await;
+    call(&other, "vault:sync", json!({})).await;
+    let (epoch, policy) = {
+        let store = ws.store.lock().unwrap();
+        (store.epoch, store.data().unwrap().git_settings)
+    };
+    assert!(git::synchronize_automatically(&ws, epoch, policy).await);
+    assert!(until(&mut rx, |e| e["type"] == "git-auto").await["state"]["syncAttention"].is_string());
+    assert!(!git::synchronize_automatically(&ws, epoch, policy).await);
+    let conflict = call(&ws, "vault:sync", json!({"pullOnly":true})).await;
+    assert_eq!(conflict["conflicts"][0]["id"], shared["id"]);
+    let choices = HashMap::from([(shared["id"].as_str().unwrap(), "remote")]);
+    let resolved = call(&ws, "vault:sync", json!({"pullOnly":true,"ticket":conflict["ticket"],"choices":choices})).await;
+    assert_eq!(resolved["pending"], false);
+    assert!(resolved["state"]["syncAttention"].is_null());
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires the macOS login keychain"]
@@ -263,6 +342,8 @@ async fn startup_unlock_preserves_encryption_and_is_local_to_the_workspace() {
     let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
     assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], false);
     assert_eq!(call(&ws, "hosts:list", Value::Null).await, hosts);
+    *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(3600);
+    assert_eq!(ws.lock(true)["locked"], false);
     call(&ws, "vault:lock", Value::Null).await;
     assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
     assert!(dispatch(&ws, "vault:set-startup-unlock", json!(true))
@@ -2280,6 +2361,37 @@ fn csv_and_workspace_state_records_validate_without_executing_input() {
     };
     assert!(command.preview().unwrap().starts_with("sh -c '"));
 }
+#[tokio::test]
+async fn layouts_keep_four_panes_and_both_ratios_across_restore() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let tabs = (0..4).map(|i| json!({"hostId":Uuid::new_v4(),"title":format!("pane {i}")})).collect::<Vec<_>>();
+    let pair = call(&ws, "layouts:save", json!({"layout":{
+        "name":"legacy pair","tabs":&tabs[..2],"split":[0,1],"direction":"horizontal","ratio":60
+    }})).await[0].clone();
+    assert!(pair.get("rowRatio").is_none());
+    let grid = json!({"name":"grid","tabs":tabs,"split":[0,1,2,3],"direction":"grid","ratio":60,"rowRatio":55});
+    let saved = call(&ws, "layouts:save", json!({"layout":grid})).await[1].clone();
+    assert_eq!(saved["rowRatio"], 55);
+    for indices in [json!([0,1,1,3]), json!([0,1,2,4]), json!([0,1])] {
+        let mut invalid = grid.clone();
+        invalid["split"] = indices;
+        assert!(dispatch(&ws, "layouts:save", json!({"layout":invalid})).await.is_err());
+    }
+    let mut wrong_direction = grid.clone();
+    wrong_direction["direction"] = json!("vertical");
+    assert!(dispatch(&ws, "layouts:save", json!({"layout":wrong_direction})).await.is_err());
+    let rows = ws.store.lock().unwrap().data().unwrap().snapshot();
+    let mut restored = Data::default();
+    restored.apply(store::portable_rows(rows).unwrap(), None);
+    assert_eq!(json!(restored.layouts)[1], saved);
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    let reopened = call(&ws, "layouts:list", Value::Null).await;
+    assert_eq!(reopened[0], pair);
+    assert_eq!(reopened[1], saved);
+}
+
 #[tokio::test]
 async fn command_library_layouts_preferences_and_empty_workspace_guards() {
     let home = tempfile::tempdir().unwrap();

@@ -28,33 +28,35 @@
     const rect = wrapper.getBoundingClientRect();
     const viewportWidth = document.documentElement.clientWidth;
     const viewportHeight = document.documentElement.clientHeight;
-    const width = Math.min(Math.max(208, rect.width), viewportWidth - 16);
+    const width = Math.min(Math.max(active.config.searchable ? 380 : 208, rect.width), viewportWidth - 16);
     panel.style.width = `${width}px`;
     const below = viewportHeight - rect.bottom - 12;
-    const above = rect.top - 12;
+    const titlebar = document.querySelector('.titlebar')?.getBoundingClientRect().bottom || 0;
+    const above = rect.top - titlebar - 12;
     const aboveTrigger = below < Math.min(220, panel.scrollHeight) && above > below;
     panel.style.left = `${Math.max(8, Math.min(rect.left, viewportWidth - width - 8))}px`;
-    panel.style.maxHeight = `${Math.min(272, Math.max(36, aboveTrigger ? above : below))}px`;
-    panel.style.top = `${aboveTrigger ? Math.max(8, rect.top - panel.offsetHeight - 5) : rect.bottom + 5}px`;
+    panel.style.maxHeight = `${Math.min(active.config.searchable ? 380 : 272, Math.max(36, aboveTrigger ? above : below))}px`;
+    panel.style.top = `${aboveTrigger ? Math.max(titlebar + 8, rect.top - panel.offsetHeight - 5) : rect.bottom + 5}px`;
   }
 
   function highlight(index, scroll = true) {
     if (!active) return;
     if (active.index >= 0) active.rows[active.index].removeAttribute('data-highlighted');
     active.index = index;
+    const focusTarget = active.input || active.anchor;
     if (index < 0) {
-      active.anchor.removeAttribute('aria-activedescendant');
+      focusTarget.removeAttribute('aria-activedescendant');
       return;
     }
     const row = active.rows[index];
     row.dataset.highlighted = 'true';
-    active.anchor.setAttribute('aria-activedescendant', row.id);
+    focusTarget.setAttribute('aria-activedescendant', row.id);
     if (scroll) {
-      const panel = active.panel;
-      const top = row.offsetTop - 4;
-      const bottom = top + row.offsetHeight + 8;
-      if (top < panel.scrollTop) panel.scrollTop = top;
-      else if (bottom > panel.scrollTop + panel.clientHeight) panel.scrollTop = bottom - panel.clientHeight;
+      const scroller = active.scroller || active.panel;
+      const bounds = scroller.getBoundingClientRect();
+      const rect = row.getBoundingClientRect();
+      if (rect.top < bounds.top + 4) scroller.scrollTop -= bounds.top + 4 - rect.top;
+      else if (rect.bottom > bounds.bottom - 4) scroller.scrollTop += rect.bottom - bounds.bottom + 4;
     }
   }
 
@@ -69,39 +71,133 @@
   }
 
   function choose(index) {
-    const { options, config } = active;
+    const { options, config, anchor } = active;
     const option = options[index];
     if (!option || option.disabled) return;
     close();
     config.select(option.value);
+    anchor.focus({ preventScroll: true });
+  }
+
+  function optionRow(option, index, panel) {
+    const row = element('div', 'dropdown-option');
+    row.id = `${panel.id}-${index}`;
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', String(option.value === active.config.value()));
+    if (option.disabled) row.setAttribute('aria-disabled', 'true');
+    if (option.icon) {
+      const icon = element('span', 'dropdown-icon', option.icon);
+      icon.setAttribute('aria-hidden', 'true');
+      row.append(icon);
+    }
+    const text = element('span', 'dropdown-text');
+    text.append(element('span', '', option.label));
+    if (option.description) text.append(element('small', 'dropdown-description', option.description));
+    row.title = [option.label, option.description].filter(Boolean).join('\n');
+    row.append(text, element('span', 'dropdown-check', '✓'));
+    row.lastElementChild.setAttribute('aria-hidden', 'true');
+    row.addEventListener('pointermove', () => { if (active?.panel === panel && !option.disabled) highlight(index, false); });
+    row.addEventListener('pointerdown', event => event.preventDefault());
+    row.addEventListener('click', () => { if (active?.panel === panel) choose(index); });
+    return row;
+  }
+
+  function searchablePanel(config) {
+    const { anchor, wrapper } = config;
+    const panel = element('div', 'dropdown-panel dropdown-searchable');
+    panel.id = config.id;
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', `选择${config.label}`);
+    const search = element('input');
+    search.type = 'search';
+    search.placeholder = config.placeholder || '搜索名称、地址、分组或标签';
+    search.setAttribute('aria-label', `搜索${config.label}`);
+    search.autocomplete = 'off';
+    const filters = element('div', 'dropdown-filters');
+    const sources = element('div', 'dropdown-sources');
+    sources.setAttribute('role', 'group');
+    sources.setAttribute('aria-label', config.sourceLabel || '会话来源');
+    sources.hidden = !config.sources?.length;
+    let source = '';
+    const group = element('select');
+    group.setAttribute('aria-label', '筛选主机分组');
+    group.hidden = !config.groups;
+    group.append(new Option('全部分组', ''));
+    for (const name of config.groups || []) group.append(new Option(name || '未分组', `group:${name}`));
+    filters.append(sources, group);
+    filters.hidden = sources.hidden && group.hidden;
+    const list = element('div', 'dropdown-results');
+    list.id = `${panel.id}-results`;
+    list.setAttribute('role', 'listbox');
+    list.setAttribute('aria-label', config.label);
+    search.setAttribute('role', 'combobox');
+    search.setAttribute('aria-autocomplete', 'list');
+    search.setAttribute('aria-expanded', 'true');
+    search.setAttribute('aria-controls', list.id);
+    const count = element('small', 'dropdown-count');
+    count.setAttribute('role', 'status');
+    panel.append(element('div', 'dropdown-search', ''), list, count);
+    panel.firstChild.append(search, filters);
+    (wrapper.closest('dialog, #vault-lock') || document.body).append(panel);
+    const render = () => {
+      if (active?.panel !== panel) return;
+      const words = search.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const options = config.options().filter(option => (!source || option.source === source) &&
+        (!group.value || option.group === group.value.slice(6)) &&
+        words.every(word => `${option.label} ${option.description || ''} ${option.search || ''}`.toLowerCase().includes(word)));
+      Object.assign(active, { options, rows: options.map((option, index) => optionRow(option, index, panel)), index: -1 });
+      list.replaceChildren(...active.rows);
+      if (!options.length) list.append(element('p', 'dropdown-empty', config.emptyText || '没有匹配项，请调整搜索或筛选。'));
+      count.textContent = `${options.length} 项匹配${config.hint ? ` · ${config.hint}` : ''}`;
+      for (const control of sources.children) control.setAttribute('aria-pressed', String(control.dataset.source === source));
+      position();
+      const selected = options.findIndex(option => !option.disabled && option.value === config.value());
+      if (selected >= 0) highlight(selected);
+      else move(1);
+    };
+    active = { config, anchor, wrapper, panel, input: search, scroller: list, options: [], rows: [], index: -1, refresh: render };
+    for (const [value, label] of config.sources || []) {
+      const control = element('button', '', label);
+      control.type = 'button';
+      control.dataset.source = value;
+      control.addEventListener('pointerdown', event => event.preventDefault());
+      control.addEventListener('click', () => { source = value; render(); });
+      sources.append(control);
+    }
+    anchor.setAttribute('aria-expanded', 'true');
+    anchor.setAttribute('aria-controls', panel.id);
+    search.addEventListener('input', render);
+    group.addEventListener('change', render);
+    search.addEventListener('keydown', event => {
+      if (event.isComposing || active?.panel !== panel) return;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') move(event.key === 'ArrowDown' ? 1 : -1);
+      else if (event.key === 'Enter') { if (active.index >= 0) choose(active.index); }
+      else if (event.key === 'Escape') { close(); anchor.focus({ preventScroll: true }); }
+      else return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (active?.panel === panel && active.index >= 0) search.setAttribute('aria-activedescendant', active.rows[active.index].id);
+    });
+    panel.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault(); event.stopPropagation();
+      close(); anchor.focus({ preventScroll: true });
+    });
+    render();
+    search.focus({ preventScroll: true });
   }
 
   function open(config, query, direction = 1) {
     close();
+    if (config.searchable) { searchablePanel(config); return; }
     const { anchor, wrapper } = config;
     const panel = element('div', 'dropdown-panel');
     panel.id = config.id;
     panel.setAttribute('role', 'listbox');
     panel.setAttribute('aria-label', config.label);
     const options = config.options(query);
-    const rows = options.map((option, index) => {
-      const row = element('div', 'dropdown-option');
-      row.id = `${panel.id}-${index}`;
-      row.setAttribute('role', 'option');
-      row.setAttribute('aria-selected', String(option.value === config.value()));
-      if (option.disabled) row.setAttribute('aria-disabled', 'true');
-      if (option.icon) {
-        const icon = element('span', 'dropdown-icon', option.icon);
-        icon.setAttribute('aria-hidden', 'true');
-        row.append(icon);
-      }
-      row.append(element('span', 'dropdown-text', option.label), element('span', 'dropdown-check', '✓'));
-      row.lastElementChild.setAttribute('aria-hidden', 'true');
-      row.addEventListener('pointermove', () => { if (active?.panel === panel && !option.disabled) highlight(index, false); });
-      row.addEventListener('pointerdown', (event) => event.preventDefault());
-      row.addEventListener('click', () => { if (active?.panel === panel) choose(index); });
-      return row;
-    });
+    active = { config, anchor, wrapper, panel, options, rows: [], index: -1 };
+    const rows = options.map((option, index) => optionRow(option, index, panel));
     panel.append(...rows);
     if (!rows.length) panel.append(element('div', 'dropdown-empty', '没有匹配选项'));
     (wrapper.closest('dialog, #vault-lock') || document.body).append(panel);
@@ -119,7 +215,7 @@
     config.id = `dropdown-${++nextId}`;
     anchor.setAttribute('role', 'combobox');
     anchor.setAttribute('aria-label', label);
-    anchor.setAttribute('aria-haspopup', 'listbox');
+    anchor.setAttribute('aria-haspopup', config.searchable ? 'dialog' : 'listbox');
     anchor.setAttribute('aria-expanded', 'false');
     if (editable) anchor.setAttribute('aria-autocomplete', 'list');
     let prefix = '';
@@ -142,6 +238,13 @@
         const available = active.options.map((option, index) => option.disabled ? -1 : index).filter((index) => index >= 0);
         if (available.length) highlight(key === 'Home' ? available[0] : available.at(-1));
       } else if (!editable && key.length === 1 && key !== ' ') {
+        if (config.searchable) {
+          if (!opened) open(config);
+          active.input.value += key;
+          active.refresh();
+          event.preventDefault(); event.stopPropagation();
+          return;
+        }
         const now = Date.now();
         prefix = (now - lastKey > 650 ? '' : prefix) + key.toLowerCase();
         lastKey = now;
@@ -154,7 +257,7 @@
     });
   }
 
-  function selectControl(select, label = select.getAttribute('aria-label')) {
+  function selectControl(select, label = select.getAttribute('aria-label'), settings = {}) {
     const wrapper = element('div', 'dropdown');
     const trigger = element('button', 'dropdown-trigger');
     trigger.type = 'button';
@@ -167,26 +270,32 @@
     const error = element('small', 'dropdown-error');
     error.setAttribute('role', 'alert');
     error.hidden = true;
+    const description = element('small', 'dropdown-selected-description');
+    description.hidden = true;
     if (select.parentNode) select.replaceWith(wrapper);
     select.hidden = true;
-    wrapper.append(trigger, select, error);
+    wrapper.append(trigger, select, description, error);
     const refresh = () => {
       const selected = select.selectedOptions[0];
       icon.textContent = selected?.dataset.icon || '';
       icon.hidden = !icon.textContent;
       value.textContent = selected?.textContent || '请选择';
-      value.title = value.textContent;
+      value.title = [value.textContent, selected?.dataset.description].filter(Boolean).join('\n');
+      description.textContent = selected?.dataset.description || '';
+      description.hidden = !settings.showDescription || !description.textContent;
       trigger.disabled = select.disabled;
       trigger.setAttribute('aria-required', String(select.required));
       if (select.validity.valid) {
         error.hidden = true;
         trigger.removeAttribute('aria-invalid');
       }
-      if (active?.anchor === trigger) open(config);
+      if (active?.anchor === trigger) { if (active.refresh) active.refresh(); else open(config); }
     };
-    const config = { anchor: trigger, wrapper, label, value: () => select.value,
+    const config = { ...settings, anchor: trigger, wrapper, label, value: () => select.value,
       options: () => Array.from(select.options, (option) => ({
         value: option.value, label: option.textContent, icon: option.dataset.icon,
+        description: option.dataset.description, search: option.dataset.search,
+        source: option.dataset.source, group: option.dataset.group,
         disabled: option.disabled || (select.required && !option.value)
       })),
       select: (newValue) => {
@@ -256,7 +365,7 @@
     if (active && !active.wrapper.contains(event.target) && !active.panel.contains(event.target)) close();
   });
   document.addEventListener('close', (event) => { if (active && event.target.contains(active.anchor)) close(); }, true);
-  document.addEventListener('scroll', (event) => { if (active && event.target !== active.panel) close(); }, true);
+  document.addEventListener('scroll', (event) => { if (active && !active.panel.contains(event.target)) position(); }, true);
   window.addEventListener('blur', close);
   window.addEventListener('resize', position);
 

@@ -302,6 +302,15 @@ pub struct Binding {
     pub last_synced: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct GitSettings {
+    pub paused: bool,
+    pub on_unlock: bool,
+    pub after_changes: bool,
+    pub interval_minutes: u32,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitMigration {
@@ -352,6 +361,9 @@ pub struct Data {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub transfer_history: Vec<Value>,
     pub sync: Option<Binding>,
+    pub git_settings: GitSettings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fetched: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_migration: Option<GitMigration>,
 }
@@ -393,7 +405,7 @@ impl Data {
             }
             if host.inherit_identity {
                 host.identity_id =
-                    Some(identity.ok_or("分组没有可继承的身份，请设置组默认值或改为独立凭据。")?);
+                    Some(identity.ok_or("分组没有可用的登录配置，请设置分组默认登录配置或单独配置此主机。")?);
             }
         } else if host.inherit_port || host.inherit_identity || host.inherit_theme {
             return Err("请先选择分组后再继承设置。".into());
@@ -403,7 +415,7 @@ impl Data {
                 .identities
                 .iter()
                 .find(|i| i.id == id)
-                .ok_or("关联身份不存在，请重新选择。")?;
+                .ok_or("关联登录配置不存在，请重新选择。")?;
             host.username = identity.username.clone();
             host.auth = identity.auth.clone();
             host.key_path = identity.key_path.clone();
@@ -691,6 +703,8 @@ impl Store {
             "gitSsh": cfg!(desktop),
             "gitMigration": migration.map(|m| json!({"remote": m.remote, "branch": m.branch})),
             "lastSynced": sync.and_then(|s| s.last_synced),
+            "lastFetched": self.data.as_ref().and_then(|data| data.last_fetched),
+            "gitSettings": self.data.as_ref().map(|data| data.git_settings),
             "fileTransfers": cfg!(desktop)
         })
     }
@@ -758,6 +772,33 @@ impl Store {
         self.write(&serde_json::to_vec(&envelope).map_err(error)?)?;
         self.envelope = Some(envelope);
         self.unlock(key, data);
+        self.revision += 1;
+        Ok(())
+    }
+    pub fn remove_protection(&mut self) -> Result<(), String> {
+        let mut data = self.data()?.clone();
+        // Workspace passwords only survive if a separate local Keychain copy exists.
+        data.portable_passwords.clear();
+        for identity in &mut data.identities {
+            identity.password = None;
+        }
+        data.sync = None;
+        data.git_migration = None;
+        data.git_settings = GitSettings::default();
+        data.last_fetched = None;
+        data.lock_settings = LockSettings::default();
+        if let Some(path) = self.touch_id_path() {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(error(err)),
+            }
+        }
+        self.write(&serde_json::to_vec(&data).map_err(error)?)?;
+        self.data = Some(data);
+        self.envelope = None;
+        self.key = None;
+        self.epoch += 1;
         self.revision += 1;
         Ok(())
     }

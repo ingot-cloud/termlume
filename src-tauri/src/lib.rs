@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 mod assets;
 mod forwarding;
 mod git;
+mod git_auto;
 mod git_https;
 mod imports;
 mod keys;
@@ -23,6 +24,7 @@ mod session_logs;
 mod ssh;
 mod startup_unlock;
 mod store;
+mod terminal_fonts;
 #[cfg(test)]
 mod tests;
 mod touch_id;
@@ -56,6 +58,7 @@ struct Inner {
     unlock_gate: tokio::sync::Mutex<()>,
     sync_cancel: Mutex<Option<CancellationToken>>,
     conflict: Mutex<Option<git::Conflict>>,
+    sync_attention: Mutex<Option<String>>,
     last_activity: Mutex<Instant>,
     key_directories: Mutex<HashSet<PathBuf>>,
     home: PathBuf,
@@ -88,6 +91,7 @@ impl Workspace {
             unlock_gate: Default::default(),
             sync_cancel: Mutex::default(),
             conflict: Mutex::default(),
+            sync_attention: Mutex::default(),
             last_activity: Mutex::new(Instant::now()),
             key_directories: Mutex::new(HashSet::from([home.join(".ssh")])),
             home,
@@ -125,6 +129,9 @@ impl Workspace {
     fn lock(&self, idle_only: bool) -> Value {
         let mut store = self.store.lock().unwrap();
         if idle_only {
+            if store.key.is_none() || store.startup_unlock.is_some() {
+                return store.status();
+            }
             let Some(minutes) = store
                 .data
                 .as_ref()
@@ -145,12 +152,20 @@ impl Workspace {
                 task.cancel();
             }
             self.conflict.lock().unwrap().take();
+            self.sync_attention.lock().unwrap().take();
             self.connections.close_pending();
             self.forwards.stop_all();
             self.logs.stop_all();
             self.emit(json!({"type":"vault","state":store.status()}));
         }
         store.status()
+    }
+    fn vault_status(&self) -> Value {
+        let mut state = self.store.lock().unwrap().status();
+        if state["locked"] == false && state["remote"].as_str().is_some_and(|s| !s.is_empty()) {
+            state["syncAttention"] = json!(*self.sync_attention.lock().unwrap());
+        }
+        state
     }
     fn key_directory(&self, value: &Value) -> Result<PathBuf, String> {
         let dir = value
@@ -242,7 +257,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         return Ok(Value::Null);
     }
     if name == "vault:state" {
-        return Ok(ws.store.lock().unwrap().status());
+        return Ok(ws.vault_status());
     }
     if name == "vault:unlock" {
         return unlock(ws, value).await;
@@ -264,6 +279,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             blocking(move || keys::copy(&code)).await?;
         }
         "vault:enable" => return enable(ws, value).await,
+        "vault:disable" => return disable(ws, value).await,
         "vault:set-touch-id" => return set_touch_id(ws, parse(value)?).await,
         "vault:set-startup-unlock" => return set_startup_unlock(ws, parse(value)?).await,
         "vault:set-auto-lock" => {
@@ -286,6 +302,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         "vault:restore-file" => return restore(ws, value, false).await,
         "vault:restore-git" => return restore(ws, value, true).await,
         "vault:sync" => return git::synchronize(ws, parse(value)?).await,
+        "vault:set-git-settings" => return git_auto::configure(ws, parse(value)?),
         "vault:migrate-git" => return git::migrate(ws, parse(value)?).await,
         "trust:list" => {
             let store = ws.store.lock().unwrap();
@@ -368,6 +385,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             };
         }
         "preferences:get" => return assets::preferences_request(ws, Value::Null),
+        "preferences:fonts" => return blocking(|| Ok(json!(terminal_fonts::families()))).await,
         "preferences:save" => return assets::preferences_request(ws, value),
         "history:list" => return Ok(json!(ws.store.lock().unwrap().data()?.command_history)),
         "history:clear" => {
@@ -763,7 +781,7 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
         "hosts:clear-password" => {
             let id = id(&value)?;
             if data.connection_host(id)?.identity_id.is_some() {
-                return Err("共享身份密码请到身份管理中修改，操作会影响所有引用主机。".into());
+                return Err("请到「设置 → 登录配置」修改密码，修改后会应用于所有关联主机的新连接。".into());
             }
             data.host(id)?;
             data.local_passwords.remove(&id);
@@ -890,7 +908,7 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
             .identities
             .iter()
             .find(|i| i.id == id)
-            .ok_or("身份不存在。")?;
+            .ok_or("登录配置不存在。")?;
         host.username = i.username.clone();
         host.auth = i.auth.clone();
         host.key_path = i.key_path.clone();
@@ -1105,6 +1123,43 @@ async fn enable(ws: &Workspace, value: Value) -> Result<Value, String> {
     store.install(key, &header, data)?;
     Ok(store.status())
 }
+async fn disable(ws: &Workspace, value: Value) -> Result<Value, String> {
+    let _sync = ws.sync_gate.try_lock().map_err(|_| "请等待同步完成。")?;
+    let _unlock = ws.unlock_gate.try_lock().map_err(|_| "请等待解锁设置完成。")?;
+    let (envelope, epoch, startup) = {
+        let store = ws.store.lock().unwrap();
+        let envelope = store.envelope.clone().ok_or("主密码保护尚未开启。")?;
+        if store.data()?.git_migration.is_some() {
+            return Err("请先继续或放弃待完成的 Git 迁移。".into());
+        }
+        let startup = store
+            .startup_unlock
+            .as_ref()
+            .map(|credential| credential.account(&store.startup_unlock_path()))
+            .transpose()?;
+        (envelope, store.epoch, startup)
+    };
+    let secret = Zeroizing::new(string(&value["secret"])?.to_owned());
+    let recovery = flag(&value, "useRecovery");
+    blocking(move || {
+        envelope
+            .unlock::<Data>(&secret, recovery, "local")
+            .map(|_| ())
+    })
+    .await?;
+    if let Some(account) = startup {
+        blocking(move || startup_unlock::delete(&account)).await?;
+    }
+    let mut store = ws.store.lock().unwrap();
+    ensure_epoch(&store, epoch)?;
+    if store.startup_unlock.is_some() {
+        store.set_startup_unlock(None)?;
+    }
+    store.remove_protection()?;
+    ws.conflict.lock().unwrap().take();
+    ws.sync_attention.lock().unwrap().take();
+    Ok(store.status())
+}
 #[cfg(desktop)]
 async fn export(ws: &Workspace) -> Result<Value, String> {
     let epoch = {
@@ -1248,6 +1303,7 @@ pub fn run() {
             let workspace =
                 Workspace::new(directory, home, legacy).map_err(std::io::Error::other)?;
             app.manage(workspace.clone());
+            tauri::async_runtime::spawn(git_auto::run(workspace.clone()));
             let idle_workspace = workspace.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
