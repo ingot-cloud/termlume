@@ -6,7 +6,11 @@ const { setImmediate: nextTurn } = require('node:timers/promises');
 
 // Exercise the actual renderer actions without a browser or a live SSH connection.
 const renderer = fs.readFileSync(require.resolve('../src/ui/renderer.js'), 'utf8');
-const extract = (from, to) => renderer.slice(renderer.indexOf(from), renderer.indexOf(to));
+const extract = (from, to) => {
+  const start = renderer.indexOf(from), end = renderer.indexOf(to, start);
+  assert(start >= 0 && end > start, `Renderer test boundary missing: ${from} → ${to}`);
+  return renderer.slice(start, end);
+};
 function fixture() {
   const session = {id:'production-session',status:'ready',attempts:1,host:{id:'production',name:'生产',username:'ops',address:'example.test',port:22}};
   const calls = [];
@@ -25,7 +29,7 @@ function fixture() {
   };
   vm.createContext(scope);
   vm.runInContext([
-    extract('function readySession(', '\nfunction renderTerminalDirectory('),
+    extract('function readySession(', '\nfunction renderTerminalBottom('),
     extract('function fillTerminalCommand(', '\nasync function configureCommand('),
     extract('async function useSnippet(', '\nasync function manageGroups(')
   ].join('\n'), scope);

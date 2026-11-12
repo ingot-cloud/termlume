@@ -4775,6 +4775,7 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "git2",
+ "objc2-app-kit",
  "rand",
  "regex",
  "rfd",

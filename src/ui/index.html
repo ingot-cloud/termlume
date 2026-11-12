@@ -91,17 +91,16 @@
           <div id="host-list"></div>
         </div>
       </section>
-      <section id="new-tab-page" aria-labelledby="quick-connect-title" hidden>
+      <section id="new-tab-page" aria-label="新建标签" hidden>
         <div class="quick-connect">
-          <header class="section-head">
-            <h1 id="quick-connect-title">新建标签</h1>
+          <div class="quick-connect-tools">
+            <form id="quick-connect-form" class="tab-search">
+              <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg>
+              <input id="quick-connect-search" type="search" placeholder="搜索主机、标签，或输入 user@host" aria-label="搜索主机或标签" autocomplete="off">
+              <kbd>⌘ K</kbd>
+            </form>
             <button id="quick-add-host" type="button" class="outlined">新建主机</button>
-          </header>
-          <form id="quick-connect-form" class="tab-search">
-            <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg>
-            <input id="quick-connect-search" type="search" placeholder="搜索主机、标签，或输入 user@host" aria-label="搜索主机或标签" autocomplete="off">
-            <kbd>⌘ K</kbd>
-          </form>
+          </div>
           <div id="quick-connect-filters"></div>
           <div id="quick-connect-results"></div>
         </div>
@@ -110,9 +109,9 @@
         <header id="toolbar" hidden>
           <div id="context"></div>
           <div id="toolbar-actions">
-            <button id="terminal-path" type="button" class="outlined" aria-haspopup="dialog" hidden>
-              <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h7l2 2h9v11H3z"/></svg>
-              <span>远端路径</span>
+            <button id="save-layout" type="button" class="outlined" aria-label="保存工作区布局" aria-haspopup="dialog" hidden>
+              <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h12l4 4v14H3V3h2zm2 0v7h10V3M7 21v-7h10v7"/></svg>
+              <span>保存布局</span>
             </button>
             <div id="session-actions"></div>
           </div>
@@ -133,9 +132,8 @@
         </div>
       </section>
       <section id="keys-page" class="settings-page" aria-label="SSH 密钥" hidden></section>
-      <section id="transfers-page" class="settings-page" aria-labelledby="transfers-title" hidden>
-        <header class="page-toolbar settings-heading">
-          <div><h1 id="transfers-title" tabindex="-1">传输记录</h1><p class="host-total">保留最近 200 条上传和下载记录</p></div>
+      <section id="transfers-page" class="settings-page" aria-label="传输记录" hidden>
+        <header class="page-toolbar transfer-toolbar">
           <div class="toolbar-actions">
             <div id="transfer-filters" role="group" aria-label="筛选传输类型">
               <button type="button" data-direction="" aria-pressed="true">全部</button>

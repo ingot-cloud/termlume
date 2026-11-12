@@ -31,15 +31,23 @@ let selectedHostId = '';
 let hostMenu;
 let active;
 let splitLayout;
-let draggingTab;
+const splitGroups = new Map();
+let tabHoverTimer;
+let tabHoverKey;
 let splitGrip;
 let splitRowGrip;
+let resizeSplitLayout = () => {};
+let tabDrag;
+let tabDragFrame;
+let suppressTabClickUntil = 0;
+let cancelledTabPointer;
 let quickConnectFilters;
 let sessionFilters;
 const defaultTerminalFont = 'SFMono-Regular, Menlo, monospace';
 let uiPreferences={theme:"dark",terminalTheme:"dark",fontFamily:defaultTerminalFont,fontSize:14,recordCommands:false};
 const recordingSessions=new Set();
 const {retryDelay,automaticCredential,filterCommands,pathBreadcrumbs}=window.workspaceState;
+const layoutState = window.workspaceState;
 const forwardRuns = new Map();
 const forwardVersions = new Map();
 let forwardVersion = 0;
@@ -189,6 +197,7 @@ function chromeIcon(kind) {
   path.setAttribute('d', {
     key: 'M15.5 13.5a5 5 0 1 0-5-5 5 5 0 0 0 .5 2.2L4 17.7V21h3.3l1.5-1.5V17h2.5l2.5-2.5m3.6-7.2h.01',
     lock: 'M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3',
+    save: 'M5 3h12l4 4v14H3V3h2m2 0v7h10V3M7 21v-7h10v7',
     file: 'M6 3h8l4 4v14H6zM14 3v5h4m-9 5h6m-6 4h6',
     folder: 'M3 6h7l2 2h9v11H3z',
     group: 'M3 5h8v8H3zm10 6h8v8h-8zM15 5h6v3m-12 11H3v-3',
@@ -252,10 +261,11 @@ function openSettings(section = settingsSection, session = origin()) {
     identities: () => manageIdentities(page), snippets: () => manageSnippets(session, page),
     layouts: () => manageLayouts(page), logs: () => manageLogs(page), trust: () => manageTrust(page),
     security: async () => renderSecurityPage() }[section];
-  $('settings-page').replaceChildren(settingsHeading('设置', '正在读取设置…'));
+  $('settings-page').setAttribute('aria-label', '设置');
+  $('settings-page').replaceChildren(settingsStatus('正在读取设置…'));
   void render?.().catch(error => {
-    if (page.active) $('settings-page').replaceChildren(settingsHeading('设置', message(error)),
-      node('div', 'page-body', button('重新加载', () => openSettings(section, session), 'outlined')));
+    if (page.active) $('settings-page').replaceChildren(settingsStatus(message(error),
+      button('重新加载', () => openSettings(section, session), 'outlined')));
   });
 }
 
@@ -270,6 +280,7 @@ function promptSettings(page, title, fields, submit, onSubmit, extra, options) {
     const notice = node('p', 'muted'); notice.setAttribute('role', 'status');
     const content = node('div', 'settings-fields', ...fields, error, notice);
     const form = node('form', 'settings-form', content);
+    form.setAttribute('aria-label', title);
     let settled = false;
     const finish = result => {
       if (settled) return;
@@ -286,8 +297,12 @@ function promptSettings(page, title, fields, submit, onSubmit, extra, options) {
       if (options.back !== false) actions.append(back);
       actions.append(save);
       form.append(node('footer', 'settings-form-actions', actions));
+    } else if (actions.childElementCount) {
+      actions.classList.add('settings-inline-actions');
+      content.prepend(actions);
     }
-    $('settings-page').replaceChildren(settingsHeading(title, '设置', overview ? actions : undefined), form);
+    $('settings-page').setAttribute('aria-label', title);
+    $('settings-page').replaceChildren(form);
     if (!overview) (options.focus || form.querySelector('input, textarea, .dropdown-trigger'))?.focus({ preventScroll: true });
     form.addEventListener('submit', async event => {
       event.preventDefault();
@@ -328,6 +343,7 @@ function closePrompt(value = '') {
 }
 
 function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
+  cancelTabDrag();
   closeHostMenu();
   if (vaultStatus.locked) return Promise.reject(new Error('请先解锁 Termlume。'));
   if (options.settingsPage) return promptSettings(options.settingsPage, title, fields, submit, onSubmit, extra, options);
@@ -447,6 +463,7 @@ function applyVaultState(state) {
   $('vault-lock').hidden = !state.locked;
   $('library-button').disabled = Boolean(state.locked);
   if (state.locked) {
+    cancelTabDrag();
     for(const tab of tabs.values()){clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);tab.reconnectCancelled=true;}
     forwardRuns.clear(); forwardVersions.clear();recordingSessions.clear();
     historyReady = false;
@@ -756,8 +773,10 @@ async function finishGitOperation(result, request, submit, label, success) {
   }
 }
 
-function settingsHeading(title, subtitle, actions) {
-  return node('header', 'page-toolbar settings-heading', node('div', '', node('h1', '', title), node('p', 'muted', subtitle)), ...(actions ? [actions] : []));
+function settingsStatus(text, ...actions) {
+  const notice = node('p', 'muted', text);
+  notice.setAttribute('role', 'status');
+  return node('div', 'page-body settings-status', notice, ...actions);
 }
 
 const defaultGitSettings = { paused: false, onUnlock: false, afterChanges: false, intervalMinutes: 0 };
@@ -925,8 +944,8 @@ function renderSecurityPage() {
   if (settingsRun?.section !== 'security' || vaultStatus.locked) return;
   const page = $('settings-page');
   const { enabled, remote, branch, fileTransfers, gitMigration, lastSynced, startupUnlockRequired } = vaultStatus;
-  const title = settingsHeading('安全与同步', '管理主密码保护、应用锁、加密备份和 Git 同步。');
-  if (typeof enabled !== 'boolean') { page.replaceChildren(title); return; }
+  page.setAttribute('aria-label', '安全与同步');
+  if (typeof enabled !== 'boolean') { page.replaceChildren(settingsStatus('正在读取设置…')); return; }
   const previous = page.querySelector('.security-body');
   const scrollTop = previous?.scrollTop || 0;
   const focusId = previous?.contains(document.activeElement) ? document.activeElement.id : '';
@@ -1029,7 +1048,7 @@ function renderSecurityPage() {
         }, 'outlined'))));
     }
   }
-  page.replaceChildren(title, body);
+  page.replaceChildren(body);
   updateTouchIdSetting();
   updateGitSummary();
   body.scrollTop = scrollTop;
@@ -1178,11 +1197,10 @@ function keyBrowser() {
     finally { passphrase.value = ''; submit.disabled = !directoryReady; }
   });
   search.addEventListener('input', render);
-  const controls = node('div', 'key-toolbar', node('div', 'settings-switcher', localTab, agentTab), search);
+  const controls = node('div', 'key-toolbar', node('div', 'settings-switcher', localTab, agentTab), search, generate);
   const body = node('div', 'page-body', directories, generator, note, node('div', 'key-body', list, detail));
-  const heading = settingsHeading('SSH 密钥', '查找、生成和管理本机 SSH 密钥。', generate);
   controls.classList.add('page-toolbar');
-  browser.append(heading, controls, body);
+  browser.append(controls, body);
   setSource(false);
   // Scan after the page or dialog has attached the browser.
   queueMicrotask(() => { if (browser.isConnected) void scan(keyDirectory); });
@@ -1402,98 +1420,158 @@ async function commandHistory(session){const history=await api.history.list();le
   if(selected&&await confirm('再次执行',`原目标 ${selected.endpoint}\n当前目标 ${endpoint(session.host)}\n${selected.command}`,'执行')){const tab={id:sessionId(),kind:'command',sessionId:session.id,host:session.host,action:'custom',status:'connecting'};attachTerminal(tab);tabs.set(tab.id,tab);selectTab(tab);await api.commands.start({id:tab.id,sessionId:session.id,request:{action:'custom',argument:selected.command,lines:100}});}
 }
 
-function reorderTabs(moving,before) {
-  if(moving===before||!tabs.has(moving)||!tabs.has(before))return;
-  const entries=window.workspaceState.reorder([...tabs.keys()],moving,before).map(id=>[id,tabs.get(id)]);tabs.clear();for(const[id,tab]of entries)tabs.set(id,tab);$('tabs').append(...[...tabs.values()].map(t=>t.tabRow));renderTabs();
+function splitGroupFor(id) {
+  return id ? [...splitGroups.values()].find(group => group.panes.includes(id)) : undefined;
 }
+
+function workspaceEntries() {
+  return layoutState.workspaceTabs([...tabs.keys()], [...splitGroups.values()]).map(entry => ({
+    ...entry, group: splitGroups.get(entry.key), tab: tabs.get(entry.representativeId)
+  }));
+}
+
+function workspaceEntryFor(id) { return workspaceEntries().find(entry => entry.panes.includes(id)); }
+function workspaceFocus(entry) { return tabs.get(entry?.group?.focusId) || entry?.tab; }
+function workspaceTitle(entry) { return entry?.group ? entry.group.title || '工作区' : tabTitle(entry.tab); }
+
+function reorderWorkspaceSessions(moving, beforeKey, beforeId) {
+  const ordered = [...tabs.keys()], remaining = ordered.filter(id => !moving.includes(id));
+  const entries = layoutState.workspaceTabs(remaining, [...splitGroups.values()]);
+  const before = entries.find(entry => entry.key === beforeKey || entry.panes.includes(beforeId || beforeKey));
+  const index = before ? remaining.indexOf(before.representativeId) : remaining.length;
+  remaining.splice(index, 0, ...ordered.filter(id => moving.includes(id)));
+  const values = remaining.map(id => [id, tabs.get(id)]);
+  tabs.clear();
+  for (const [id, tab] of values) tabs.set(id, tab);
+  $('tabs').append(...[...tabs.values()].map(tab => tab.tabRow));
+  renderTabs();
+}
+
+function reorderTabs(moving, before) {
+  if (moving === before || !tabs.has(moving) || !tabs.has(before)) return;
+  const entry = workspaceEntryFor(moving), target = workspaceEntryFor(before);
+  if (entry.key !== target.key) reorderWorkspaceSessions(entry.panes, target.key);
+}
+
 async function editTab(tab) {
-  const title=input(tab.title||'');title.maxLength=80;title.placeholder=tabName(tab);
-  const move=delta=>{const ids=[...tabs.keys()];const index=ids.indexOf(tab.id);const target=ids[index+delta];if(target){if(delta<0)reorderTabs(tab.id,target);else reorderTabs(target,tab.id);}dialog.close();};
-  await prompt('标签名称与顺序',[field('自定义名称（留空恢复默认）',title)],'保存',()=>{tab.title=title.value.trim();renderTabs();renderSplitLayout();return true;},[button('左移',()=>move(-1),'outlined'),button('右移',()=>move(1),'outlined')]);
+  const entry = workspaceEntryFor(tab.id), group = entry?.group;
+  const title = input(group ? group.title || '' : tab.title || '');
+  title.maxLength = 80; title.placeholder = group ? '工作区' : tabName(tab);
+  const move = delta => {
+    const entries = workspaceEntries(), index = entries.findIndex(item => item.key === entry.key);
+    const target = entries[index + delta];
+    if (target) {
+      if (delta < 0) reorderWorkspaceSessions(entry.panes, target.key);
+      else reorderWorkspaceSessions(entry.panes, entries[index + 2]?.key);
+    }
+    dialog.close();
+  };
+  await prompt(group ? '工作区名称与顺序' : '标签名称与顺序', [field('自定义名称（留空恢复默认）', title)], '保存', () => {
+    if (group) group.title = title.value.trim(); else tab.title = title.value.trim();
+    renderTabs(); renderSplitLayout(); return true;
+  }, [button('左移', () => move(-1), 'outlined'), button('右移', () => move(1), 'outlined')]);
 }
+
+function splitFromTree(tree, previous = {}) {
+  const panes = layoutState.paneIds(tree);
+  return { ...previous, id: previous.id || sessionId(), tree, panes, direction: 'tree', focusId: panes.includes(previous.focusId) ? previous.focusId : panes[0] };
+}
+
+function replaceGroupTree(group, tree) {
+  const panes = layoutState.paneIds(tree);
+  if (panes.length < 2) splitGroups.delete(group.id);
+  else splitGroups.set(group.id, splitFromTree(tree, group));
+}
+
+function installSplitLayout(value, previous) {
+  const tree = layoutState.layoutTree(value), group = splitFromTree(tree, { ...previous, ...value, id: previous?.id || value.id });
+  for (const other of [...splitGroups.values()]) if (other.id !== group.id && other.panes.some(id => group.panes.includes(id))) {
+    replaceGroupTree(other, group.panes.reduce((result, id) => layoutState.removePane(result, id), other.tree));
+  }
+  if (group.panes.length >= 2) splitGroups.set(group.id, group);
+  return group.panes.length >= 2 ? group : undefined;
+}
+
+function syncPendingSplitLayout() {
+  if (splitLayout && (!splitLayout.id || splitGroups.get(splitLayout.id) !== splitLayout)) splitLayout = installSplitLayout(splitLayout);
+}
+
 function visibleSplitLayout() {
-  return splitLayout?.panes.includes(active?.id) &&
-    splitLayout.panes.every(id => tabs.get(id)?.kind === 'shell') ? splitLayout : undefined;
+  syncPendingSplitLayout();
+  splitLayout = splitGroupFor(active?.id);
+  return splitLayout;
 }
 
 function removeSplitPane(id) {
-  if (!splitLayout?.panes.includes(id)) return;
-  const panes = splitLayout.panes.filter(item => item !== id && tabs.has(item));
-  if (panes.length < 2) splitLayout = undefined;
-  else if (panes.length === 2 && splitLayout.direction === 'grid') {
-    splitLayout = { panes, direction: 'horizontal', ratio: 50 };
-  } else splitLayout = { ...splitLayout, panes };
-  return panes[0];
+  const group = splitGroupFor(id);
+  if (!group) return;
+  const tree = layoutState.removePane(group.tree, id), panes = layoutState.paneIds(tree);
+  replaceGroupTree(group, tree);
+  splitLayout = splitGroupFor(active?.id);
+  return panes.includes(group.focusId) ? group.focusId : panes[0];
 }
 
 function detachSplitPane(tab) {
-  const next = removeSplitPane(tab.id);
-  selectTab(tabs.get(next) || tab);
+  removeSplitPane(tab.id);
+  selectTab(tab);
 }
 
 function renderSplitLayout() {
   const container = $('terminal-views');
-  container.querySelector('.split-empty')?.remove();
-  splitGrip?.remove();
-  splitRowGrip?.remove();
+  container.querySelectorAll('.split-grip, .split-empty').forEach(item => item.remove());
   splitGrip = splitRowGrip = undefined;
   const layout = visibleSplitLayout();
-  container.dataset.split = layout?.direction || '';
+  container.dataset.split = layout ? 'tree' : '';
   container.style.gridTemplateColumns = container.style.gridTemplateRows = '';
+  resizeSplitLayout = () => {};
   for (const tab of tabs.values()) {
     if (!tab.view) continue;
-    const index = layout?.panes.indexOf(tab.id) ?? -1;
-    tab.view.hidden = layout ? index < 0 : tab !== active;
+    tab.view.hidden = layout ? !layout.panes.includes(tab.id) : tab !== active;
     tab.view.classList.toggle('split-focused', Boolean(layout && tab === active));
-    tab.view.style.gridColumn = tab.view.style.gridRow = tab.view.style.order = '';
+    if (layout?.panes.includes(tab.id)) tab.unread = false;
+    for (const property of ['gridColumn', 'gridRow', 'order', 'left', 'top', 'width', 'height', 'right', 'bottom']) tab.view.style[property] = '';
     if (tab.paneHeader) {
       tab.paneHeader.hidden = !layout;
       tab.paneLabel.textContent = tabTitle(tab);
       tab.paneLabel.title = tabTitle(tab);
     }
-    if (layout && index >= 0) {
-      if (layout.direction === 'grid') {
-        tab.view.style.gridColumn = String((index % 2) * 2 + 1);
-        tab.view.style.gridRow = String(Math.floor(index / 2) * 2 + 1);
-      } else {
-        tab.view.style[layout.direction === 'vertical' ? 'gridRow' : 'gridColumn'] = String(index * 2 + 1);
-      }
-    }
   }
   if (!layout) return;
-  const grid = layout.direction === 'grid';
-  const rows = layout.direction === 'vertical';
+  const grips = new Map();
+  const geometry = () => layoutState.treeRects(layout.tree, { x: 0, y: 0, width: container.clientWidth, height: container.clientHeight });
+  const place = (element, rect) => Object.assign(element.style, {
+    left: `${rect.x}px`, top: `${rect.y}px`, width: `${rect.width}px`, height: `${rect.height}px`, right: 'auto', bottom: 'auto'
+  });
   const resize = () => {
-    const columns = ratio => `minmax(0, ${ratio}fr) 9px minmax(0, ${100 - ratio}fr)`;
-    const rowTracks = ratio => `minmax(var(--pane-min-height), ${ratio}fr) 9px minmax(var(--pane-min-height), ${100 - ratio}fr)`;
-    if (rows) container.style.gridTemplateRows = rowTracks(layout.ratio);
-    else container.style.gridTemplateColumns = columns(layout.ratio);
-    if (grid) container.style.gridTemplateRows = rowTracks(layout.rowRatio ?? 50);
-    splitGrip?.setAttribute('aria-valuenow', String(Math.round(layout.ratio)));
-    splitRowGrip?.setAttribute('aria-valuenow', String(Math.round(layout.rowRatio ?? 50)));
-    for (const id of layout.panes) tabs.get(id)?.fit.fit();
+    if (splitLayout !== layout) return;
+    const rectangles = geometry();
+    for (const [id, rect] of rectangles.panes) place(tabs.get(id).view, rect);
+    for (const { node: item, grip } of rectangles.splits) {
+      place(grips.get(item), grip);
+      grips.get(item).setAttribute('aria-valuenow', String(Math.round(item.ratio)));
+    }
   };
-  const handle = (axis, property, label) => {
+  for (const { node: item } of geometry().splits) {
+    const column = item.axis === 'column';
     const grip = node('div', 'split-grip');
-    grip.dataset.axis = axis;
+    grips.set(item, grip);
+    grip.dataset.axis = item.axis;
     grip.tabIndex = 0;
     grip.setAttribute('role', 'separator');
-    grip.setAttribute('aria-label', label);
-    grip.setAttribute('aria-orientation', axis === 'row' ? 'horizontal' : 'vertical');
+    grip.setAttribute('aria-label', column ? '调整分屏宽度' : '调整分屏高度');
+    grip.setAttribute('aria-orientation', column ? 'vertical' : 'horizontal');
     grip.setAttribute('aria-valuemin', '20');
     grip.setAttribute('aria-valuemax', '80');
     grip.title = '拖动调整尺寸，双击恢复均分';
     const change = value => {
       if (splitLayout !== layout) return;
-      layout[property] = Math.max(20, Math.min(80, value));
+      item.ratio = Math.max(20, Math.min(80, value));
       resize();
     };
     grip.addEventListener('keydown', event => {
-      const backward = axis === 'row' ? 'ArrowUp' : 'ArrowLeft';
-      const forward = axis === 'row' ? 'ArrowDown' : 'ArrowRight';
-      if (event.key === backward || event.key === forward) {
+      if ([column ? 'ArrowLeft' : 'ArrowUp', column ? 'ArrowRight' : 'ArrowDown'].includes(event.key)) {
         event.preventDefault();
-        change((layout[property] ?? 50) + (event.key === backward ? -5 : 5));
+        change(item.ratio + (event.key === (column ? 'ArrowLeft' : 'ArrowUp') ? -5 : 5));
       }
     });
     grip.addEventListener('dblclick', () => change(50));
@@ -1501,14 +1579,13 @@ function renderSplitLayout() {
       if (event.button !== 0) return;
       event.preventDefault();
       grip.setPointerCapture(event.pointerId);
-      const bounds = container.getBoundingClientRect();
-      const start = axis === 'row' ? event.clientY : event.clientX;
-      const initial = layout[property] ?? 50;
-      const length = Math.max(1, (axis === 'row' ? bounds.height : bounds.width) - 9);
+      const { bounds } = geometry().splits.find(entry => entry.node === item);
+      const start = column ? event.clientX : event.clientY, initial = item.ratio;
+      const length = Math.max(1, (column ? bounds.width : bounds.height) - 9);
       const move = pointer => {
         if (pointer.pointerId !== event.pointerId) return;
         if (!(pointer.buttons & 1)) { end(); return; }
-        change(initial + 100 * ((axis === 'row' ? pointer.clientY : pointer.clientX) - start) / length);
+        change(initial + 100 * ((column ? pointer.clientX : pointer.clientY) - start) / length);
       };
       const end = pointer => {
         if (pointer?.pointerId !== undefined && pointer.pointerId !== event.pointerId) return;
@@ -1524,138 +1601,218 @@ function renderSplitLayout() {
       window.addEventListener('blur', end);
       grip.addEventListener('lostpointercapture', end);
     });
-    return grip;
-  };
-  splitGrip = handle(rows ? 'row' : 'column', 'ratio', rows ? '调整分屏高度' : '调整分屏宽度');
-  splitGrip.style[rows ? 'gridRow' : 'gridColumn'] = '2';
-  if (grid) splitGrip.style.gridRow = '1 / -1';
-  container.append(splitGrip);
-  if (grid) {
-    splitRowGrip = handle('row', 'rowRatio', '调整分屏行高');
-    splitRowGrip.style.gridRow = '2';
-    splitRowGrip.style.gridColumn = '1 / -1';
-    container.append(splitRowGrip);
-    if (layout.panes.length === 3) {
-      const add = button('＋ 添加会话', () => configureSplit(tabs.get(layout.panes[0])), 'split-empty');
-      add.style.gridColumn = add.style.gridRow = '3';
-      container.append(add);
-    }
+    container.append(grip);
+    if (column && !splitGrip) splitGrip = grip;
+    if (!column && !splitRowGrip) splitRowGrip = grip;
   }
+  resizeSplitLayout = resize;
   resize();
 }
 
-async function configureSplit(session) {
-  if (!tabs.has(session.id) || session.kind !== 'shell') return;
-  const current = splitLayout?.panes.includes(session.id) ? splitLayout : undefined;
-  const sessions = [...tabs.values()].filter(tab => tab.kind === 'shell');
-  let direction = current?.direction || 'horizontal';
-  let values = (current?.panes || [session.id]).map(id => `tab:${id}`);
-  const available = [...new Set([...(current?.panes || []), session.id, ...sessions.map(tab => tab.id)])];
-  const selectors = [];
-  const slots = node('div', 'split-slots');
-  const presets = node('div', 'split-presets');
-  presets.setAttribute('role', 'group');
-  presets.setAttribute('aria-label', '分屏布局');
-  const controls = new Map();
-  const renderSlots = () => {
-    const count = direction === 'grid' ? 4 : 2;
-    values = values.slice(0, count);
-    while (values.length < count) {
-      const unused = available.find(id => tabs.has(id) && !values.includes(`tab:${id}`));
-      values.push(unused ? `tab:${unused}` : `host:${session.host.id}`);
-    }
-    selectors.length = 0;
-    slots.replaceChildren();
-    slots.dataset.layout = direction;
-    const positions = direction === 'grid' ? ['左上', '右上', '左下', '右下']
-      : direction === 'vertical' ? ['上方', '下方'] : ['左侧', '右侧'];
-    const refreshChoices = () => {
-      const selected = selectors.map(select => select.value);
-      selectors.forEach((select, index) => {
-        for (const option of select.options) {
-          option.disabled = option.value.startsWith('tab:') &&
-            selected.some((value, other) => other !== index && value === option.value);
-        }
-      });
-    };
-    for (let index = 0; index < count; index++) {
-      const select = node('select');
-      const sources = hosts.some(host => host.id === session.host.id) ? hosts : [session.host, ...hosts];
-      const choice = (value, label, host, source, state) => {
-        const option = hostChoiceOption(host, value, label, state);
-        option.dataset.source = source;
-        select.append(option);
-      };
-      for (const tab of sessions) choice(`tab:${tab.id}`, `已有会话 · ${tabTitle(tab)}`,
-        tab.host, 'tab', sessionLabels[tab.status]);
-      for (const host of sources) choice(`host:${host.id}`, `新会话 · ${host.name}`, host, 'host');
-      select.value = values[index];
-      select.required = true;
-      select.addEventListener('change', () => {
-        values[index] = select.value;
-        refreshChoices();
-      });
-      selectors.push(select);
-      const detail = node('small', 'split-slot-detail');
-      const updateDetail = () => { detail.textContent = select.selectedOptions[0]?.dataset.description || ''; };
-      select.addEventListener('change', updateDetail);
-      updateDetail();
-      slots.append(node('section', 'split-slot', node('strong', '', positions[index]),
-        hostSelectControl(select, `${positions[index]}会话`, sources, {
-          showDescription: false,
-          sources: [['', '全部'], ['tab', '已有会话'], ['host', '新建会话']],
-          hint: '已放入其他位置的会话不可重复选择' }), detail));
-    }
-    refreshChoices();
-    for (const [value, control] of controls) control.setAttribute('aria-pressed', String(direction === value));
-  };
-  for (const [value, label, count] of [['horizontal', '左右分屏', 2], ['vertical', '上下分屏', 2], ['grid', '四宫格', 4]]) {
-    const preview = node('span', `split-preview ${value}`, ...Array.from({ length: count }, () => node('span')));
-    preview.setAttribute('aria-hidden', 'true');
-    const control = button('', () => { direction = value; renderSlots(); }, 'split-preset', label);
-    control.append(preview, node('span', '', label));
-    controls.set(value, control);
-    presets.append(control);
-  }
-  renderSlots();
-  let reset = false;
-  const created = [];
-  const result = await prompt('安排分屏', [
-    node('p', 'muted', '先选排列，再为每个位置选择会话。支持搜索名称、地址、分组和标签，新会话需点击「连接」。'),
-    presets, slots, node('small', 'muted', '分隔条可拖动调尺寸，双击恢复均分。')
-  ], '应用分屏', async () => {
-    const ids = [];
-    try {
-      for (const value of values) {
-        if (vaultStatus.locked) throw new Error('请先解锁 Termlume。');
-        const id = value.slice(value.indexOf(':') + 1);
-        if (value.startsWith('tab:')) {
-          if (tabs.get(id)?.kind !== 'shell') throw new Error('所选会话已关闭，请重新选择。');
-          if (ids.includes(id)) throw new Error('同一个会话只能放在一个分屏中。');
-          ids.push(id);
-        } else {
-          const host = hosts.find(item => item.id === id) || (session.host.id === id ? session.host : undefined);
-          if (!host) throw new Error('所选主机已删除，请重新选择。');
-          const tab = await openHost(host, { force: true, connectNow: false });
-          created.push(tab);
-          ids.push(tab.id);
-        }
-      }
-      return { panes: ids, direction, ratio: current?.direction === direction ? current.ratio : 50,
-        ...(direction === 'grid' ? { rowRatio: current?.rowRatio ?? 50 } : {}) };
-    } catch (error) {
-      for (const tab of created.splice(0)) removeTab(tab);
-      throw error;
-    }
-  }, current ? [button('拆回标签', () => { reset = true; dialog.close(); }, 'outlined')] : [], { split: true });
-  if (reset) { splitLayout = undefined; if (tabs.has(session.id)) selectTab(session); return; }
-  if (!result || vaultStatus.locked) return;
-  if (!result.panes.every(id => tabs.has(id))) return;
-  splitLayout = result;
-  selectTab(tabs.get(result.panes.includes(session.id) ? session.id : result.panes[0]));
+const tabDropPreview = node('div', 'tab-drop-preview');
+const tabDragGhost = node('div', 'tab-drag-ghost', chromeIcon('terminal'), node('span', 'text-ellipsis'));
+const tabInsertMarker = node('div', 'tab-insert-marker');
+const tabDropPlaceholder = node('div', 'tab-drop-placeholder', chromeIcon('terminal'), node('span', 'text-ellipsis'));
+tabDropPlaceholder.setAttribute('role', 'status');
+tabDropPlaceholder.setAttribute('aria-live', 'polite');
+for (const element of [tabDropPreview, tabDragGhost, tabInsertMarker]) { element.hidden = true; document.body.append(element); }
+tabDropPreview.setAttribute('role', 'status');
+tabDropPreview.setAttribute('aria-live', 'polite');
+tabDragGhost.setAttribute('aria-hidden', 'true');
+new ResizeObserver(() => { resizeSplitLayout(); if (tabDrag?.started) updateTabDrag(); }).observe($('terminal-views'));
+
+function dragBlocked() {
+  return vaultStatus.locked || dialog.open || fileEditor.open || $('key-dialog').open || $('session-switcher').open || workspace.inert;
 }
 
+function clearTabHover() {
+  clearTimeout(tabHoverTimer); tabHoverTimer = undefined; tabHoverKey = undefined;
+}
+
+function cancelTabDrag() {
+  if (tabDrag?.started) {
+    suppressTabClickUntil = performance.now() + 250;
+    cancelledTabPointer = tabDrag.pointerId;
+  }
+  const previous = tabDrag;
+  tabDrag = undefined;
+  cancelAnimationFrame(tabDragFrame); tabDragFrame = undefined;
+  clearTabHover();
+  document.body.classList.remove('tab-drag-active');
+  previous?.source.classList.remove('tab-dragging');
+  if (previous?.kind === 'pane') tabs.get(previous.id)?.view.classList.remove('drag-source-pane');
+  if (previous && document.body.hasPointerCapture(previous.pointerId)) document.body.releasePointerCapture(previous.pointerId);
+  for (const element of [tabDropPreview, tabDragGhost, tabInsertMarker]) element.hidden = true;
+  tabDropPlaceholder.remove();
+}
+
+function tabDropAt(x, y, drag) {
+  const hit = document.elementFromPoint(x, y);
+  const bar = document.querySelector('.titlebar').getBoundingClientRect();
+  if (x >= bar.left && x <= bar.right && y >= bar.top && y <= bar.bottom) {
+    if (hit?.closest('.tab-drop-placeholder') && drag.barDrop) return drag.barDrop;
+    const strip = $('tabs');
+    const entries = workspaceEntries().filter(entry => drag.kind === 'pane' || entry.key !== drag.workspaceKey);
+    const before = entries.find(entry => x < entry.tab.tabRow.getBoundingClientRect().left + entry.tab.tabRow.getBoundingClientRect().width / 2);
+    const rect = before?.tab.tabRow.getBoundingClientRect() || entries.at(-1)?.tab.tabRow.getBoundingClientRect() || strip.getBoundingClientRect();
+    const hoveredId = hit?.closest('.tab')?.dataset.tabId;
+    const hover = workspaceEntryFor(hoveredId);
+    return { type: drag.kind === 'pane' && splitGroupFor(drag.id) ? 'detach' : 'reorder',
+      before: before?.key, beforeId: before?.panes.find(id => !drag.panes.includes(id)), hover,
+      x: before ? rect.left : rect.right, y: rect.top, height: rect.height };
+  }
+  const source = tabs.get(drag.id), view = hit?.closest('.terminal-view');
+  const target = [...tabs.values()].find(tab => tab.view === view);
+  if (source?.kind !== 'shell' || !target || target.kind !== 'shell' || drag.panes.includes(target.id) || target.view.hidden ||
+      drag.panes.some(id => !tabs.has(id) || tabs.get(id).closing) || target.closing) return;
+  const bounds = view.getBoundingClientRect();
+  const edge = layoutState.dropEdge({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }, x, y);
+  if (!edge) return;
+  const group = splitGroupFor(target.id), tree = group?.tree || layoutState.pane(target.id);
+  const candidate = layoutState.moveTree(tree, drag.tree, target.id, edge);
+  const root = $('terminal-views').getBoundingClientRect(), minimum = layoutState.minimumSize(candidate);
+  if (candidate === tree) return;
+  const reason = minimum.width > root.width || minimum.height > root.height ? '空间不足，请放大窗口或调整分屏' : '';
+  // Anchor feedback to the pane currently under the pointer. Removing a source
+  // from this same tree may collapse ancestors, but must not move the preview.
+  const rect = reason ? bounds : layoutState.dropPreviewRect(bounds, edge);
+  return { type: 'split', tree: candidate, group, target: target.id, edge, rect, reason };
+}
+
+function updateTabHover(drop) {
+  const entry = drop?.hover;
+  if (!entry || entry.key === tabDrag?.workspaceKey || entry.panes.includes(active?.id)) { clearTabHover(); return; }
+  if (tabHoverKey === entry.key) return;
+  clearTabHover(); tabHoverKey = entry.key;
+  const gesture = tabDrag;
+  tabHoverTimer = setTimeout(() => {
+    if (tabDrag !== gesture || !tabDrag?.started || !tabs.has(entry.representativeId)) return;
+    selectTab(workspaceFocus(entry), undefined, { keepDrag: true });
+    updateTabDrag();
+  }, 400);
+}
+
+function updateTabDrag() {
+  if (!tabDrag?.started) return;
+  if (dragBlocked() || tabDrag.panes.some(id => !tabs.has(id))) { cancelTabDrag(); return; }
+  const { x, y } = tabDrag, drop = tabDropAt(x, y, tabDrag);
+  updateTabHover(drop);
+  tabDragGhost.hidden = false;
+  tabDropPreview.hidden = drop?.type !== 'split';
+  const overBar = ['reorder', 'detach'].includes(drop?.type);
+  tabDragGhost.classList.toggle('in-tab-bar', overBar);
+  tabInsertMarker.hidden = !overBar || drop.type === 'detach';
+  if (drop?.type === 'detach') {
+    tabDrag.barDrop = drop;
+    tabDropPlaceholder.lastChild.textContent = tabDrag.title;
+    tabDropPlaceholder.setAttribute('aria-label', `松手恢复为独立标签：${tabDrag.title}`);
+    const before = workspaceEntries().find(entry => entry.key === drop.before)?.tab.tabRow;
+    const strip = $('tabs');
+    if (tabDropPlaceholder.parentNode !== strip || tabDropPlaceholder.nextElementSibling !== (before || null)) strip.insertBefore(tabDropPlaceholder, before || null);
+  } else { tabDropPlaceholder.remove(); tabDrag.barDrop = undefined; }
+  const bar = document.querySelector('.titlebar').getBoundingClientRect();
+  tabDragGhost.style.left = `${Math.max(0, Math.min(innerWidth - tabDragGhost.offsetWidth, overBar ? x - 32 : x + 12))}px`;
+  tabDragGhost.style.top = `${overBar ? bar.top + (bar.height - 30) / 2 : Math.max(0, Math.min(innerHeight - 36, y + 14))}px`;
+  if (drop?.type === 'split') {
+    const rect = drop.rect;
+    Object.assign(tabDropPreview.style, { left: `${rect.x + 5}px`, top: `${rect.y + 5}px`, width: `${Math.max(0, rect.width - 10)}px`, height: `${Math.max(0, rect.height - 10)}px` });
+    const label = drop.reason || `松手放到${({ left: '左侧', right: '右侧', top: '上方', bottom: '下方' })[drop.edge]}`;
+    tabDropPreview.setAttribute('aria-label', label);
+    if (tabDropPreview.textContent !== (drop.reason || '')) tabDropPreview.textContent = drop.reason || '';
+    tabDropPreview.dataset.disabled = String(Boolean(drop.reason));
+  } else if (['reorder', 'detach'].includes(drop?.type)) {
+    Object.assign(tabInsertMarker.style, { left: `${drop.x}px`, top: `${drop.y}px`, height: `${drop.height}px` });
+  }
+}
+
+function scrollDraggedTabs() {
+  tabDragFrame = undefined;
+  if (!tabDrag?.started) return;
+  const strip = $('tabs'), rect = strip.getBoundingClientRect();
+  if (tabDrag.y >= rect.top && tabDrag.y <= rect.bottom && tabDrag.x >= rect.left && tabDrag.x <= rect.right) {
+    const step = tabDrag.x < rect.left + 30 ? -8 : tabDrag.x > rect.right - 30 ? 8 : 0;
+    if (step) { strip.scrollLeft += step; updateTabEdges(); updateTabDrag(); }
+  }
+  tabDragFrame = requestAnimationFrame(scrollDraggedTabs);
+}
+
+function wireTabDrag(row, tab, options = {}) {
+  row.dataset.tabId = tab.id;
+  if (options.pane) row.dataset.dragPaneId = tab.id;
+  row.draggable = false;
+  row.addEventListener('mousedown', event => {
+    if (options.pane && event.target.closest('button')) return;
+    event.preventDefault(); event.stopPropagation();
+  });
+  row.addEventListener('dragstart', event => event.preventDefault());
+  row.addEventListener('click', event => {
+    if (performance.now() < suppressTabClickUntil) { event.preventDefault(); event.stopImmediatePropagation(); }
+  }, true);
+  row.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || dragBlocked()) return;
+    cancelTabDrag(); cancelledTabPointer = undefined; suppressTabClickUntil = 0;
+    if (event.target.closest(options.pane ? 'button' : '.tab-close')) return;
+    const entry = workspaceEntryFor(tab.id), group = entry?.group;
+    const tree = !options.pane && group ? group.tree : layoutState.pane(tab.id);
+    tabDrag = { id: !options.pane && group ? workspaceFocus(entry).id : tab.id, kind: options.pane ? 'pane' : group ? 'group' : 'tab',
+      tree, panes: layoutState.paneIds(tree), workspaceKey: entry?.key, title: options.pane ? tabTitle(tab) : workspaceTitle(entry),
+      pointerId: event.pointerId, source: row, startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY };
+  });
+}
+
+function moveTabDrag(event) {
+  if (!tabDrag || (event.pointerId !== undefined && event.pointerId !== tabDrag.pointerId)) return;
+  if (dragBlocked()) { cancelTabDrag(); return; }
+  tabDrag.x = event.clientX; tabDrag.y = event.clientY;
+  if (!tabDrag.started) {
+    if (Math.hypot(event.clientX - tabDrag.startX, event.clientY - tabDrag.startY) < 6) return;
+    tabDrag.started = true;
+    tabDrag.source.classList.add('tab-dragging');
+    document.body.classList.add('tab-drag-active');
+    window.getSelection()?.removeAllRanges();
+    tabDragGhost.lastChild.textContent = tabDrag.title;
+    if (tabDrag.kind === 'pane') tabs.get(tabDrag.id).view.classList.add('drag-source-pane');
+    tabDragFrame = requestAnimationFrame(scrollDraggedTabs);
+  }
+  // WKWebView can omit button masks and pointerup; explicit down/up own the gesture.
+  try { if (!document.body.hasPointerCapture(tabDrag.pointerId)) document.body.setPointerCapture(tabDrag.pointerId); } catch { /* Optional capture. */ }
+  event.preventDefault(); event.stopImmediatePropagation(); updateTabDrag();
+}
+window.addEventListener('pointermove', moveTabDrag, true);
+window.addEventListener('mousemove', moveTabDrag, true);
+function finishTabDrag(event) {
+  if (event.type === 'mouseup' && event.button !== 0) return;
+  const pointerId = event.pointerId ?? tabDrag?.pointerId ?? cancelledTabPointer;
+  if (pointerId !== undefined && cancelledTabPointer === pointerId) { suppressTabClickUntil = performance.now() + 250; cancelledTabPointer = undefined; }
+  if (!tabDrag || pointerId !== tabDrag.pointerId) return;
+  if (tabDrag.started) { event.preventDefault(); event.stopPropagation(); }
+  const moving = tabDrag.id, payload = tabDrag;
+  const drop = tabDrag.started && !dragBlocked() ? tabDropAt(event.clientX, event.clientY, tabDrag) : undefined;
+  cancelTabDrag(); cancelledTabPointer = undefined;
+  if (drop?.type === 'detach') {
+    removeSplitPane(moving);
+    reorderWorkspaceSessions([moving], drop.before, drop.beforeId);
+    selectTab(tabs.get(moving));
+  } else if (drop?.type === 'reorder') {
+    reorderWorkspaceSessions(payload.panes, drop.before, drop.beforeId);
+  } else if (drop?.type === 'split' && !drop.reason) {
+    splitLayout = installSplitLayout(splitFromTree(drop.tree, drop.group));
+    selectTab(tabs.get(moving));
+  }
+}
+window.addEventListener('pointerup', finishTabDrag, true);
+window.addEventListener('mouseup', finishTabDrag, true);
+window.addEventListener('pointercancel', cancelTabDrag);
+window.addEventListener('blur', cancelTabDrag);
+window.addEventListener('resize', cancelTabDrag);
+window.addEventListener('keydown', event => {
+  if (!tabDrag) return;
+  if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); cancelTabDrag(); }
+  else if (tabDrag.started) { event.preventDefault(); event.stopImmediatePropagation(); }
+}, true);
+
 function sessionLayoutSummary(layout) {
+  if (layout.split?.version === 2) return `${layout.tabs.length} 个会话 · 自定义分屏`;
   const split = layout.split.length >= 2;
   if (layout.direction === 'grid' && split) {
     return `${layout.tabs.length} 个会话 · 四宫格 · 列宽 ${layout.ratio}% / ${100 - layout.ratio}% · 行高 ${layout.rowRatio ?? 50}% / ${100 - (layout.rowRatio ?? 50)}%`;
@@ -1665,20 +1822,18 @@ function sessionLayoutSummary(layout) {
 
 async function saveSessionLayout() {
   const visible = visibleSplitLayout();
-  const session = origin();
-  const sessions = visible ? visible.panes.map(id => tabs.get(id)) : session?.kind === 'shell' ? [session] : [];
-  if (!sessions.length) throw new Error('请先打开需要保存的主机会话。');
+  if (!visible) throw new Error('请先拖拽会话形成分屏工作区，再保存布局。');
+  const sessions = visible.panes.map(id => tabs.get(id));
   const layout = {
     tabs: sessions.map(tab => ({ hostId: tab.host.id, title: tab.title || '' })),
-    split: visible ? sessions.map((_, index) => index) : [],
-    direction: visible?.direction || 'horizontal',
-    ratio: Math.round(visible?.ratio || 50),
-    ...(visible?.direction === 'grid' ? { rowRatio: Math.round(visible.rowRatio ?? 50) } : {})
+    split: { version: 2, root: layoutState.serializeTree(visible.tree, sessions.map(tab => tab.id)) },
+    direction: 'tree',
+    ratio: 50
   };
   const name = input('');
   name.required = true;
   name.maxLength = 120;
-  name.placeholder = layout.split.length ? '例如：应用与数据库' : '例如：日常运维';
+  name.placeholder = '例如：应用与数据库';
   const saved = await prompt('保存会话布局', [
     node('p', 'muted', '保存当前分屏中的会话、排列和尺寸。以后可按 ⌘K 搜索布局名称直接打开。'),
     field('布局名称', name),
@@ -1705,17 +1860,16 @@ async function openSessionLayout(saved) {
     const targets = layout.tabs.map(tab => hosts.find(host => host.id === tab.hostId));
     const missing = targets.filter(host => !host).length;
     if (missing) throw new Error(`此会话布局中的 ${missing} 个主机已删除，请重新保存布局。`);
+    layoutState.layoutTree(layout, layout.tabs.map((_, index) => String(index)));
     for (let index = 0; index < layout.tabs.length; index++) {
       if (vaultStatus.locked) throw new Error('请先解锁 Termlume 后再打开会话布局。');
       const tab = await openHost(targets[index], { force: true, connectNow: false });
       created.push(tab);
       tab.title = layout.tabs[index].title;
     }
-    splitLayout = layout.split.length >= 2 ? {
-      panes: layout.split.map(index => created[index].id), direction: layout.direction, ratio: layout.ratio,
-      ...(layout.direction === 'grid' ? { rowRatio: layout.rowRatio ?? 50 } : {})
-    } : undefined;
-    selectTab(created[layout.split[0] ?? 0]);
+    const tree = layoutState.layoutTree(layout, created.map(tab => tab.id));
+    splitLayout = (layout.split?.version === 2 || layout.split.length >= 2) ? installSplitLayout(splitFromTree(tree)) : undefined;
+    selectTab(tabs.get(splitLayout?.panes[0]) || created[0]);
     status(`已打开会话布局「${layout.name}」，点击各标签的「连接」即可开始。`);
   } catch (error) {
     for (const tab of created) removeTab(tab);
@@ -1742,8 +1896,8 @@ async function manageLayouts(page) {
         button('重命名', () => { choice = { rename: layout }; close(); }, 'outlined'),
         button('删除', () => { choice = { remove: layout }; close(); }, 'outlined danger'))));
     await ask('会话布局', [
-      node('p', 'muted', '管理已保存的会话和分屏排列。在终端工具栏点「保存布局」创建，按 ⌘K 搜索布局名称打开。'),
-      ...(rows.length ? rows : [node('p', 'muted', '还没有会话布局。先在终端安排好分屏，再点「保存布局」。')])
+      node('p', 'muted', '管理已保存的会话和分屏排列。在分屏工作区的标签上点「保存布局」图标创建，按 ⌘K 搜索布局名称打开。'),
+      ...(rows.length ? rows : [node('p', 'muted', '还没有会话布局。先拖拽会话形成分屏，再点工作区标签上的「保存布局」图标。')])
     ], '关闭', () => true);
     if (!choice) break;
     if (choice.remove) {
@@ -2474,7 +2628,7 @@ function attachTerminal(tab) {
   terminal.open(surface);
   const paths = terminalPaths.observe(terminal, (path, text, mayProbe) => {
     void openLinkedTerminalPath(tab, path, text, mayProbe).catch((error) => status(message(error)));
-  }, () => { if (active === tab) renderTerminalDirectory(); }, () => tab.kind === 'shell' && tab.status === 'ready');
+  }, () => {}, () => tab.kind === 'shell' && tab.status === 'ready');
   view.addEventListener('contextmenu', (event) => {
     const selected = terminal.getSelection().trim();
     if (!selected || selected.includes('\n') || !readySession(origin(tab))) return;
@@ -2502,7 +2656,7 @@ function attachTerminal(tab) {
     } catch (error) { status(message(error)); }
   }, true);
   view.addEventListener('pointerdown', event => {
-    if (!event.target.closest('.split-pane-header button') && active !== tab && splitLayout?.panes.includes(tab.id)) selectTab(tab);
+    if (!event.target.closest('.split-pane-header') && active !== tab && splitLayout?.panes.includes(tab.id)) selectTab(tab);
   });
   const resizeObserver = new ResizeObserver(() => { if (surface.clientHeight) fit.fit(); });
   resizeObserver.observe(surface);
@@ -2510,9 +2664,11 @@ function attachTerminal(tab) {
   Object.assign(tab, { view, surface, terminal, fit, search, paths });
   if (tab.kind === 'shell') {
     tab.paneLabel = summaryText('span', tabTitle(tab));
+    tab.paneLabel.classList.add('split-pane-title');
     tab.paneHeader = node('div', 'split-pane-header', tab.paneLabel,
-      button('分屏设置', () => configureSplit(tab), '', `调整 ${tab.host.name} 所在分屏`),
       button('×', () => detachSplitPane(tab), '', `将 ${tab.host.name} 移出分屏`));
+    wireTabDrag(tab.paneHeader, tab, { pane: true });
+    tab.paneHeader.addEventListener('click', event => { if (!event.target.closest('button')) selectTab(tab); });
     tab.paneHeader.hidden = true;
     view.append(tab.paneHeader);
   }
@@ -2531,12 +2687,16 @@ function syncTerminalSize(tab) {
   }
 }
 
-function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session' : 'hosts') {
+function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session' : 'hosts', options = {}) {
+  if (!options.keepDrag) cancelTabDrag();
+  syncPendingSplitLayout();
   closeDropdown();
   closeHostMenu();
   if (view === 'settings' && !settingsRun) { openSettings(); return; }
   if (view !== 'settings') leaveSettings();
   active = tab;
+  splitLayout = splitGroupFor(tab?.id);
+  if (splitLayout) splitLayout.focusId = tab.id;
   if (!tab && view !== 'new-tab') libraryView = view;
   $('workspace-tools').hidden = view !== 'settings';
   if (tab) tab.unread = false;
@@ -2588,7 +2748,7 @@ function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session'
     if (!vaultStatus.locked) $('quick-connect-search').focus({ preventScroll: true });
   } else if (tab) {
     requestAnimationFrame(() => {
-      if (active !== tab) return;
+      if (active !== tab || tabDrag?.started) return;
       tab.fit.fit();
       focusTerminal(tab);
     });
@@ -2610,7 +2770,7 @@ function updateTabEdges() {
 
 function revealActiveTab(behavior = 'auto') {
   const strip = $('tabs');
-  const row = active?.tabRow;
+  const row = workspaceEntryFor(active?.id)?.tab.tabRow;
   if (row) {
     const viewport = strip.getBoundingClientRect();
     const bounds = row.getBoundingClientRect();
@@ -2639,44 +2799,47 @@ function tabIcon(tab) {
 }
 
 function renderTabs() {
-  const strip = $('tabs');
+  const strip = $('tabs'), entries = workspaceEntries();
+  const membership = new Map(entries.flatMap(entry => entry.panes.map(id => [id, entry])));
   for (const tab of tabs.values()) {
     if (tab.tabRow?.dataset.kind !== tab.kind) {
-      const title = tabTitle(tab);
-      const open = button('', () => selectTab(tab), 'tab-open', title);
-      open.replaceChildren(node('span', 'tab-status'), summaryText('span', tabName(tab)), node('span', 'tab-unread', '新'),
-        ...(tab.number > 1 ? [node('span', 'tab-number', String(tab.number))] : []));
-      const close = button('×', () => closeTab(tab), 'tab-close', `关闭 ${title}`);
-      const icon = tabIcon(tab);
-      const leading = tab.kind === 'new' ? node('span', 'tab-leading', icon, close) : close;
+      const open = button('', () => selectTab(workspaceFocus(workspaceEntryFor(tab.id))), 'tab-open');
+      open.replaceChildren(node('span', 'tab-status'), summaryText('span', tabName(tab)), node('span', 'tab-unread', '新'), node('span', 'tab-number'));
+      const close = button('×', () => closeWorkspaceTab(tab), 'tab-close');
+      const icon = tabIcon(tab), leading = tab.kind === 'new' ? node('span', 'tab-leading', icon, close) : close;
       if (tab.kind !== 'new') open.append(icon);
       const row = node('div', 'tab', leading, open);
       row.dataset.kind = tab.kind;
-      row.draggable=true;
-      row.addEventListener('dragstart',(event)=>{draggingTab=tab.id;event.dataTransfer.setData('application/x-termlume-tab',tab.id);});
-      row.addEventListener('dragover',(event)=>{if(draggingTab&&tabs.has(draggingTab))event.preventDefault();});
-      row.addEventListener('drop',(event)=>{event.preventDefault();if(draggingTab)reorderTabs(draggingTab,tab.id);draggingTab=undefined;});
-      row.addEventListener('dragend',()=>{draggingTab=undefined;});
-      row.addEventListener('contextmenu',(event)=>{event.preventDefault();void editTab(tab);});
-      if (tab.tabRow) tab.tabRow.replaceWith(row);
-      else strip.append(row);
+      wireTabDrag(row, tab);
+      row.addEventListener('contextmenu', event => { event.preventDefault(); void editTab(tab); });
+      if (tab.tabRow) tab.tabRow.replaceWith(row); else strip.append(row);
       tab.tabRow = row;
     }
-    tab.tabRow.dataset.active = String(tab === active);
-    tab.tabRow.querySelector('.tab-close').setAttribute('aria-label',`关闭 ${tabTitle(tab)}`);
+    const entry = membership.get(tab.id), group = entry.group;
+    const current = entry.panes.includes(active?.id), focused = workspaceFocus(entry);
+    const title = workspaceTitle(entry), members = entry.panes.map(id => tabs.get(id));
+    const unread = members.some(item => item.unread);
+    tab.tabRow.hidden = entry.representativeId !== tab.id;
+    tab.tabRow.dataset.workspaceId = entry.key;
+    tab.tabRow.dataset.active = String(current);
+    tab.tabRow.dataset.grouped = String(Boolean(group));
+    tab.tabRow.querySelector('.tab-close').setAttribute('aria-label', group ? `关闭${title}（${members.length} 个会话）` : `关闭 ${title}`);
     const open = tab.tabRow.querySelector('.tab-open');
-    open.querySelector('.text-ellipsis').textContent=tab.title||tabName(tab);
-    const state = tab.kind === 'new' ? '选择主机' : sessionLabels[tab.status] || '等待连接';
-    open.setAttribute('aria-pressed', String(tab === active));
-    open.setAttribute('aria-label', `${tabTitle(tab)} · ${state}${tab.unread ? ' · 有未读输出' : ''}`);
+    open.querySelector('.text-ellipsis').textContent = group ? title : tab.title || tabName(tab);
+    const state = tab.kind === 'new' ? '选择主机' : sessionLabels[focused.status] || '等待连接';
+    const description = group ? `${title} · ${members.length} 个分屏 · ${members.map(item => tabTitle(item)).join('、')}` : title;
+    open.setAttribute('aria-pressed', String(current));
+    open.setAttribute('aria-label', `${description} · ${state}${unread ? ' · 有未读输出' : ''}`);
     open.title = open.getAttribute('aria-label');
-    tab.tabRow.dataset.status = tab.status || '';
+    const number = open.querySelector('.tab-number');
+    number.hidden = !group && !(tab.number > 1);
+    number.textContent = group ? String(members.length) : String(tab.number || '');
+    tab.tabRow.dataset.status = focused.status || '';
     const indicator = open.querySelector('.tab-status');
-    indicator.hidden = tab.kind === 'new';
-    indicator.title = state;
-    open.querySelector('.tab-unread').hidden = !tab.unread;
+    indicator.hidden = tab.kind === 'new'; indicator.title = state;
+    open.querySelector('.tab-unread').hidden = !unread;
   }
-  $('switch-tabs').hidden = tabs.size < 2;
+  $('switch-tabs').hidden = entries.length < 2;
   updateTabEdges();
   if (sessionFilters && $('session-switcher').open) renderSessionSwitcher();
 }
@@ -2961,13 +3124,6 @@ function renderConnectionPage(tab) {
       actions.append(button('编辑主机认证', () => editHost(hosts.find(host => host.id === tab.host.id) || tab.host), 'outlined'));
     }
   }
-  if (tab.kind === 'shell' && ['idle', 'closed'].includes(tab.status)) {
-    actions.append(button('分屏', () => configureSplit(tab), 'outlined'));
-    if (api.layouts) actions.append(button('保存布局', () => {
-      selectTab(tab);
-      return saveSessionLayout();
-    }, 'outlined'));
-  }
   actions.append(button(tab.status === 'connecting' ? '取消连接' : '关闭', () => closeTab(tab), 'outlined'));
   body.append(actions, logs);
   page.replaceChildren(body);
@@ -2981,8 +3137,9 @@ function addConnectionLog(tab, detail) {
 function renderContext() {
   const tab = active;
   const session = origin(tab);
-  $('toolbar').hidden = !tab?.terminal || Boolean(tab.connectionPage && !tab.connectionPage.hidden);
-  renderTerminalDirectory();
+  const split = tab?.kind === 'shell' && visibleSplitLayout();
+  $('toolbar').hidden = !tab?.terminal || Boolean(tab.connectionPage && !tab.connectionPage.hidden && !split);
+  $('save-layout').hidden = !api.layouts || !split;
   $('session-notice').hidden = true;
   if ($('toolbar').hidden) return;
   const labels = { idle: '等待连接', connecting: '连接中', trust: '核对主机指纹', ready: '已连接', closed: '已断开', running: '运行中', done: '已完成', stopped: '已停止', failed: '失败' };
@@ -2998,6 +3155,7 @@ function renderContext() {
     if (output) controls.append(button('查看输出', () => selectTab(output), 'outlined', `查看输出 · ${actionLabels[output.action]}`));
   }
   const moreActions = [];
+  if (readySession(session)) moreActions.push(button('打开远端路径', () => chooseTerminalPath()));
   let runningForwards = 0;
   if (api.forwards && session) {
     const running = [...forwardRuns.values()].filter((job) => job.sessionId === session.id && ['running', 'stopping'].includes(job.status)).length;
@@ -3006,10 +3164,6 @@ function renderContext() {
   }
   if(api.logs&&session?.status==='ready') moreActions.push(button(recordingSessions.has(session.id)?'停止录制':'记录输出',()=>toggleRecording(session)));
   if(api.history&&session) moreActions.push(button('历史',()=>commandHistory(session)));
-  if (session?.kind === 'shell') {
-    controls.append(button(splitLayout?.panes.includes(session.id) ? '分屏设置' : '分屏', () => configureSplit(session)));
-    if (api.layouts) controls.append(button('保存布局', saveSessionLayout, 'outlined', '保存当前会话布局'));
-  }
   if (api.layouts) moreActions.push(button('管理会话布局', () => manageLayouts()));
   const shortcuts = button('快捷命令', () => openPalette('commands'));
   shortcuts.disabled = session?.status !== 'ready';
@@ -3131,7 +3285,16 @@ async function openHost(host, { force = false, draftTab, connectNow = true } = {
   return tab;
 }
 
-async function closeTab(tab) {
+async function closeWorkspaceTab(tab) {
+  const entry = workspaceEntryFor(tab.id);
+  if (!entry?.group) { await closeTab(tab); return; }
+  const ongoing = [...jobs.values()].filter(job => entry.panes.includes(job.sessionId) && ['queued', 'running', 'committing'].includes(job.status));
+  if (ongoing.some(job => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭工作区。'); return; }
+  if (ongoing.length && !await confirm('关闭分屏工作区', `关闭 ${entry.panes.length} 个会话，并取消正在传输的 ${ongoing.length} 项任务？`, '取消任务并关闭')) return;
+  for (const id of [...entry.panes]) if (tabs.has(id)) await closeTab(tabs.get(id), { confirmed: true });
+}
+
+async function closeTab(tab, options = {}) {
   if (tab.closing || !tabs.has(tab.id)) return;
   tab.closing = true;
   clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);
@@ -3139,7 +3302,7 @@ async function closeTab(tab) {
     if (tab.kind === 'shell') {
       const ongoing = [...jobs.values()].filter((job) => job.sessionId === tab.id && ['queued', 'running', 'committing'].includes(job.status));
       if (ongoing.some((job) => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭会话。'); return; }
-      if (ongoing.length && !await confirm('关闭 SSH 会话', `取消「${tab.host.name}」正在传输的 ${ongoing.length} 项任务？`, '取消任务并关闭')) return;
+      if (ongoing.length && !options.confirmed && !await confirm('关闭 SSH 会话', `取消「${tab.host.name}」正在传输的 ${ongoing.length} 项任务？`, '取消任务并关闭')) return;
       if (!tabs.has(tab.id)) return;
       await api.ssh.close(tab.id);
     } else if (tab.kind === 'command') {
@@ -3150,6 +3313,7 @@ async function closeTab(tab) {
 }
 
 function removeTab(tab) {
+  cancelTabDrag();
   if (!tabs.delete(tab.id)) return;
   clearTimeout(tab.reconnectTimer);
   clearTimeout(tab.stableTimer);
@@ -3264,7 +3428,7 @@ async function openPalette(scope = 'all') {
           () => openSessionLayout(layout), `会话布局 分屏 ${names}`, layout.tabs.map(tab => hosts.find(host => host.id === tab.hostId)).filter(Boolean));
       }
       if (api.layouts) {
-        if (source?.kind === 'shell') add('会话操作', '保存当前会话布局', '保存当前分屏中的会话和排列', saveSessionLayout);
+        if (source?.kind === 'shell' && visibleSplitLayout()) add('会话操作', '保存当前会话布局', '保存当前分屏中的会话和排列', saveSessionLayout);
         add('设置', '管理会话布局', '重命名或删除已保存的布局', manageLayouts);
       }
       if (api.logs) add('工具', '会话日志', '查找本机输出记录', manageLogs);
@@ -3364,14 +3528,6 @@ function toggleFiles() {
 
 function readySession(tab, attempt = tab?.attempts) {
   return !vaultStatus.locked && tab?.status === 'ready' && tabs.get(tab.id) === tab && tab.attempts === attempt;
-}
-
-function renderTerminalDirectory() {
-  const control = $('terminal-path');
-  const tab = active;
-  const directory = tab?.paths?.directory;
-  control.hidden = !readySession(origin(tab));
-  control.title = directory ? `Shell 上次报告的目录 ${directory} · 打开路径操作` : '打开远端路径 · ⌘ 单击终端中的路径';
 }
 
 function renderTerminalBottom() {
@@ -3586,6 +3742,7 @@ function openRemoteFile(tab, path, downloadPath) {
 }
 
 function handleFileDrag({ phase, position, count, ticket }) {
+  if (tabDrag?.started) return;
   if (phase === 'enter' || phase === 'drop') draggedFileCount = count;
   if (phase === 'leave') draggedFileCount = 0;
   const overlay = $('terminal-drop');
@@ -4147,7 +4304,7 @@ api.onEvent((event) => {
     const acknowledge = () => { if (pending.delete(event.ack)) api.ssh.ack(event.ack); };
     pending.set(event.ack, acknowledge);
     tab.paths.invalidate();
-    if ((active !== tab || document.hidden || vaultStatus.locked) && !tab.unread) {
+    if ((tab.view.hidden || workspace.dataset.view !== 'session' || document.hidden || vaultStatus.locked) && !tab.unread) {
       tab.unread = true;
       renderTabs();
     }
@@ -4245,7 +4402,7 @@ for (const control of pageButtons) {
 }
 if (api.chrome) {
   const titlebar = document.querySelector('.titlebar');
-  const isChromeClick = (event) => event.button === 0 && !event.target.closest('button, a, input');
+  const isChromeClick = (event) => event.button === 0 && !event.target.closest('button, a, input, #tabs') && !tabDrag?.started;
   const reportWindowError = (error) => status(message(error));
   let dragOrigin;
   titlebar.addEventListener('mousedown', (event) => {
@@ -4396,7 +4553,7 @@ sessionSwitcher.addEventListener('close', () => {
 $('palette-button').addEventListener('click', openGlobalSearch);
 $('queue-button').addEventListener('click', () => {
   selectTab(undefined, 'transfers');
-  $('transfers-title').focus();
+  $('transfer-filters').querySelector('[aria-pressed="true"]')?.focus();
 });
 $('clear-downloads').addEventListener('click', () => removeDownloadHistory().catch((error) => status(message(error))));
 for (const control of transferFilters) {
@@ -4406,7 +4563,7 @@ for (const control of transferFilters) {
     renderTransferSummary();
   });
 }
-$('terminal-path').addEventListener('click', () => chooseTerminalPath().catch((error) => status(message(error))));
+$('save-layout').addEventListener('click', () => saveSessionLayout().catch((error) => status(message(error))));
 $('terminal-bottom').addEventListener('click', () => { active?.terminal?.scrollToBottom(); focusTerminal(active); });
 $('terminal-find').addEventListener('submit', (event) => {
   event.preventDefault();
@@ -4427,18 +4584,18 @@ window.addEventListener('keydown', (event) => {
   if (key === 'b' && !event.shiftKey) { event.preventDefault(); toggleNav.click(); return; }
   if (key === 'e' && !event.shiftKey && origin()) { event.preventDefault(); toggleFiles(); return; }
   if (key === 't' && !event.shiftKey) { event.preventDefault(); void addNewTab(); return; }
-  if (key === 'w' && !event.shiftKey && active) { event.preventDefault(); void closeTab(active).catch((error) => status(message(error))); return; }
+  if (key === 'w' && !event.shiftKey && active) { event.preventDefault(); void closeWorkspaceTab(active).catch((error) => status(message(error))); return; }
   if (!event.shiftKey && /^[1-9]$/.test(key)) {
-    const tab = [...tabs.values()][Number(key) - 1];
+    const tab = workspaceFocus(workspaceEntries()[Number(key) - 1]);
     if (tab) { event.preventDefault(); selectTab(tab); }
     return;
   }
   if (event.shiftKey && ['BracketLeft', 'BracketRight'].includes(event.code) && tabs.size) {
     event.preventDefault();
-    const entries = [...tabs.values()];
-    const index = entries.indexOf(active);
+    const entries = workspaceEntries();
+    const index = entries.findIndex(entry => entry.panes.includes(active?.id));
     const step = event.code === 'BracketRight' ? 1 : -1;
-    selectTab(entries[(index + step + entries.length) % entries.length]);
+    selectTab(workspaceFocus(entries[(index + step + entries.length) % entries.length]));
     return;
   }
   if (event.key.toLowerCase() === 'k') { event.preventDefault(); openGlobalSearch(); }

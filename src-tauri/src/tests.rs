@@ -2384,7 +2384,8 @@ async fn layouts_keep_four_panes_and_both_ratios_across_restore() {
     let rows = ws.store.lock().unwrap().data().unwrap().snapshot();
     let mut restored = Data::default();
     restored.apply(store::portable_rows(rows).unwrap(), None);
-    assert_eq!(json!(restored.layouts)[1], saved);
+    let restored_grid = restored.layouts.iter().find(|layout| layout.id.to_string() == saved["id"].as_str().unwrap()).unwrap();
+    assert_eq!(json!(restored_grid), saved);
     drop(ws);
     let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
     let reopened = call(&ws, "layouts:list", Value::Null).await;
@@ -2605,4 +2606,78 @@ async fn macos_commands_logs_remote_and_dynamic_forwards() {
     .await;
     assert_eq!(closed["retryable"], false);
     assert_eq!(closed["exited"], true);
+}
+
+#[tokio::test]
+async fn layouts_keep_tree_geometry_and_reject_invalid_or_future_records() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let leaf = |index| json!({"type":"pane","index":index});
+    let tabs = (0..3).map(|_| json!({"hostId":Uuid::new_v4(),"title":""})).collect::<Vec<_>>();
+    let layout = json!({"name":"three panes","tabs":tabs,"direction":"tree","ratio":50,
+        "split":{"version":2,"root":{"type":"split","axis":"column","ratio":60,"first":leaf(0),
+            "second":{"type":"split","axis":"row","ratio":45,"first":leaf(1),"second":leaf(2)}}}});
+    let saved = call(&ws, "layouts:save", json!({"layout":layout})).await[0].clone();
+    assert_eq!(saved["split"], layout["split"]);
+    // The prior client's Vec<usize> decoder fails instead of dropping geometry.
+    assert!(serde_json::from_value::<Vec<usize>>(saved["split"].clone()).is_err());
+    for pointer in ["/split/root/second/second/index", "/split/root/ratio", "/split/root/axis", "/split/version"] {
+        let mut invalid = layout.clone();
+        *invalid.pointer_mut(pointer).unwrap() = match pointer {
+            "/split/root/second/second/index" => json!(0),
+            "/split/root/ratio" => json!(10),
+            "/split/root/axis" => json!("diagonal"),
+            _ => json!(3),
+        };
+        assert!(dispatch(&ws, "layouts:save", json!({"layout":invalid})).await.is_err());
+    }
+    let mut out_of_range = layout.clone();
+    out_of_range["split"]["root"]["first"]["index"] = json!(3);
+    assert!(dispatch(&ws, "layouts:save", json!({"layout":out_of_range})).await.is_err());
+    let mut omitted = layout.clone();
+    omitted["split"]["root"]["second"] = leaf(1);
+    assert!(dispatch(&ws, "layouts:save", json!({"layout":omitted})).await.is_err());
+    let rows = ws.store.lock().unwrap().data().unwrap().snapshot();
+    let mut restored = Data::default();
+    restored.apply(store::portable_rows(rows).unwrap(), None);
+    assert_eq!(json!(restored.layouts)[0], saved);
+    let summary = restored.snapshot().into_iter().find(|row| row.summary()["recordType"] == "layout").unwrap().summary();
+    assert_eq!(summary["split"], saved["split"]);
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "layouts:list", Value::Null).await[0], saved);
+}
+
+#[tokio::test]
+async fn layouts_keep_large_and_deep_trees_across_restore() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let tabs = (0..32).map(|_| json!({"hostId":Uuid::new_v4(),"title":""})).collect::<Vec<_>>();
+    // Exceeds the former pane, tab and depth limits in one persisted record.
+    let mut root = json!({"type":"pane","index":0});
+    for index in 1..32 {
+        root = json!({"type":"split","axis":"row","ratio":50,"first":root,
+            "second":{"type":"pane","index":index}});
+    }
+    let split = json!({"version":2,"root":root});
+    let saved = call(&ws, "layouts:save", json!({"layout":{
+        "name":"large workspace","tabs":tabs,"direction":"tree","ratio":50,"split":split
+    }})).await[0].clone();
+    assert_eq!(saved["tabs"].as_array().unwrap().len(), 32);
+    assert_eq!(saved["split"], split);
+    let rows = ws.store.lock().unwrap().data().unwrap().snapshot();
+    let mut restored = Data::default();
+    restored.apply(store::portable_rows(rows).unwrap(), None);
+    assert_eq!(json!(restored.layouts)[0], saved);
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "layouts:list", Value::Null).await[0], saved);
+}
+
+#[test]
+fn initial_window_fits_the_available_work_area() {
+    assert_eq!(initial_window_size(None), (1280.0, 800.0));
+    assert_eq!(initial_window_size(Some((1920.0, 1080.0))), (1280.0, 800.0));
+    assert_eq!(initial_window_size(Some((1024.0, 720.0))), (976.0, 672.0));
+    assert_eq!(initial_window_size(Some((600.0, 540.0))), (552.0, 492.0));
 }

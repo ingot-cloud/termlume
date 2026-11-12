@@ -495,13 +495,57 @@ pub struct LayoutTab {
     pub host_id: Uuid,
     pub title: String,
 }
+// Versioned split objects deliberately fail deserialization in older clients,
+// whose `split` field accepts only an array. Keep legacy arrays unchanged.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum LayoutSplit {
+    Legacy(Vec<usize>),
+    Tree(LayoutTree),
+}
+impl Default for LayoutSplit {
+    fn default() -> Self { Self::Legacy(Vec::new()) }
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutTree {
+    pub version: u8,
+    pub root: LayoutNode,
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum LayoutNode {
+    Pane { index: usize },
+    Split { axis: String, ratio: u8, first: Box<LayoutNode>, second: Box<LayoutNode> },
+}
+impl LayoutNode {
+    fn validate(&self, count: usize, indices: &mut std::collections::HashSet<usize>) -> Result<(), String> {
+        let mut pending = vec![self];
+        while let Some(node) = pending.pop() {
+            match node {
+                Self::Pane { index } => {
+                    if *index >= count || !indices.insert(*index) {
+                        return Err("分屏包含重复或无效的会话。".into());
+                    }
+                }
+                Self::Split { axis, ratio, first, second } => {
+                    if !matches!(axis.as_str(), "column" | "row") || !(20..=80).contains(ratio) {
+                        return Err("分屏方向或比例无效。".into());
+                    }
+                    pending.push(first); pending.push(second);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Layout {
     pub id: Uuid,
     pub name: String,
     pub tabs: Vec<LayoutTab>,
-    pub split: Vec<usize>,
+    pub split: LayoutSplit,
     pub direction: String,
     pub ratio: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -511,33 +555,38 @@ impl Layout {
     fn normalized(mut self) -> Result<Self, String> {
         self.name = checked(&self.name, "布局名称", 120)?;
         if self.tabs.is_empty()
-            || self.tabs.len() > 16
             || self.tabs.iter().any(|t| {
                 t.host_id.is_nil() || t.title.len() > 240 || t.title.chars().any(char::is_control)
             })
         {
-            return Err("布局需要 1–16 个有效主机标签。".into());
+            return Err("布局需要至少一个有效主机标签。".into());
         }
-        let unique: std::collections::HashSet<_> = self.split.iter().collect();
-        if !self.split.is_empty()
-            && (!(2..=4).contains(&self.split.len())
-                || unique.len() != self.split.len()
-                || self.split.iter().any(|i| *i >= self.tabs.len()))
-        {
-            return Err("分屏配置无效。".into());
+        match &self.split {
+            LayoutSplit::Tree(tree) => {
+                if tree.version != 2 { return Err("不支持此会话布局版本，请更新 Termlume。".into()); }
+                let mut indices = std::collections::HashSet::new();
+                tree.root.validate(self.tabs.len(), &mut indices)?;
+                if indices.len() < 2 || indices.len() != self.tabs.len() {
+                    return Err("自定义分屏需要至少两个不同的会话。".into());
+                }
+                self.direction = "tree".into();
+                self.ratio = 50;
+                self.row_ratio = None;
+            }
+            LayoutSplit::Legacy(split) => {
+                let unique: std::collections::HashSet<_> = split.iter().collect();
+                if !split.is_empty()
+                    && (!(2..=4).contains(&split.len()) || unique.len() != split.len() || split.iter().any(|i| *i >= self.tabs.len())) {
+                    return Err("分屏配置无效。".into());
+                }
+                if (split.len() > 2) != (self.direction == "grid") {
+                    return Err("四宫格需要 3–4 个不同的会话，双分屏需要 2 个不同的会话。".into());
+                }
+                if !matches!(self.direction.as_str(), "horizontal" | "vertical" | "grid") { self.direction = "horizontal".into(); }
+                self.ratio = self.ratio.clamp(20, 80);
+                self.row_ratio = if self.direction == "grid" { Some(self.row_ratio.unwrap_or(50).clamp(20, 80)) } else { None };
+            }
         }
-        if (self.split.len() > 2) != (self.direction == "grid") {
-            return Err("四宫格需要 3–4 个不同的会话，双分屏需要 2 个不同的会话。".into());
-        }
-        if !matches!(self.direction.as_str(), "horizontal" | "vertical" | "grid") {
-            self.direction = "horizontal".into();
-        }
-        self.ratio = self.ratio.clamp(20, 80);
-        self.row_ratio = if self.direction == "grid" {
-            Some(self.row_ratio.unwrap_or(50).clamp(20, 80))
-        } else {
-            None
-        };
         Ok(self)
     }
 }

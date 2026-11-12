@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{ipc::Channel, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{ipc::Channel, Manager, State, WebviewWindow, WebviewWindowBuilder};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -25,6 +25,8 @@ mod ssh;
 mod startup_unlock;
 mod store;
 mod terminal_fonts;
+#[cfg(target_os = "macos")]
+mod window_chrome;
 #[cfg(test)]
 mod tests;
 mod touch_id;
@@ -1284,6 +1286,13 @@ async fn restore(ws: &Workspace, value: Value, from_git: bool) -> Result<Value, 
     Ok(store.status())
 }
 
+fn initial_window_size(work_area: Option<(f64, f64)>) -> (f64, f64) {
+    match work_area {
+        Some((width, height)) => ((width - 48.0).clamp(550.0, 1280.0), (height - 48.0).clamp(490.0, 800.0)),
+        None => (1280.0, 800.0),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1311,24 +1320,30 @@ pub fn run() {
                     idle_workspace.lock(true);
                 }
             });
-            let mut window =
-                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            #[cfg(desktop)]
+            let work_area = app.primary_monitor().ok().flatten().map(|monitor| {
+                let size = monitor.work_area().size;
+                (size.width as f64 / monitor.scale_factor(), size.height as f64 / monitor.scale_factor())
+            });
+            #[cfg(not(desktop))]
+            let work_area = None;
+            let (initial_width, initial_height) = initial_window_size(work_area);
+            // Apply native window settings as well as webview settings, so
+            // AppKit can restore the configured controls after window changes.
+            let window =
+                WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
                     .title("Termlume")
-                    .inner_size(1140.0, 740.0)
+                    .inner_size(initial_width, initial_height)
+                    .center()
                     .min_inner_size(550.0, 490.0)
                     .on_navigation(local_url)
                     .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny);
-            #[cfg(target_os = "macos")]
-            {
-                window = window
-                    .title_bar_style(tauri::TitleBarStyle::Overlay)
-                    .traffic_light_position(tauri::LogicalPosition::new(14.0, 24.0))
-                    .hidden_title(true);
-            }
             #[cfg(not(desktop))]
             window.build()?;
             #[cfg(desktop)]
             let window = window.build()?;
+            #[cfg(target_os = "macos")]
+            window_chrome::install(&window);
             #[cfg(desktop)]
             window.on_window_event(move |event| {
                 use tauri::{DragDropEvent, WindowEvent};

@@ -84,8 +84,12 @@
     for (const section of ['preferences','groups','identities','snippets','layouts','logs','trust']) {
       openSettings(section); await tick();
       assert(workspace.dataset.view === 'settings' && !dialog.open && $('settings-page').querySelector('.settings-form'), `${section} 在独立设置页面显示`);
+      assert(!$('settings-page').querySelector('h1, .page-toolbar') && $('settings-page').getAttribute('aria-label') &&
+        $('settings-page').querySelector('form').getAttribute('aria-label'), `${section} 不保留重复标题栏，使用可访问区域名称`);
     }
     openSettings('preferences'); await tick();
+    assert($('settings-page').firstElementChild.matches('.settings-form') &&
+      !$('settings-page').querySelector('.settings-inline-actions'), '偏好页面移除整个空标题区域，直接显示配置');
     const preferenceForm=$('settings-page').querySelector('form');
     const fontPicker = preferenceForm.querySelector('[role="combobox"][aria-label="终端字体"]');
     assert(fontPicker?.textContent.includes('当前设置（Menlo, monospace）'), '终端字体下拉保留已有的字体设置');
@@ -145,7 +149,7 @@
       !identitySave.localPassword && !identitySave.sourceHostId, '保存时自动命名，只提交所选认证且不关联原主机');
     $('workspace-tools').querySelector('[data-section="security"]').click(); await tick();
     const security = $('settings-page');
-    assert(security.querySelector('h1').textContent === '安全与同步' && !document.querySelector('[data-page="vault"]') &&
+    assert(security.getAttribute('aria-label') === '安全与同步' && !security.querySelector('h1') && !document.querySelector('[data-page="vault"]') &&
       !$('vault-protection').checked && !$('vault-startup-unlock') && !$('vault-git-enabled') &&
       findButton(security, '从 Git 恢复'), '主密码保护默认关闭，安全设置保留恢复入口');
     applyVaultState(previewProtected); await tick();
@@ -331,19 +335,19 @@
     splitLayout = {panes:[production.id,staging.id],direction:'horizontal',ratio:50}; selectTab(production); await tick();
     const connectCount = previewCalls.filter(([type]) => type === 'connect').length;
     splitGrip.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));
-    assert(splitLayout.ratio === 55 && connectCount === previewCalls.filter(([type]) => type === 'connect').length, '分屏调整保留连接');
-    splitLayout.panes = [staging.id, production.id];
+    assert(splitLayout.tree.ratio === 55 && connectCount === previewCalls.filter(([type]) => type === 'connect').length, '分屏调整保留连接');
+    splitLayout = splitFromTree(layoutState.presetTree([staging.id, production.id], 'horizontal', 55));
     selectTab(staging);
     const savedTabIds = [...tabs.keys()];
-    findButton($('session-actions'), '保存布局').click(); await tick();
+    $('save-layout').click(); await tick();
     assert(dialog.open && dialog.querySelector('h2').textContent === '保存会话布局',
-      '终端分屏操作旁可直接保存会话布局');
+      '分屏工作区从终端工具栏保存布局');
     dialog.querySelector('input').value = '生产巡检布局';
     dialog.querySelector('form').requestSubmit(); await tick();
     const savedLayout = previewLayouts[0];
-    assert(savedLayout.name === '生产巡检布局' && savedLayout.tabs.length === 2 && savedLayout.ratio === 55 &&
-      savedLayout.tabs[savedLayout.split[0]].hostId === staging.host.id &&
-      savedLayout.tabs[savedLayout.split[1]].hostId === production.host.id,
+    assert(savedLayout.name === '生产巡检布局' && savedLayout.tabs.length === 2 && savedLayout.split.root.ratio === 55 &&
+      savedLayout.tabs[savedLayout.split.root.first.index].hostId === staging.host.id &&
+      savedLayout.tabs[savedLayout.split.root.second.index].hostId === production.host.id,
       '只保存当前分屏两端及比例，额外标签不加入布局');
     openSettings('layouts'); await tick();
     assert(!$('settings-page').textContent.includes('保存当前布局') &&
@@ -362,7 +366,7 @@
     layoutChoice.click(); await layoutPalette; await tick();
     const openedLayoutTabs = [...tabs.values()].filter(tab => !savedTabIds.includes(tab.id));
     assert(openedLayoutTabs.length === savedLayout.tabs.length && openedLayoutTabs.every(tab => tab.status === 'idle') &&
-      savedTabIds.every(id => tabs.has(id)) && splitLayout.ratio === 55 &&
+      savedTabIds.every(id => tabs.has(id)) && splitLayout.tree.ratio === 55 &&
       splitLayout.panes.map(id => tabs.get(id).host.id).join() === [staging.host.id, production.host.id].join() &&
       active.id === splitLayout.panes[0] &&
       beforeLayoutOpen === previewCalls.filter(([type]) => type === 'connect').length,
@@ -382,98 +386,63 @@
     assert(unavailableLayoutError?.message.includes('主机已删除') && tabs.size === beforeUnavailableLayout,
       '包含已删除主机的布局会提示问题，并在创建标签前停止');
     previewLayouts.length = 0;
-    splitLayout = undefined; selectTab(production);
+    splitGroups.clear(); splitLayout = undefined; selectTab(production);
     const unrelated = await openHost(previewHosts[3], { force: true, connectNow: false });
     selectTab(production);
     const beforeGridConnections = previewCalls.filter(([type]) => type === 'connect').length;
-    const beforeGridTabs = new Set(tabs.keys());
-    const beforeSearchHosts = hosts;
-    const manyHosts = Array.from({ length: 120 }, (_, index) => ({ ...previewHosts[0], id: `split-search-${index}`,
-      name: `批量主机 ${index}`, address: `batch-${index}.example.test`, group: index % 2 ? '测试甲组' : '测试乙组', tags: ['巡检'] }));
-    hosts = [...hosts, ...manyHosts];
-    const gridPrompt = configureSplit(production); await tick();
-    dialog.querySelector('[aria-label="四宫格"]').click(); await tick();
-    const gridSelectors = dialog.querySelectorAll('.split-slot select');
-    assert(gridSelectors.length === 4, '四宫格提供四个位置的会话选择器');
-    const firstSlot = dialog.querySelector('.split-slot');
-    const firstSlotValue = gridSelectors[0].value;
-    firstSlot.querySelector('.dropdown-trigger').click(); await tick();
-    let splitPicker = dialog.querySelector('.dropdown-searchable');
-    const splitSearch = splitPicker.querySelector('input');
-    assert(document.activeElement === splitSearch && splitPicker.querySelectorAll('[role="option"]').length > 120,
-      '大量会话选择提供自动聚焦的搜索入口');
-    splitPicker.querySelector('[data-source="host"]').click();
-    const groupFilter = splitPicker.querySelector('select');
-    groupFilter.value = 'group:测试甲组'; groupFilter.dispatchEvent(new Event('change'));
-    splitSearch.value = 'BATCH-119 巡检'; splitSearch.dispatchEvent(new Event('input')); await tick();
-    const match = splitPicker.querySelector('[role="option"]');
-    assert(splitPicker.querySelectorAll('[role="option"]').length === 1 && match.title.includes('batch-119.example.test') &&
-      match.title.includes('测试甲组'), '搜索支持地址、标签、多词匹配及来源和分组组合筛选');
-    splitSearch.value = '不存在的会话'; splitSearch.dispatchEvent(new Event('input'));
-    assert(splitPicker.textContent.includes('没有匹配') && !splitPicker.querySelector('[role="option"]'), '筛选无结果时明确说明');
-    splitSearch.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-    assert(dialog.open && !dialog.querySelector('.dropdown-searchable') && document.activeElement === firstSlot.querySelector('.dropdown-trigger'),
-      'Escape 只收起会话选择，不关闭分屏配置并返回焦点');
-    firstSlot.querySelector('.dropdown-trigger').click(); await tick();
-    splitPicker = dialog.querySelector('.dropdown-searchable');
-    const availableSearch = splitPicker.querySelector('input');
-    availableSearch.value = 'batch-119'; availableSearch.dispatchEvent(new Event('input'));
-    availableSearch.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); await tick();
-    assert(gridSelectors[0].value === 'host:split-search-119' && !dialog.querySelector('.dropdown-searchable') &&
-      firstSlot.querySelector('.split-slot-detail').textContent.includes('batch-119'), '回车选中搜索结果并显示完整连接资料');
-    gridSelectors[0].value = firstSlotValue; gridSelectors[0].dispatchEvent(new Event('change'));
-    hosts = beforeSearchHosts;
-    gridSelectors[3].value = `host:${production.host.id}`;
-    gridSelectors[3].dispatchEvent(new Event('change', { bubbles: true }));
-    dialog.querySelector('form').requestSubmit(); await gridPrompt; await tick();
-    const gridCreated = [...tabs.values()].find(tab => !beforeGridTabs.has(tab.id));
-    assert(splitLayout.direction === 'grid' && splitLayout.panes.length === 4 &&
+    const gridExtra = await openHost(production.host, { force: true, connectNow: false });
+    const gridCreated = await openHost(production.host, { force: true, connectNow: false });
+    splitLayout = installSplitLayout(splitFromTree(layoutState.presetTree([production.id, staging.id, gridExtra.id, gridCreated.id], 'grid')));
+    selectTab(production); await tick();
+    assert(splitLayout.direction === 'tree' && splitLayout.panes.length === 4 &&
       !splitLayout.panes.includes(unrelated.id) && gridCreated?.status === 'idle' &&
       beforeGridConnections === previewCalls.filter(([type]) => type === 'connect').length,
-      '四宫格可组合已有会话和新的空闲会话，保留额外标签');
+      '布局模型可组合已有会话与空闲会话，保留其他标签');
     const panes = splitLayout.panes.map(id => tabs.get(id));
     const rectangles = panes.map(tab => tab.view.getBoundingClientRect());
-    assert(rectangles[0].left < rectangles[1].left && rectangles[0].top < rectangles[2].top &&
-      rectangles[2].left < rectangles[3].left &&
+    assert(rectangles[0].top < rectangles[1].top && rectangles[0].left < rectangles[2].left &&
+      rectangles[2].top < rectangles[3].top &&
       panes.every(tab => !tab.view.hidden) && unrelated.view.hidden,
       '四个会话按左上、右上、左下、右下显示');
     panes[3].view.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
     splitGrip.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     splitRowGrip.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-    assert(active === panes[3] && splitLayout.ratio === 55 && splitLayout.rowRatio === 55,
+    assert(active === panes[3] && splitLayout.tree.ratio === 55 && splitLayout.tree.first.ratio === 55,
       '点击切换四屏焦点，可分别调整列宽和行高');
     const saveGrid = saveSessionLayout(); await tick();
     dialog.querySelector('input').value = '四屏巡检';
     dialog.querySelector('form').requestSubmit(); await saveGrid; await tick();
     const savedGrid = previewLayouts[0];
-    assert(savedGrid.tabs.length === 4 && savedGrid.split.length === 4 &&
-      savedGrid.rowRatio === 55 && !savedGrid.tabs.some(tab => tab.hostId === unrelated.host.id),
+    assert(savedGrid.tabs.length === 4 && savedGrid.split.version === 2 &&
+      savedGrid.split.root.first.ratio === 55 && !savedGrid.tabs.some(tab => tab.hostId === unrelated.host.id),
       '四屏布局只保存本组会话及行列比例');
     await openSessionLayout(savedGrid); await tick();
     const restoredGrid = splitLayout.panes.map(id => tabs.get(id));
     assert(restoredGrid.length === 4 && restoredGrid.every(tab => tab.status === 'idle') &&
-      splitLayout.ratio === 55 && splitLayout.rowRatio === 55 &&
+      splitLayout.tree.ratio === 55 && splitLayout.tree.first.ratio === 55 &&
       beforeGridConnections === previewCalls.filter(([type]) => type === 'connect').length,
       '打开四屏布局还原行列尺寸，并等待用户连接');
     removeTab(restoredGrid[0]); await tick();
-    assert(splitLayout.panes.length === 3 && splitLayout.direction === 'grid' &&
+    assert(splitLayout.panes.length === 3 && splitLayout.direction === 'tree' &&
       restoredGrid.slice(1).every(tab => !tab.view.hidden), '四屏关闭一屏后保留其余三屏');
     removeTab(restoredGrid[1]); await tick();
-    assert(splitLayout.panes.length === 2 && splitLayout.direction === 'horizontal',
-      '剩余两个会话自动整理为双分屏');
+    assert(splitLayout.panes.length === 2 && splitLayout.tree.axis === 'row',
+      '剩余两个会话保留原分支的上下排列');
     restoredGrid[2].paneHeader.querySelector('button:last-child').click(); await tick();
-    assert(!splitLayout && tabs.has(restoredGrid[2].id) && active === restoredGrid[3],
-      '移出分屏保留会话标签，并聚焦剩余会话');
-    const saveSingle = saveSessionLayout(); await tick();
-    dialog.querySelector('input').value = '单会话';
-    dialog.querySelector('form').requestSubmit(); await saveSingle;
-    const savedSingle = previewLayouts.at(-1);
-    assert(savedSingle.tabs.length === 1 && !savedSingle.split.length &&
-      savedSingle.tabs[0].hostId === active.host.id, '单屏保存只包含当前会话');
+    assert(!splitLayout && tabs.has(restoredGrid[2].id) && active === restoredGrid[2],
+      '移出分屏保留会话标签，并聚焦移出的会话');
+    const singleLayoutCount = previewLayouts.length;
+    let singleLayoutError;
+    try { await saveSessionLayout(); } catch (error) { singleLayoutError = error; }
+    assert(singleLayoutError?.message.includes('分屏工作区') && previewLayouts.length === singleLayoutCount &&
+      $('save-layout').hidden && !dialog.open,
+      '独立会话不显示保存布局，也不会创建单屏布局');
+    assert(![...document.querySelectorAll('button')].some(button => button.getClientRects().length && ['分屏', '分屏设置'].includes(button.textContent)),
+      '分屏设置入口已移除，分屏由拖拽完成');
     for (const tab of restoredGrid.slice(2)) removeTab(tab);
-    removeTab(unrelated); removeTab(gridCreated);
+    removeTab(unrelated); removeTab(gridCreated); removeTab(gridExtra);
     previewLayouts.length = 0;
-    splitLayout = undefined; selectTab(production);
+    splitGroups.clear(); splitLayout = undefined; selectTab(production);
     const terminalOverflow = tab => tab.view.querySelector('.xterm-screen').getBoundingClientRect().bottom
       - tab.view.querySelector('.terminal-surface').getBoundingClientRect().bottom;
     await new Promise(resolve => production.terminal.write('output\r\n'.repeat(150) + 'prompt$ ', resolve));
@@ -505,7 +474,7 @@
       else tab.host.terminalTheme = theme;
     }
     uiPreferences.terminalTheme = previousTerminalTheme; applyPreferences();
-    splitLayout = undefined; selectTab(production);
+    splitGroups.clear(); splitLayout = undefined; selectTab(production);
     assert(document.documentElement.scrollWidth <= innerWidth, '工作台无页面横向溢出');
     api.ssh.connect = async value => previewCalls.push(['connect', value]);
     await openHost(previewHosts[0], { force: true });

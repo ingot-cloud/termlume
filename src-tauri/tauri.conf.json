@@ -13,10 +13,12 @@
     "windows": [
       {
         "title": "Termlume",
-        "width": 1140,
-        "height": 740,
+        "width": 1280,
+        "height": 800,
         "minWidth": 550,
         "minHeight": 490,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
         "create": false
       }
     ],
