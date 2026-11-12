@@ -262,6 +262,37 @@ class WorkspaceSSH {
     });
   }
 
+  async serverInfo(id) {
+    const { client } = this.connected(id);
+    const script = await readFile(join(__dirname, 'server-info.sh'), 'utf8');
+    return new Promise((resolve, reject) => {
+      let channel, done = false, output = Buffer.alloc(0);
+      const finish = (error, value) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        channel?.close();
+        if (error) reject(error); else resolve(value);
+      };
+      const timer = setTimeout(() => finish(new Error('采集服务器信息超时，请刷新重试。')), 15000);
+      client.exec(`sh -c '${script.replaceAll("'", "'\\''")}'`, (error, stream) => {
+        if (error) { finish(error); return; }
+        if (done) { stream.close(); return; }
+        channel = stream;
+        stream.stderr.on('data', () => {});
+        stream.on('data', bytes => {
+          if (output.length + bytes.length > 256 * 1024) { finish(new Error('服务器信息超过大小限制。')); return; }
+          output = Buffer.concat([output, bytes]);
+        });
+        stream.on('error', error => finish(error));
+        stream.on('close', code => {
+          if (code !== 0) finish(new Error('服务器信息采集失败，请重试。'));
+          else finish(null, output.toString('utf8'));
+        });
+      });
+    });
+  }
+
   async command(id, sessionId, request) {
     const session = this.connected(sessionId);
     const command = commandFor(request);

@@ -32,7 +32,7 @@ browser.stdio[4].on('data', chunk => {
     if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
   }
 });
-const deadline = setTimeout(() => { console.error('UI checks timed out.', stderr); browser.kill(); process.exitCode = 1; }, 90000);
+const deadline = setTimeout(() => { console.error('UI checks timed out.', stderr); browser.kill(); process.exitCode = 1; }, 120000);
 async function main() {
   const { targetId } = await request('Target.createTarget', { url: 'about:blank' });
   const { sessionId } = await request('Target.attachToTarget', { targetId, flatten: true });
@@ -42,8 +42,8 @@ async function main() {
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception.description);
     return result.result.value;
   };
-  const wait = async expression => {
-    for (let attempt = 0; attempt < 100; attempt++) {
+  const wait = async (expression, attempts = 100) => {
+    for (let attempt = 0; attempt < attempts; attempt++) {
       if (await js(expression)) return;
       await new Promise(resolve => setTimeout(resolve, 50));
     }
@@ -420,7 +420,7 @@ async function main() {
   for (const [width, height] of [[1140, 740], [550, 490]]) {
     await run('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
     await run('Page.navigate', { url: pathToFileURL(path.join(root, 'dist/ux-review/workspace.html')).href });
-    await wait("document.getElementById('smoke-results')");
+    await wait("document.getElementById('smoke-results')", 400);
     const report = await js("document.getElementById('smoke-results').textContent");
     assert.match(report, /^✓/, report);
     console.log(`${width}×${height}: ${report.split('（')[0]}`);
@@ -559,6 +559,20 @@ async function main() {
         return list.top - panel.top <= 145 && list.height >= panel.height - 145;
       })()`), 'File controls should leave the remaining panel height to the list');
       await shot(`session-${theme}-${width}.png`);
+      await js('toggleServerInfo()'); await tick();
+      await wait("$('server-info').querySelectorAll('[role=\"meter\"]').length === 4");
+      await overflow();
+      assert(await js("$('server-info').scrollWidth <= $('server-info').clientWidth + 1 && $('server-info').getBoundingClientRect().right <= innerWidth"));
+      await shot(`server-info-${theme}-${width}.png`);
+      await js('active.networkHistory=previewNetworkHistory(); active.resourceHistory=previewResourceHistory(); active.diskHistory=previewDiskHistory(); renderServerInfo()');
+      for (const [metric, selector] of [['cpu','[data-metric="cpu"]'], ['memory','[data-metric="memory"]'], ['network','.server-info-network .server-network-chart'], ['disk','.server-disk-chart'], ['iops','[data-disk-metric="iops"]'], ['io-utilization','[data-disk-metric="utilization"]'], ['disk-latency','.server-disk-latency-chart'], ['io-queue','[data-disk-metric="queueLength"]']]) {
+        await js(`(()=>{const body=$('server-info').querySelector('.server-info-body');const chart=body.querySelector(${JSON.stringify(selector)});
+          body.scrollTop+=chart.getBoundingClientRect().top-body.getBoundingClientRect().top-6;})()`);
+        await tick(); await overflow();
+        assert(await js(`$('server-info').querySelector(${JSON.stringify(selector)}).getBoundingClientRect().right <= innerWidth`));
+        await shot(`${metric}-history-${theme}-${width}.png`);
+      }
+      await js('toggleServerInfo(); toggleFiles()'); await tick();
       if (theme === 'dark') {
         const shellId = await js('active.id');
         await js(`(async () => {

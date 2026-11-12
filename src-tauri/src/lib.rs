@@ -20,6 +20,7 @@ mod git_auto;
 mod git_https;
 mod imports;
 mod keys;
+mod server_info;
 mod session_logs;
 mod ssh;
 mod startup_unlock;
@@ -268,7 +269,8 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         return blocking(|| Ok(json!(touch_id::available()))).await;
     }
     ws.store.lock().unwrap().data()?;
-    if !matches!(name, "ssh:resize" | "ssh:input") {
+    // Periodic server snapshots must not keep an idle vault unlocked.
+    if !matches!(name, "ssh:resize" | "ssh:input" | "ssh:server-info") {
         *ws.last_activity.lock().unwrap() = Instant::now();
     }
     match name {
@@ -611,6 +613,10 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         "ssh:directory" => {
             let session = ws.connections.connected(id(&value)?)?;
             return Ok(json!(ssh::terminal_directory(&session).await));
+        }
+        "ssh:server-info" => {
+            let session = ws.connections.connected(id(&value)?)?;
+            return Ok(json!(server_info::collect(&session).await?));
         }
         #[cfg(desktop)]
         "files:list" => {

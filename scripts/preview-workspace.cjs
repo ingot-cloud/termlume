@@ -13,6 +13,7 @@ const sources = {
   '/overlays.js':'src/ui/overlays.js',
   '/terminal-paths.js':'src/ui/terminal-paths.js',
   '/workspace-state.js':'src/ui/workspace-state.js',
+  '/server-info.js':'src/ui/server-info.js',
   '/renderer.js':'src/ui/renderer.js'
 };
 let html = read('src/ui/index.html').replace(/\s*<meta http-equiv="Content-Security-Policy"[^>]*>/, '');

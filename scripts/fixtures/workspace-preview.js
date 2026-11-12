@@ -6,6 +6,71 @@ const previewHosts = [
   {id:'jump',name:'运维跳板',address:'jump.example.test',username:'ops',port:22,auth:'agent',tags:['ops']}
 ];
 const previewCalls = [];
+const previewServerInfo = `
+__TERMLUME_INFO__version
+1
+__TERMLUME_INFO__platform
+Linux
+__TERMLUME_INFO__hostname
+api-production
+__TERMLUME_INFO__os
+PRETTY_NAME="Ubuntu 24.04 LTS"
+__TERMLUME_INFO__kernel
+6.8.0-51-generic
+__TERMLUME_INFO__architecture
+x86_64
+__TERMLUME_INFO__cpuModel
+Intel Xeon Platinum 8375C CPU @ 2.90GHz
+__TERMLUME_INFO__cpuCount
+4
+__TERMLUME_INFO__memory
+MemTotal:       8388608 kB
+MemAvailable:   5242880 kB
+SwapTotal:      0 kB
+SwapFree:       0 kB
+__TERMLUME_INFO__uptime
+987654.32 123456.00
+__TERMLUME_INFO__load
+0.25 0.40 0.31 1/100 222
+__TERMLUME_INFO__cpuBefore
+cpu 100 0 100 800 0 0 0 0 0 0
+__TERMLUME_INFO__cpuAfter
+cpu 125 0 110 865 0 0 0 0 0 0
+__TERMLUME_INFO__networkBeforeTime
+100.00 500.00
+__TERMLUME_INFO__networkDefault
+eth0
+__TERMLUME_INFO__networkBefore
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast |bytes    packets errs drop fifo colls carrier compressed
+    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0
+  veth0: 100 1 0 0 0 0 0 0 200 1 0 0 0 0 0 0
+  eth0: 1071644672 1 0 0 0 0 0 0 536346624 1 0 0 0 0 0 0
+__TERMLUME_INFO__networkAfterTime
+101.00 504.00
+__TERMLUME_INFO__networkAfter
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast |bytes    packets errs drop fifo colls carrier compressed
+    lo: 200 2 0 0 0 0 0 0 200 2 0 0 0 0 0 0
+  veth0: 200 2 0 0 0 0 0 0 400 2 0 0 0 0 0 0
+  eth0: 1073741824 2 0 0 0 0 0 0 536870912 2 0 0 0 0 0 0
+__TERMLUME_INFO__diskIoBeforeTime
+100.00 500.00
+__TERMLUME_INFO__diskIoBefore
+vda 252:0:1 1000000 500000 1000 500 100000 20000 10000 400000
+vdb 252:16:2 2000000 1000000 2000 1000 200000 10000 5000 300000
+__TERMLUME_INFO__diskIoAfterTime
+101.00 504.00
+__TERMLUME_INFO__diskIoAfter
+vda 252:0:1 1004096 501024 1016 508 100400 20320 10480 400800
+vdb 252:16:2 2002048 1000512 2040 1020 200100 10080 5080 300160
+__TERMLUME_INFO__disks
+Filesystem 1024-blocks Used Available Capacity Mounted on
+/dev/vda1 104857600 41943040 62914560 40% /
+/dev/vdb1 209715200 52428800 157286400 25% /srv/application data
+__TERMLUME_INFO__end
+ok
+`;
 const previewResizes = [];
 let previewListener;
 const previewProtected = { enabled: true, locked: false, fileTransfers: true, startupUnlockSupported: true,
@@ -79,3 +144,46 @@ window.termlume = {
   forwards:{list:async()=>({rules:[],running:[]})},
   onEvent(listener){previewListener=listener;}
 };
+window.termlume.ssh.serverInfo = async id => { previewCalls.push(['server-info', id]); return previewServerInfo; };
+
+function previewNetworkHistory(now = Date.now()) {
+  let history = [];
+  for (let i = 0; i <= 60; i++) {
+    if (i >= 31 && i <= 34) continue;
+    history = window.serverInfo.appendNetworkHistory(history, [
+      { name: 'eth0', downloadRate: (0.5 + (1 + Math.sin(i * .23)) * .45 + (i === 48 ? 1.2 : 0)) * 1024 ** 2,
+        uploadRate: (.1 + (1 + Math.cos(i * .18)) * .15) * 1024 ** 2 },
+      { name: 'veth0', downloadRate: 100 + i * 2, uploadRate: 200 + i }
+    ], now - 300000 + i * 5000);
+  }
+  return history;
+}
+
+function previewResourceHistory(now = Date.now()) {
+  let history = [];
+  for (let i = 0; i <= 60; i++) {
+    if (i >= 31 && i <= 34) continue;
+    history = window.serverInfo.appendResourceHistory(history, {
+      cpuPercent: 20 + (1 + Math.sin(i * .23)) * 15 + (i === 48 ? 35 : 0),
+      memory: { percent: 55 + (1 + Math.cos(i * .18)) * 8 }
+    }, now - 300000 + i * 5000);
+  }
+  return history;
+}
+
+function previewDiskHistory(now = Date.now()) {
+  let history = [];
+  for (let i = 0; i <= 60; i++) {
+    if (i >= 31 && i <= 34) continue;
+    history = window.serverInfo.appendDiskHistory(history, [
+      { name: 'vda', identity: '252:0:1', readRate: (1 + Math.sin(i * .23)) * 1024 ** 2,
+        writeRate: (.1 + (1 + Math.cos(i * .18)) * .3) * 1024 ** 2,
+        iops: (1 + Math.sin(i * .23)) * 300 + (i === 48 ? 1200 : 0), utilization: (1 + Math.cos(i * .18)) * 40,
+        readLatency: .2 + (1 + Math.sin(i * .21)) * .4, writeLatency: .5 + (1 + Math.cos(i * .18)) * 1.5,
+        queueLength: .2 + (1 + Math.sin(i * .17)) * .6 + (i === 48 ? 2 : 0) },
+      { name: 'vdb', identity: '252:16:2', readRate: 1024 ** 2, writeRate: 512 * 1024, iops: 100, utilization: 25,
+        readLatency: 2, writeLatency: 4, queueLength: .16 }
+    ], now - 300000 + i * 5000);
+  }
+  return history;
+}

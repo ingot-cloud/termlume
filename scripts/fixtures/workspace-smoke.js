@@ -71,6 +71,108 @@
     assert(previewResizes.slice(beforeReady).some(({ id, size }) =>
       id === production.id && size.cols === production.terminal.cols && size.rows === production.terminal.rows),
       'SSH 握手完成后同步已适配的终端行列数');
+    const infoButton = () => $('session-actions').querySelector('[aria-controls="server-info"]');
+    const inputsBeforeInfo = previewCalls.filter(([type]) => type === 'input').length;
+    infoButton().click(); await tick();
+    assert(!$('server-info').hidden && infoButton().getAttribute('aria-expanded') === 'true' &&
+      $('server-info').textContent.includes('Ubuntu 24.04 LTS') && $('server-info').querySelectorAll('[role="meter"]').length === 4,
+      '服务器信息一键展开，显示系统、CPU、内存和各挂载点的占用图');
+    assert($('server-info').querySelectorAll('.server-info-network').length === 2 &&
+      $('server-info').querySelector('.server-info-network').firstChild.textContent === 'eth0' &&
+      $('server-info').textContent.includes('2.0 MiB/s') && $('server-info').textContent.includes('512.0 KiB/s') &&
+      $('server-info').textContent.includes('累计接收') && $('server-info').textContent.includes('累计发送'),
+      '网络优先显示默认路由网卡，按网卡显示速率与累计流量，并排除回环接口');
+    assert($('server-info').querySelector('.server-info-network .server-network-chart svg[role="img"]') &&
+      Number($('server-info').querySelector('.server-info-network .server-network-chart').dataset.samples) >= 1,
+      '网络曲线显示真实采样点和最近五分钟时间范围');
+    for (const metric of ['cpu', 'memory']) {
+      const chart = $('server-info').querySelector(`.server-usage-chart[data-metric="${metric}"]`);
+      assert(chart?.querySelector('svg[role="img"]') && Number(chart.dataset.samples) >= 1 &&
+        chart.querySelector('.network-chart-y').textContent === '100%50%0%',
+        `${metric} 显示独立的最近五分钟使用率曲线，刻度为 0–100%`);
+    }
+    assert($('server-info').querySelectorAll('.server-info-disk-io').length === 2 &&
+      $('server-info').querySelector('.server-info-disk-io').textContent.includes('2.0 MiB/s') &&
+      $('server-info').querySelector('.server-disk-chart svg').getAttribute('aria-label').includes('磁盘读写速度曲线') &&
+      Number($('server-info').querySelector('.server-disk-chart').dataset.samples) >= 1,
+      '磁盘按设备显示读取/写入速度和最近五分钟双曲线');
+    for (const metric of ['iops', 'utilization', 'queueLength']) {
+      const charts = [...$('server-info').querySelectorAll(`[data-disk-metric="${metric}"]`)];
+      assert(charts.length === 2 && charts.every(chart => Number(chart.dataset.samples) >= 1 &&
+        chart.querySelector('svg[role="img"]')) && (metric !== 'utilization' ||
+        charts.every(chart => chart.querySelector('.network-chart-y').textContent === '100%50%0%')),
+        `每块磁盘显示独立的 ${metric} 五分钟曲线及正确刻度`);
+    }
+    assert($('server-info').querySelector('.server-info-disk-io').textContent.includes('24 IOPS') &&
+      $('server-info').querySelector('.server-info-disk-io').textContent.includes('40%'),
+      '磁盘同时显示每秒读写次数与设备忙碌时间占比');
+    assert($('server-info').querySelectorAll('.server-disk-latency-chart').length === 2 &&
+      [...$('server-info').querySelectorAll('.server-disk-latency-chart')].every(chart => Number(chart.dataset.samples) >= 1 &&
+        chart.querySelector('svg').getAttribute('aria-label').includes('平均读写延迟曲线')) &&
+      $('server-info').querySelector('.server-info-disk-io').textContent.includes('20 ms') &&
+      $('server-info').querySelector('.server-info-disk-io').textContent.includes('60 ms') &&
+      $('server-info').querySelector('.server-info-disk-io').textContent.includes('0.8 个请求'),
+      '磁盘独立展示平均读写延迟、毫秒双曲线及平均队列长度');
+    const originalInfoHeader = $('server-info').querySelector('header');
+    findButton($('server-info'), '刷新').click(); await tick();
+    assert($('server-info').querySelector('header') === originalInfoHeader &&
+      previewCalls.filter(([type]) => type === 'server-info').length === 2 &&
+      previewCalls.filter(([type]) => type === 'input').length === inputsBeforeInfo,
+      '刷新信息不向终端输入命令，并保留操作按钮和焦点');
+    const otherNetworks = $('server-info').querySelector('.server-network-others');
+    assert(!otherNetworks.open, '其余网卡默认收起');
+    otherNetworks.querySelector('summary').click();
+    otherNetworks.querySelector('summary').focus();
+    findButton($('server-info'), '刷新').click(); await tick();
+    assert($('server-info').querySelector('.server-network-others').open &&
+      document.activeElement === $('server-info').querySelector('.server-network-others summary'),
+      '刷新保留其他网卡的展开状态及键盘焦点');
+    $('server-info').querySelector('.server-network-others summary').click();
+    findButton($('session-actions'), '文件').click(); await tick();
+    assert($('server-info').hidden && !serverInfoOpen && filesOpen, '文件与服务器信息共用侧栏空间');
+    toggleFiles(); infoButton().click(); await tick();
+    const serverInfo = api.ssh.serverInfo;
+    api.ssh.serverInfo = async () => { throw new Error('fixture timeout'); };
+    findButton($('server-info'), '刷新').click(); await tick();
+    assert($('server-info').textContent.includes('采集失败') && $('server-info').textContent.includes('上次成功采集'),
+      '刷新失败保留上一份数据并明确标记');
+    api.ssh.serverInfo = serverInfo;
+    findButton($('server-info'), '刷新').click(); await tick();
+    assert(!$('server-info').textContent.includes('采集失败'), '采集失败后可刷新重试');
+    assert($('server-info').textContent.includes('每 5 秒自动刷新'), '服务器信息说明自动刷新间隔');
+    if (innerWidth === 1140) {
+      const body = $('server-info').querySelector('.server-info-body');
+      body.scrollTop = 120;
+      const scroll = body.scrollTop;
+      const count = previewCalls.filter(([type]) => type === 'server-info').length;
+      await new Promise(resolve => setTimeout(resolve, 5200));
+      assert(previewCalls.filter(([type]) => type === 'server-info').length > count &&
+        $('server-info').querySelector('.server-info-body').scrollTop === scroll &&
+        $('server-info').querySelector('.server-info-network').textContent.includes('2.0 MiB/s'),
+        '展开时自动刷新系统与网络数据，保留正在查看的滚动位置');
+      assert(Number($('server-info').querySelector('.server-info-network .server-network-chart').dataset.samples) >= 2,
+        '自动刷新将新数据追加到网络历史曲线');
+      assert([...$('server-info').querySelectorAll('.server-usage-chart')].every(chart => Number(chart.dataset.samples) >= 2),
+        '每五秒采集同时更新 CPU 与内存历史曲线');
+      assert([...$('server-info').querySelectorAll('.server-disk-chart')].every(chart => Number(chart.dataset.samples) >= 2),
+        '每五秒采集同时更新所有磁盘的读写曲线');
+      assert([...$('server-info').querySelectorAll('.server-disk-metric-chart')].every(chart => Number(chart.dataset.samples) >= 2),
+        'IOPS 和 I/O 利用率随同一轮采样自动追加历史');
+      assert([...$('server-info').querySelectorAll('.server-disk-latency-chart, [data-disk-metric="queueLength"]')]
+        .every(chart => Number(chart.dataset.samples) >= 2), '延迟和队列长度随同一轮采集自动追加历史');
+    }
+    findButton($('server-info'), '×').click(); await tick();
+    assert($('server-info').hidden && document.activeElement === infoButton(), '关闭服务器信息后焦点回到入口');
+    if (innerWidth === 1140) {
+      const count = previewCalls.filter(([type]) => type === 'server-info').length;
+      const samples = production.networkHistory.length;
+      const resourceSamples = production.resourceHistory.length;
+      const diskSamples = production.diskHistory.length;
+      await new Promise(resolve => setTimeout(resolve, 5200));
+      assert(previewCalls.filter(([type]) => type === 'server-info').length === count && production.networkHistory.length === samples &&
+        production.resourceHistory.length === resourceSamples && production.diskHistory.length === diskSamples,
+        '收起面板后 CPU、内存、网络和磁盘均不再采集或追加曲线数据');
+    }
     assert(getComputedStyle($('sidebar')).display === 'none' && !$('sidebar-sessions') && !$('sidebar-group-list'), '会话独占内容区域，移除重复会话与分组导航');
     await openHost(previewHosts[1]); await tick();
     const staging = active;

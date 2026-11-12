@@ -45,7 +45,8 @@
         return request('ssh:close', id);
       },
       input: sendTerminal('ssh:input'),
-      resize: sendTerminal('ssh:resize'), ack: notify('ssh:ack'), directory: (id) => request('ssh:directory', id)
+      resize: sendTerminal('ssh:resize'), ack: notify('ssh:ack'), directory: (id) => request('ssh:directory', id),
+      serverInfo: (id) => request('ssh:server-info', id)
     },
     editors:bind({list:'editors:list',open:'editors:open',prepare:'editors:prepare',close:'editors:close'}),
     forwards: bind({ list: 'forwards:list', save: 'forwards:save', remove: 'forwards:delete', start: 'forwards:start', stop: 'forwards:stop' }),

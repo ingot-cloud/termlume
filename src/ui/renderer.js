@@ -54,6 +54,8 @@ let forwardVersion = 0;
 let renderForwardPanel;
 let forwardPanelOpen = false;
 let filesOpen = false;
+let serverInfoOpen = false;
+let serverInfoRefresh;
 let vaultStatus = {};
 let touchIdAvailable = false;
 let draggedFileCount = 0;
@@ -463,6 +465,15 @@ function applyVaultState(state) {
   $('vault-lock').hidden = !state.locked;
   $('library-button').disabled = Boolean(state.locked);
   if (state.locked) {
+    serverInfoOpen = false;
+    stopServerInfoRefresh();
+    $('server-info').replaceChildren();
+    $('server-info').hidden = $('server-info').inert = true;
+    workspace.dataset.serverInfo = 'closed';
+    for (const tab of tabs.values()) {
+      tab.serverInfo = tab.networkHistory = tab.resourceHistory = tab.diskHistory = undefined;
+      tab.serverHistoryPaused = true;
+    }
     cancelTabDrag();
     for(const tab of tabs.values()){clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);tab.reconnectCancelled=true;}
     forwardRuns.clear(); forwardVersions.clear();recordingSessions.clear();
@@ -2741,6 +2752,8 @@ function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session'
   renderContext();
   renderFiles();
   if (filesOpen) ensureFiles(origin());
+  renderServerInfo();
+  if (serverInfoOpen) void loadServerInfo(origin(), true);
   if (tab?.kind === 'new') {
     $('quick-connect-search').value = tab.query;
     renderQuickConnect(tab);
@@ -3168,6 +3181,13 @@ function renderContext() {
   const shortcuts = button('快捷命令', () => openPalette('commands'));
   shortcuts.disabled = session?.status !== 'ready';
   controls.append(shortcuts);
+  if (api.ssh.serverInfo) {
+    const info = button('服务器信息', toggleServerInfo);
+    info.disabled = session?.status !== 'ready';
+    info.setAttribute('aria-expanded', String(serverInfoOpen && Boolean(session)));
+    info.setAttribute('aria-controls', 'server-info');
+    controls.append(info);
+  }
   const fileButton = button('文件', toggleFiles);
   fileButton.setAttribute('aria-expanded', String(filesOpen && Boolean(session)));
   fileButton.setAttribute('aria-controls', 'files');
@@ -3333,12 +3353,17 @@ function removeTab(tab) {
     if (active?.sessionId === tab.id || active?.id === tab.sessionId) {
       renderContext();
       renderFiles();
+      renderServerInfo();
     }
   }
 }
 
 function updateSession(tab, next, detail = '') {
   tab.status = next;
+  if (next !== 'ready') {
+    tab.serverInfo = tab.networkHistory = tab.resourceHistory = tab.diskHistory = undefined;
+    tab.serverHistoryPaused = true;
+  }
   if(next==='closed')recordingSessions.delete(tab.id);
   renderForwardPanel?.();
   tab.message = detail;
@@ -3369,6 +3394,10 @@ function updateSession(tab, next, detail = '') {
   }
   if (active === tab || origin() === tab) renderContext();
   if (filesOpen && origin() === tab) renderFiles();
+  if (origin() === tab) {
+    renderServerInfo();
+    if (next === 'ready' && serverInfoOpen) void loadServerInfo(tab);
+  }
   refreshTransferActions(tab.id);
   renderTabs();
 }
@@ -3520,10 +3549,334 @@ async function configureCommand(session, action, file) {
 
 function toggleFiles() {
   filesOpen = !filesOpen;
+  if (filesOpen) serverInfoOpen = false;
+  renderServerInfo();
   renderContext();
   renderFiles();
   if (filesOpen) ensureFiles(origin());
   else focusTerminal(active);
+}
+
+function toggleServerInfo() {
+  serverInfoOpen = !serverInfoOpen;
+  if (serverInfoOpen) filesOpen = false;
+  renderContext();
+  renderFiles();
+  renderServerInfo();
+  if (serverInfoOpen) {
+    void loadServerInfo(origin(), true);
+    $('server-info').querySelector('button')?.focus({ preventScroll: true });
+  } else {
+    $('session-actions').querySelector('[aria-controls="server-info"]')?.focus({ preventScroll: true });
+  }
+}
+
+function stopServerInfoRefresh() {
+  if (serverInfoRefresh) {
+    clearInterval(serverInfoRefresh.timer);
+    serverInfoRefresh.tab.serverHistoryPaused = true;
+  }
+  serverInfoRefresh = undefined;
+}
+
+function syncServerInfoRefresh(tab, open) {
+  if (!open || !readySession(tab)) { stopServerInfoRefresh(); return; }
+  const attempt = tab.attempts;
+  if (serverInfoRefresh?.tab === tab && serverInfoRefresh.attempt === attempt) return;
+  stopServerInfoRefresh();
+  const refresh = { tab, attempt };
+  refresh.timer = setInterval(() => {
+    if (serverInfoRefresh !== refresh) return;
+    if (!serverInfoOpen || $('server-info').hidden || origin() !== tab || !readySession(tab, attempt)) {
+      stopServerInfoRefresh();
+      return;
+    }
+    // loadServerInfo coalesces requests if a previous sample is still in flight.
+    void loadServerInfo(tab, true);
+  }, 5000);
+  serverInfoRefresh = refresh;
+}
+
+async function loadServerInfo(tab, refresh = false) {
+  if (!readySession(tab)) return;
+  if (tab.serverInfo?.loading || (!refresh && tab.serverInfo)) return;
+  const attempt = tab.attempts;
+  const refreshRun = serverInfoRefresh;
+  const collecting = () => refreshRun && serverInfoRefresh === refreshRun && serverInfoOpen &&
+    origin() === tab && !$('server-info').hidden;
+  const state = { ...tab.serverInfo, loading: true, error: '' };
+  tab.serverInfo = state;
+  if (origin() === tab) renderServerInfo();
+  try {
+    const source = await api.ssh.serverInfo(tab.id);
+    if (!readySession(tab, attempt) || tab.serverInfo !== state) return;
+    state.data = window.serverInfo.parse(source);
+    state.at = new Date();
+    if (collecting()) {
+      tab.networkHistory = window.serverInfo.appendNetworkHistory(tab.networkHistory,
+        state.data.network, state.at.getTime(), tab.serverHistoryPaused);
+      tab.resourceHistory = window.serverInfo.appendResourceHistory(tab.resourceHistory,
+        state.data, state.at.getTime(), tab.serverHistoryPaused);
+      tab.diskHistory = window.serverInfo.appendDiskHistory(tab.diskHistory,
+        state.data.diskIo, state.at.getTime(), tab.serverHistoryPaused);
+      tab.serverHistoryPaused = false;
+    }
+  } catch (error) {
+    if (!readySession(tab, attempt) || tab.serverInfo !== state) return;
+    state.error = message(error);
+    if (collecting()) tab.serverHistoryPaused = true;
+  } finally {
+    if (tab.serverInfo === state) {
+      state.loading = false;
+      if (origin() === tab) renderServerInfo();
+    }
+  }
+}
+
+function renderServerInfo() {
+  const panel = $('server-info');
+  const tab = origin();
+  const open = serverInfoOpen && Boolean(tab) && !vaultStatus.locked &&
+    (!active.connectionPage || active.connectionPage.hidden);
+  panel.hidden = panel.inert = !open;
+  workspace.dataset.serverInfo = open ? 'open' : 'closed';
+  syncServerInfoRefresh(tab, open);
+  if (!open) return;
+  const scrollTop = panel.dataset.session === tab.id ? panel.querySelector('.server-info-body')?.scrollTop || 0 : 0;
+  const networkExpanded = panel.dataset.session === tab.id && Boolean(panel.querySelector('.server-network-others')?.open);
+  const networkFocused = panel.dataset.session === tab.id &&
+    panel.querySelector('.server-network-others summary') === document.activeElement;
+  const state = tab.serverInfo || {};
+  const refresh = button('刷新', () => loadServerInfo(tab, true), 'outlined', '刷新服务器信息');
+  refresh.disabled = state.loading || !readySession(tab);
+  const close = button('×', toggleServerInfo, 'file-icon-button', '关闭服务器信息');
+  const heading = node('header', 'file-heading', chromeIcon('server'),
+    node('div', 'file-heading-title', node('strong', '', '服务器信息'), summaryText('small', tab.host.name)), refresh, close);
+  // Keep header controls mounted while sampling so keyboard focus survives refresh.
+  const oldHeader = panel.querySelector('header');
+  if (oldHeader && panel.dataset.session === tab.id) {
+    oldHeader.querySelector('[aria-label="刷新服务器信息"]').disabled = refresh.disabled;
+  } else {
+    panel.replaceChildren(heading);
+    panel.dataset.session = tab.id;
+  }
+  panel.querySelector('.server-info-body')?.remove();
+  const body = node('div', 'server-info-body');
+  panel.append(body);
+  const feedback = node('p', state.error ? 'danger' : 'muted',
+    !readySession(tab) ? '连接 SSH 后可查看服务器信息。' : state.error ? `采集失败：${state.error}` : state.loading && !state.data
+      ? '正在采集服务器信息…' : state.at ? `更新于 ${state.at.toLocaleTimeString()} · 每 5 秒自动刷新` : '准备采集…');
+  feedback.setAttribute('role', 'status');
+  body.append(feedback);
+  const data = state.data;
+  if (!data || !readySession(tab)) return;
+  if (state.error) body.append(node('p', 'muted', '以下为上次成功采集的数据。'));
+  const row = (label, value) => node('div', 'server-info-row', node('dt', '', label), node('dd', '', value || '暂不可用'));
+  const card = (label, ...content) => node('section', 'server-info-card', node('h3', '', label), ...content);
+  const details = (...content) => node('dl', 'server-info-details', ...content);
+  const size = value => Number.isFinite(value) ? bytes(value) : '暂不可用';
+  const usage = (label, value, detail) => {
+    const known = Number.isFinite(value);
+    const bar = node('div', 'server-info-meter', node('span'));
+    bar.setAttribute('role', 'meter');
+    bar.setAttribute('aria-label', label);
+    bar.setAttribute('aria-valuemin', '0');
+    bar.setAttribute('aria-valuemax', '100');
+    bar.setAttribute('aria-valuetext', known ? `${value.toFixed(1)}%` : '暂不可用');
+    if (known) bar.setAttribute('aria-valuenow', String(value));
+    else bar.classList.add('unavailable');
+    bar.firstChild.style.width = `${known ? value : 0}%`;
+    if (value >= 90) bar.classList.add('high');
+    return node('div', 'server-info-usage', node('div', 'server-info-value',
+      node('span', '', label), node('strong', '', known ? `${value.toFixed(1)}%` : '暂不可用')), bar,
+    ...(detail ? [node('small', 'muted', detail)] : []));
+  };
+  const uptime = Number.isFinite(data.uptime)
+    ? `${Math.floor(data.uptime / 86400)} 天 ${Math.floor(data.uptime % 86400 / 3600)} 小时 ${Math.floor(data.uptime % 3600 / 60)} 分钟` : '';
+  body.append(card('系统', details(row('主机名', data.hostname), row('系统', data.os),
+    row('内核', data.kernel), row('架构', data.architecture), row('运行时间', uptime))),
+  card('CPU', usage('CPU 使用率', data.cpuPercent), resourceHistoryChart(tab.resourceHistory, 'cpu'), details(row('型号', data.cpuModel),
+    row('逻辑核心', data.cpuCount ? `${data.cpuCount} 核` : ''), row('负载 · 1 / 5 / 15 分钟', data.load))),
+  card('内存', usage('内存使用率', data.memory.percent,
+    `已用 ${size(data.memory.used)} / 总计 ${size(data.memory.total)}`),
+    resourceHistoryChart(tab.resourceHistory, 'memory'),
+    details(row('可用内存', size(data.memory.available)),
+      row('交换空间', data.swap.total === undefined ? '暂不可用' : data.swap.total === 0 ? '未配置' : `${size(data.swap.used)} / ${size(data.swap.total)}`)),
+    node('small', 'muted', data.platform === 'Darwin' ? '可用内存按空闲与非活跃页估算。' : '已用内存按总量减可用量计算，包含可回收缓存的估算。')));
+  const network = card('网络');
+  if (!data.network.length) network.append(node('p', 'muted', '暂未获取到网络信息。'));
+  const networkEntry = entry => {
+    const speed = (label, value) => node('div', 'server-network-speed', node('span', 'muted', label),
+      node('strong', '', window.serverInfo.formatNetworkBytes(value, true)));
+    return node('div', 'server-info-network', node('strong', '', entry.name),
+      node('div', 'server-network-speeds', speed('↓ 下行（接收）', entry.downloadRate), speed('↑ 上行（发送）', entry.uploadRate)),
+      networkHistoryChart(tab.networkHistory, entry.name),
+      details(row('累计接收', window.serverInfo.formatNetworkBytes(entry.received)),
+        row('累计发送', window.serverInfo.formatNetworkBytes(entry.sent))));
+  };
+  if (data.network.length) network.append(networkEntry(data.network[0]));
+  if (data.network.length > 1) {
+    const others = node('details', 'server-network-others', node('summary', '', `其他网卡（${data.network.length - 1}）`),
+      node('div', 'server-network-other-list', ...data.network.slice(1).map(networkEntry)));
+    others.open = networkExpanded;
+    network.append(others);
+  }
+  network.append(node('small', 'muted', '速度为本次约 1 秒采样均值；累计为网卡计数，不含回环接口。'));
+  body.append(network);
+  const diskIo = card('磁盘读写');
+  if (!data.diskIo.length) diskIo.append(node('p', 'muted', '暂未获取到磁盘读写信息。'));
+  for (const entry of data.diskIo) {
+    const speed = (label, value) => node('div', 'server-network-speed', node('span', 'muted', label),
+      node('strong', '', window.serverInfo.formatNetworkBytes(value, true)));
+    diskIo.append(node('div', 'server-info-disk-io', node('strong', '', entry.name),
+      node('div', 'server-network-speeds', speed('读取', entry.readRate), speed('写入', entry.writeRate)),
+      diskHistoryChart(tab.diskHistory, entry.name),
+      node('div', 'server-network-speeds',
+        node('div', 'server-network-speed', node('span', 'muted', 'IOPS（读写合计）'), node('strong', '', formatIops(entry.iops))),
+        node('div', 'server-network-speed', node('span', 'muted', 'I/O 利用率'), node('strong', '', formatUtilization(entry.utilization)))),
+      diskMetricHistoryChart(tab.diskHistory, entry.name, 'iops'),
+      diskMetricHistoryChart(tab.diskHistory, entry.name, 'utilization'),
+      node('div', 'server-network-speeds',
+        node('div', 'server-network-speed', node('span', 'muted', '平均读取延迟'), node('strong', '', formatDiskDetail(entry.readLatency, 'ms'))),
+        node('div', 'server-network-speed', node('span', 'muted', '平均写入延迟'), node('strong', '', formatDiskDetail(entry.writeLatency, 'ms')))),
+      diskLatencyHistoryChart(tab.diskHistory, entry.name),
+      node('div', 'server-network-speed', node('span', 'muted', '平均 I/O 队列长度'), node('strong', '', formatDiskDetail(entry.queueLength, '个请求'))),
+      diskMetricHistoryChart(tab.diskHistory, entry.name, 'queueLength')));
+  }
+  diskIo.append(node('small', 'muted', '速度为本次约 1 秒采样均值；按块设备分别显示，不加总或重复统计分区。'));
+  diskIo.append(node('small', 'muted', 'IOPS 为每秒完成的读写次数；I/O 利用率按设备忙碌时间占比计算。'));
+  diskIo.append(node('small', 'muted', '延迟按采样期完成请求的平均耗时计算，无对应完成请求时暂不可用；队列长度为同期平均在途请求数。'));
+  if (data.platform === 'Darwin') diskIo.append(node('small', 'muted', '当前系统未提供设备忙碌时间与加权在途时间，I/O 利用率和平均队列长度暂不可用。'));
+  body.append(diskIo);
+  const storage = card('存储 · 本地文件系统');
+  if (!data.disks.length) storage.append(node('p', 'muted', '暂未获取到存储信息。'));
+  for (const disk of data.disks) storage.append(node('div', 'server-info-disk',
+    node('strong', '', disk.mount), node('small', 'muted', disk.device),
+    usage('存储使用率', disk.percent, `已用 ${size(disk.used)} / 总计 ${size(disk.total)} · 可用 ${size(disk.available)}`)));
+  body.append(storage);
+  if (networkFocused) panel.querySelector('.server-network-others summary')?.focus({ preventScroll: true });
+  body.scrollTop = scrollTop;
+}
+
+function networkHistoryChart(history, name) {
+  const model = window.serverInfo.networkChartModel(history, name);
+  return historyChart(history, model, { name, description: `${name} 最近 5 分钟上下行速度曲线`,
+    format: value => window.serverInfo.formatNetworkBytes(value, true),
+    series: [
+      { type: 'download', label: '下行', key: 'downloadRate', segments: model.download, peak: model.downloadPeak },
+      { type: 'upload', label: '上行', key: 'uploadRate', segments: model.upload, peak: model.uploadPeak }
+    ] });
+}
+
+function diskHistoryChart(history, name) {
+  const model = window.serverInfo.diskChartModel(history, name);
+  const figure = historyChart(history, model, { name, description: `${name} 最近 5 分钟磁盘读写速度曲线`,
+    format: value => window.serverInfo.formatNetworkBytes(value, true),
+    series: [
+      { type: 'download', label: '读取', key: 'readRate', segments: model.read, peak: model.readPeak },
+      { type: 'upload', label: '写入', key: 'writeRate', segments: model.write, peak: model.writePeak }
+    ] });
+  figure.classList.add('server-disk-chart');
+  return figure;
+}
+
+function formatIops(value) {
+  if (!Number.isFinite(value)) return '暂不可用';
+  const scale = value >= 1e6 ? 1e6 : value >= 1e3 ? 1e3 : 1;
+  return `${Number((value / scale).toFixed(1))} ${scale === 1e6 ? 'M' : scale === 1e3 ? 'k' : ''}IOPS`;
+}
+
+function formatUtilization(value) {
+  return Number.isFinite(value) ? `${Number(value.toFixed(1))}%` : '暂不可用';
+}
+
+function formatDiskDetail(value, unit) {
+  if (!Number.isFinite(value)) return '暂不可用';
+  return `${value > 0 && value < .001 ? '<0.001' : Number(value.toFixed(3))} ${unit}`;
+}
+
+function diskLatencyHistoryChart(history, name) {
+  const model = window.serverInfo.diskLatencyChartModel(history, name);
+  const figure = historyChart(history, model, { name, description: `${name} 最近 5 分钟平均读写延迟曲线`,
+    format: value => formatDiskDetail(value, 'ms'), emptyText: '暂无有效延迟采样',
+    series: [
+      { type: 'download', label: '读取延迟', key: 'readLatency', segments: model.read, peak: model.readPeak },
+      { type: 'upload', label: '写入延迟', key: 'writeLatency', segments: model.write, peak: model.writePeak }
+    ] });
+  figure.classList.add('server-disk-latency-chart');
+  return figure;
+}
+
+function diskMetricHistoryChart(history, name, metric) {
+  const model = window.serverInfo.diskMetricChartModel(history, name, metric);
+  const { label, format } = {
+    iops: { label: 'IOPS', format: formatIops },
+    utilization: { label: 'I/O 利用率', format: formatUtilization },
+    queueLength: { label: '平均 I/O 队列长度', format: value => formatDiskDetail(value, '个请求') }
+  }[metric];
+  const figure = historyChart(history, model, { name, description: `${name} 最近 5 分钟${label}曲线`,
+    format,
+    series: [{ type: 'download', label, key: metric, segments: model.series, peak: model.peak }],
+    emptyText: `暂无有效${label}采样` });
+  figure.classList.add('server-disk-metric-chart');
+  figure.dataset.diskMetric = metric;
+  return figure;
+}
+
+function resourceHistoryChart(history, metric) {
+  const model = window.serverInfo.resourceChartModel(history, metric);
+  const label = metric === 'cpu' ? 'CPU' : '内存';
+  const figure = historyChart(history, model, { name: metric, description: `${label} 最近 5 分钟使用率曲线`,
+    format: value => Number.isFinite(value) ? `${Number(value.toFixed(1))}%` : '暂不可用',
+    series: [{ type: 'download', label: '使用率', key: 'percent', segments: model.series, peak: model.peak }] });
+  figure.classList.add('server-usage-chart');
+  figure.dataset.metric = metric;
+  return figure;
+}
+
+function historyChart(history, model, { name, description, format, series, emptyText = '等待有效采样以绘制曲线' }) {
+  const figure = node('figure', 'server-network-chart');
+  const legend = (label, type) => node('span', `network-chart-key ${type}`, node('i'), label);
+  figure.append(node('figcaption', '', node('span', '', '最近 5 分钟'),
+    node('span', 'network-chart-legend', ...series.map(entry => legend(entry.label, entry.type)))));
+  const svgElement = (tag, attributes = {}) => {
+    const element = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
+    return element;
+  };
+  const svg = svgElement('svg', { viewBox: '0 0 300 112', preserveAspectRatio: 'none', role: 'img',
+    'aria-label': `${description}，${model.count} 个采样点；${series.map(entry => `${entry.label}峰值 ${format(entry.peak)}`).join('，')}` });
+  const x = at => 2 + (at - model.start) / (model.end - model.start) * 296;
+  const y = value => 108 - value / model.maximum * 104;
+  for (const value of [0, model.maximum / 2, model.maximum]) {
+    svg.append(svgElement('line', { x1: 0, x2: 300, y1: y(value), y2: y(value), class: 'network-chart-grid', 'vector-effect': 'non-scaling-stroke' }));
+  }
+  for (const { type, segments } of series) {
+    const path = segments.map(segment => segment.map((point, index) =>
+      `${index ? 'L' : 'M'}${x(point.at).toFixed(2)},${y(point.value).toFixed(2)}`).join(' ')).join(' ');
+    svg.append(svgElement('path', { d: path, class: `network-chart-line ${type}`, 'vector-effect': 'non-scaling-stroke' }));
+    for (const segment of segments) {
+      const point = segment.at(-1);
+      svg.append(svgElement('circle', { cx: x(point.at), cy: y(point.value), r: 2.5,
+        class: `network-chart-dot ${type}` }));
+    }
+  }
+  for (const sample of history || []) {
+    const value = sample.values[name];
+    if (sample.at < model.start || sample.at > model.end || !value) continue;
+    const hit = svgElement('rect', { x: x(sample.at) - 2, y: 0, width: 4, height: 112, fill: 'transparent' });
+    const title = svgElement('title');
+    title.textContent = `${new Date(sample.at).toLocaleTimeString()} · ${series.map(entry => `${entry.label} ${format(value[entry.key])}`).join(' · ')}`;
+    hit.append(title);
+    svg.append(hit);
+  }
+  const axis = node('div', 'network-chart-y', ...[model.maximum, model.maximum / 2, 0].map(value =>
+    node('span', '', model.count ? format(value) : '—')));
+  figure.append(node('div', 'network-chart-plot', axis, svg),
+    node('div', 'network-chart-x', node('span', '', '5 分钟前'), node('span', '', '现在')),
+    node('small', 'muted network-chart-note', model.count ? `${model.count} 个采样点 · 空档为未采集时段` : emptyText));
+  figure.dataset.samples = model.count;
+  return figure;
 }
 
 function readySession(tab, attempt = tab?.attempts) {
@@ -3621,6 +3974,8 @@ async function openTerminalPath(source, candidate, inspected) {
       focusTerminal(tab);
     } else if (choice === 'browse') {
       filesOpen = true;
+      serverInfoOpen = false;
+      renderServerInfo();
       renderContext();
       await loadFiles(tab, path);
     }
@@ -4579,6 +4934,7 @@ $('close-find').addEventListener('click', () => {
 window.addEventListener('keydown', (event) => {
   if (event.defaultPrevented || event.isComposing || dialog.open || fileEditor.open || $('key-dialog').open || sessionSwitcher.open || vaultStatus.locked || hostMenu) return;
   if (event.key === 'Escape' && !$('terminal-find').hidden) { event.preventDefault(); $('close-find').click(); return; }
+  if (event.key === 'Escape' && serverInfoOpen && $('server-info').contains(document.activeElement)) { event.preventDefault(); toggleServerInfo(); return; }
   if (!event.metaKey || event.ctrlKey || event.altKey) return;
   const key = event.key.toLowerCase();
   if (key === 'b' && !event.shiftKey) { event.preventDefault(); toggleNav.click(); return; }

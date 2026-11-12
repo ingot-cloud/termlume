@@ -139,6 +139,9 @@ async fn auto_lock_settings_respect_activity_and_survive_restart() {
         15
     );
     *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(14 * 60);
+    let inactive_since = *ws.last_activity.lock().unwrap();
+    assert!(dispatch(&ws, "ssh:server-info", json!(Uuid::new_v4())).await.is_err());
+    assert_eq!(*ws.last_activity.lock().unwrap(), inactive_since);
     assert_eq!(ws.lock(true)["locked"], false);
     let state = call(&ws, "vault:set-auto-lock", json!(5)).await;
     assert_eq!(state["autoLockMinutes"], 5);
@@ -609,6 +612,24 @@ async fn macos_transport_migration_and_sync() {
     let mut rx = events(&ws);
     let first = connect_tab(&ws, &mut rx, &host1, "", false, false).await;
     let second = connect_tab(&ws, &mut rx, &host2, "fixture key passphrase", false, false).await;
+    let info = call(&ws, "ssh:server-info", json!(second)).await;
+    let info = info.as_str().unwrap();
+    assert!(info.contains("__TERMLUME_INFO__platform\nDarwin\n"));
+    assert!(info.contains("__TERMLUME_INFO__architecture\narm64\n"));
+    assert!(info.contains("__TERMLUME_INFO__disks\n"));
+    assert!(info.contains("__TERMLUME_INFO__networkBefore\n"));
+    assert!(info.contains("__TERMLUME_INFO__networkAfter\n"));
+    assert!(info.contains("Ibytes"));
+    assert!(info.contains("Obytes"));
+    assert!(info.contains("__TERMLUME_INFO__diskIoBefore\n"));
+    assert!(info.contains("__TERMLUME_INFO__diskIoAfter\n"));
+    assert!(info.contains("\"Bytes (Read)\"="));
+    assert!(info.contains("\"Bytes (Write)\"="));
+    assert!(info.contains("\"Operations (Read)\"="));
+    assert!(info.contains("\"Operations (Write)\"="));
+    assert!(info.contains("\"Total Time (Read)\"="));
+    assert!(info.contains("\"Total Time (Write)\"="));
+    assert!(info.trim_end().ends_with("__TERMLUME_INFO__end\nok"));
     call(
         &ws,
         "ssh:resize",

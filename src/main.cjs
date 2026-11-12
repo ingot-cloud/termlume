@@ -257,6 +257,7 @@ const resources = new Map([
   ['/index.html', [path.join(rendererDir, 'index.html'), 'text/html']],
   ['/style.css', [path.join(rendererDir, 'style.css'), 'text/css']],
   ['/workspace-state.js',[path.join(rendererDir,'workspace-state.js'),'text/javascript']],
+  ['/server-info.js', [path.join(rendererDir, 'server-info.js'), 'text/javascript']],
   ['/renderer.js', [path.join(rendererDir, 'renderer.js'), 'text/javascript']],
   ['/dropdown.js', [path.join(rendererDir, 'dropdown.js'), 'text/javascript']],
   ['/overlays.js', [path.join(rendererDir, 'overlays.js'), 'text/javascript']],
@@ -337,7 +338,7 @@ function handle(name, fn) {
   ipcMain.handle(name, (event, request) => {
     if (!verified(event)) throw new Error('工作台请求来源无效。');
     if (!store.data && !['vault:state', 'vault:unlock'].includes(name)) throw new Error('请先解锁保险库。');
-    lastActivity = Date.now();
+    if (name !== 'ssh:server-info') lastActivity = Date.now();
     return fn(request);
   });
 }
@@ -761,6 +762,7 @@ function registerHandlers() {
   listen('ssh:resize', ({ id, size }) => ssh.resize(id, size));
   listen('ssh:ack', (id) => ssh.acknowledge(id));
   handle('ssh:directory', (id) => ssh.directory(id));
+  handle('ssh:server-info', (id) => ssh.serverInfo(id));
 
   handle('commands:preview', commandFor);
   handle('commands:start', ({ id, sessionId, request }) => ssh.command(checkId(id), sessionId, request));

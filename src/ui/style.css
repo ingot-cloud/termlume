@@ -225,6 +225,55 @@ code, kbd { font-family: SFMono-Regular, Menlo, monospace; font-size: 12px; }
 #session-actions button[aria-expanded="true"] { background: var(--selected); }
 #content { --files-width: clamp(310px, 36%, 440px); --files-motion: 220ms; position: relative; isolation: isolate; overflow: hidden; min-width: 0; min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr); background: var(--terminal); }
 #workspace[data-files="open"] #content { grid-template-columns: minmax(0, 1fr) var(--files-width); }
+#workspace[data-server-info="open"] #content { grid-template-columns: minmax(0, 1fr) var(--files-width); }
+#server-info { position: absolute; z-index: 4; inset: 0 0 0 auto; width: var(--files-width); display: flex; flex-direction: column; min-height: 0; background: var(--bg); border-left: 1px solid var(--border); }
+#server-info .file-heading { flex-shrink: 0; }
+.server-info-body { min-height: 0; overflow: auto; padding: 12px; display: grid; gap: 12px; }
+.server-info-body > p { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+.server-info-card { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--bar); display: grid; gap: 12px; }
+.server-info-card h3 { margin: 0; font-size: 13px; }
+.server-info-details { display: grid; gap: 8px; margin: 0; font-size: 12px; }
+.server-info-row { display: grid; grid-template-columns: minmax(68px, .65fr) minmax(0, 1.5fr); gap: 12px; }
+.server-info-row dt { color: var(--muted); }
+.server-info-row dd { margin: 0; overflow-wrap: anywhere; }
+.server-info-value { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+.server-info-value strong { font-variant-numeric: tabular-nums; }
+.server-info-usage { display: grid; gap: 6px; }
+.server-info-usage small { overflow-wrap: anywhere; }
+.server-info-meter { height: 7px; overflow: hidden; border-radius: 4px; background: var(--selected); }
+.server-info-meter > span { display: block; height: 100%; background: var(--accent); border-radius: inherit; }
+.server-info-meter.high > span { background: var(--warning); }
+.server-info-disk { display: grid; gap: 6px; min-width: 0; font-size: 12px; }
+.server-info-disk > :is(strong, small) { overflow-wrap: anywhere; }
+.server-info-disk + .server-info-disk { padding-top: 12px; border-top: 1px solid var(--border); }
+.server-info-network, .server-info-disk-io { display: grid; gap: 10px; min-width: 0; font-size: 12px; }
+.server-info-network > strong, .server-info-disk-io > strong { overflow-wrap: anywhere; }
+.server-info-network + .server-info-network, .server-info-disk-io + .server-info-disk-io { padding-top: 12px; border-top: 1px solid var(--border); }
+.server-network-speeds { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.server-network-speed { display: grid; gap: 4px; min-width: 0; padding: 10px; border-radius: var(--radius-control); background: var(--bg); overflow-wrap: anywhere; }
+.server-network-speed strong { color: var(--accent); font-size: 16px; font-variant-numeric: tabular-nums; }
+.server-network-others { border-top: 1px solid var(--border); padding-top: 8px; }
+.server-network-others summary { min-height: var(--control-compact); cursor: pointer; color: var(--muted); font-size: 12px; }
+.server-network-other-list { display: grid; gap: 12px; padding-top: 8px; }
+.server-network-chart { --network-upload: #9bc4ff; margin: 0; min-width: 0; display: grid; gap: 5px; }
+:root[data-theme="light"] .server-network-chart { --network-upload: #2563a6; }
+.server-network-chart figcaption { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; color: var(--muted); font-size: 11px; }
+.network-chart-legend { display: flex; gap: 10px; }
+.network-chart-key { display: inline-flex; align-items: center; gap: 4px; }
+.network-chart-key i { width: 14px; border-top: 2px solid var(--accent); }
+.network-chart-key.upload i { border-color: var(--network-upload); border-top-style: dashed; }
+.network-chart-plot { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 6px; min-width: 0; }
+.network-chart-y { display: flex; flex-direction: column; justify-content: space-between; min-width: 0; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.network-chart-y span { overflow-wrap: anywhere; }
+.network-chart-plot svg { display: block; width: 100%; height: 112px; overflow: visible; }
+.network-chart-grid { stroke: var(--border); stroke-width: 1; }
+.network-chart-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.network-chart-line.download { stroke: var(--accent); }
+.network-chart-line.upload { stroke: var(--network-upload); stroke-dasharray: 5 3; }
+.network-chart-dot.download { fill: var(--accent); }
+.network-chart-dot.upload { fill: var(--network-upload); }
+.network-chart-x { display: flex; justify-content: space-between; gap: 8px; padding-left: 70px; color: var(--muted); font-size: 10px; }
+.network-chart-note { font-size: 10px; }
 #terminal-stage { --pane-min-height: min(90px, calc(50% - 4px)); position: relative; display: grid; min-width: 0; min-height: 0; background: var(--terminal); }
 #terminal-views, .terminal-view { position: absolute; inset: 0; overflow: hidden; }
 .terminal-view { padding: 12px 10px 8px 14px; background: var(--terminal-background, var(--terminal)); }
@@ -628,6 +677,8 @@ body.vault-locked > :not(#vault-lock, .titlebar), body.vault-locked .titlebar > 
   #content { --files-height: min(65%, 290px); }
   #content:has(#terminal-views:is([data-split="vertical"], [data-split="grid"], [data-split="tree"])) { --files-height: min(65%, 290px, max(0px, calc(100% - 187px))); }
   #workspace[data-files="open"] #content { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) var(--files-height); }
+  #workspace[data-server-info="open"] #content { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) var(--files-height); }
+  #server-info { top: auto; width: 100%; height: var(--files-height); border-left: 0; border-top: 1px solid var(--border); }
   #files { top: auto; width: 100%; height: var(--files-height); border-left: 0; border-top: 1px solid var(--border); transform: translateY(100%); }
 }
 @media (prefers-reduced-motion: reduce) {
