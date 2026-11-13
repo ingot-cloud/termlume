@@ -1,5 +1,10 @@
 # Termlume
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/logo-on-dark.svg">
+  <img src="assets/brand/logo.svg" alt="Termlume Logo" width="300">
+</picture>
+
 Termlume 把主机列表、SSH 终端、SFTP 文件和日志输出放在同一个桌面窗口里。项目约定集中在以下文档：
 
 - [产品规划与跟进](PRODUCT_PLAN.md)：功能对比、当前状态、任务编号、优先级和验收条件。P1/P2 已按统一批次实现，人工验收与后续扩展见跟进表。

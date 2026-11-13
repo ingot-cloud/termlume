@@ -561,6 +561,13 @@
       delete production.host.terminalTheme;
       uiPreferences.terminalTheme = theme; applyPreferences(); await tick();
       assert(terminalBackgroundMatches(production), `${theme} 终端底部余量与渲染内容同色，没有默认黑条`);
+      const terminalColors = { ...production.terminal.options.theme };
+      const previousUITheme = uiPreferences.theme;
+      uiPreferences.theme = previousUITheme === 'dark' ? 'light' : 'dark'; applyPreferences();
+      assert(['background', 'foreground', 'cursor', 'selectionBackground'].every(key =>
+        production.terminal.options.theme[key] === terminalColors[key]),
+        `${theme} 终端背景、文字、光标与选区保持独立，不随应用主题改变`);
+      uiPreferences.theme = previousUITheme; applyPreferences();
     }
     uiPreferences.terminalTheme = 'dark';
     production.host.terminalTheme = 'dark'; staging.host.terminalTheme = 'light'; applyPreferences();

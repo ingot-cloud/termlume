@@ -427,6 +427,24 @@ async function main() {
     await js("document.getElementById('smoke-results').hidden=true");
     for (const theme of ['dark', 'light']) {
       await js(`uiPreferences.theme='${theme}';applyPreferences();selectTab(undefined,'hosts')`); await tick();
+      const contrast = await js(`(() => {
+        const styles=getComputedStyle(document.documentElement);
+        const color=name=>styles.getPropertyValue('--'+name).trim();
+        const luminance=value=>{
+          const channels=value.slice(1).match(/../g).slice(0,3).map(v=>parseInt(v,16)/255)
+            .map(v=>v<=.04045?v/12.92:((v+.055)/1.055)**2.4);
+          return channels.reduce((sum,v,i)=>sum+v*[.2126,.7152,.0722][i],0);
+        };
+        const ratio=(a,b)=>{const [low,high]=[luminance(color(a)),luminance(color(b))].sort((a,b)=>a-b);return(high+.05)/(low+.05)};
+        const pairs=['bg','bar','raise','selected'].flatMap(surface=>
+          ['text','muted','accent','success','warning','danger'].map(ink=>[ink,surface]));
+        pairs.push(...['primary','primary-hover','primary-active'].map(bg=>['primary-text',bg]),
+          ['resource-fg','resource-bg'],['group-fg','group-bg'],
+          ['terminal-dark-text','terminal-dark'],['terminal-light-text','terminal-light']);
+        return pairs.map(([ink,bg])=>({ink,bg,ratio:ratio(ink,bg)}));
+      })()`);
+      assert(contrast.every(pair=>Number.isFinite(pair.ratio)&&pair.ratio>=4.5),
+        `${theme} theme text, states and button colors must retain 4.5:1 contrast: ${JSON.stringify(contrast.filter(pair=>!Number.isFinite(pair.ratio)||pair.ratio<4.5))}`);
       await overflow();
       for (const selector of ['.host-quick-edit','.host-edit:last-child']) {
         await run('Input.dispatchMouseEvent', {type:'mouseMoved',x:0,y:0});

@@ -10,6 +10,7 @@
     "electron:dev": "electron .",
     "test": "node --test",
     "test:ui": "node scripts/check-ui.cjs",
+    "brand:icons": "node scripts/brand-icons.cjs",
     "tauri:assets": "node scripts/tauri-assets.cjs",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",

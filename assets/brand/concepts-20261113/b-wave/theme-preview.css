@@ -1,0 +1,3 @@
+:root,:root[data-theme="dark"]{--chrome:#24212E;--bg:#17151E;--bar:#1E1B28;--raise:#2B2639;--border:#423A54;--text:#F2EEFC;--muted:#B9AFC9;--selected:#383044;--surface-hover:#332C40;--accent:#C6AEFF;--accent-soft:#C6AEFF1C;--primary:#C3ACEE;--primary-hover:#D5C3F7;--primary-border:#D5BEFF;--resource-fg:#E3C7F7;--resource-bg:#3D2C4A;--group-fg:#D7CAFB;--group-bg:#352E49;--terminal:#121018;--terminal-text:#EEE9F5;--terminal-selection:#423452;--success:#8EDAB4;--warning:#F0CE86;--danger:#FFACA6;--danger-soft:#FFACA618;}
+.primary{color:#21162F;}
+.brand-mark{color:var(--accent);}

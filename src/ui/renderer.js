@@ -1354,12 +1354,19 @@ async function manageTrust(page) {
   }
 }
 
+function terminalThemeFor(host) {
+  const light = (host?.terminalTheme || uiPreferences.terminalTheme) === 'light';
+  const styles = getComputedStyle(document.documentElement);
+  const prefix = `--terminal-${light ? 'light' : 'dark'}`;
+  const color = suffix => styles.getPropertyValue(prefix + suffix).trim();
+  const ansi=light?{black:'#2d2230',brightBlack:'#796b78',red:'#b73535',brightRed:'#b73535',green:'#187447',brightGreen:'#187447',yellow:'#8b650b',brightYellow:'#8b650b',blue:'#285eb2',brightBlue:'#285eb2',magenta:'#a13d70',brightMagenta:'#a13d70',cyan:'#0c7180',brightCyan:'#0c7180',white:'#766872',brightWhite:'#2d2230'}:{black:'#756675',brightBlack:'#bbafbe',red:'#f58291',brightRed:'#ffacb7',green:'#84d5a4',brightGreen:'#a2e9bb',yellow:'#e7c47d',brightYellow:'#ffdb97',blue:'#83aff6',brightBlue:'#a6c7ff',magenta:'#f58cb8',brightMagenta:'#ffc2db',cyan:'#7ccedb',brightCyan:'#a0e7f0',white:'#e1d3de',brightWhite:'#fff4fb'};
+  return { ...ansi, background: color(''), foreground: color('-text'), cursor: color('-cursor'), selectionBackground: color('-selection') };
+}
 function applyTerminalPreferences(tab) {
-  if(!tab?.terminal)return;const light=(tab.host?.terminalTheme||uiPreferences.terminalTheme)==='light';
-  const background=light?'#f7f8fb':'#11161f';
-  tab.view.style.setProperty('--terminal-background',background);
-  const ansi=light?{black:'#273444',brightBlack:'#5c6878',red:'#b73535',brightRed:'#b73535',green:'#187447',brightGreen:'#187447',yellow:'#8b650b',brightYellow:'#8b650b',blue:'#285eb2',brightBlue:'#285eb2',magenta:'#8c3fab',brightMagenta:'#8c3fab',cyan:'#0c7180',brightCyan:'#0c7180',white:'#677387',brightWhite:'#172238'}:{black:'#596578',brightBlack:'#9aa9d7',red:'#f58291',brightRed:'#ffacb7',green:'#84d5a4',brightGreen:'#a2e9bb',yellow:'#e7c47d',brightYellow:'#ffdb97',blue:'#83aff6',brightBlue:'#a6c7ff',magenta:'#c9a2f4',brightMagenta:'#e0bfff',cyan:'#7ccedb',brightCyan:'#a0e7f0',white:'#d3dceb',brightWhite:'#f4f7fc'};
-  tab.terminal.options.theme={...ansi,background,foreground:light?'#172238':'#e8edf6',cursor:light?'#147d55':'#4bce95',selectionBackground:light?'#b9d8d3':'#30534e'};
+  if (!tab?.terminal) return;
+  const theme = terminalThemeFor(tab.host);
+  tab.view.style.setProperty('--terminal-background', theme.background);
+  tab.terminal.options.theme = theme;
 }
 function applyPreferences(fonts = false) {
   document.documentElement.dataset.theme=uiPreferences.theme==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):uiPreferences.theme;
@@ -2619,18 +2626,10 @@ function attachTerminal(tab) {
   const view = node('div', 'terminal-view', surface);
   view.hidden = true;
   $('terminal-views').append(view);
-  const styles = getComputedStyle(document.documentElement);
-  const color = (name) => styles.getPropertyValue(name).trim();
   const terminal = new Terminal({
     fontFamily: uiPreferences.fontFamily, fontSize: uiPreferences.fontSize, lineHeight: 1.2, scrollback: 6000,
     cursorBlink: tab.kind === 'shell', disableStdin: tab.kind === 'command',
-    convertEol: tab.kind === 'command', allowProposedApi: true, minimumContrastRatio: 4.5, theme: {
-      background: color('--terminal'), foreground: color('--terminal-text'), cursor: color('--accent'), selectionBackground: color('--terminal-selection'),
-      black: '#596578', brightBlack: '#9aa9bf', red: '#f58291', brightRed: '#ffacb7',
-      green: '#84d5a4', brightGreen: '#a2e9bb', yellow: '#e7c47d', brightYellow: '#ffdb97',
-      blue: '#83aff6', brightBlue: '#a6c7ff', magenta: '#c9a2f4', brightMagenta: '#e0bfff',
-      cyan: '#7ccedb', brightCyan: '#a0e7f0', white: '#d3dceb', brightWhite: '#f4f7fc'
-    }
+    convertEol: tab.kind === 'command', allowProposedApi: true, minimumContrastRatio: 4.5, theme: terminalThemeFor(tab.host)
   });
   const fit = new FitAddon.FitAddon();
   const search = new SearchAddon.SearchAddon();
