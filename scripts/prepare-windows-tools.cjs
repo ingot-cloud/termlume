@@ -8,8 +8,10 @@ const root = path.resolve(__dirname, '..');
 const digest = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
 function verifyArchive(file, spec) {
-  if (fs.statSync(file).size !== spec.size || digest(file) !== spec.sha256) {
-    throw new Error(`${spec.archive}: official archive SHA-256/size mismatch`);
+  const size = fs.statSync(file).size;
+  const sha256 = digest(file);
+  if (size !== spec.size || sha256 !== spec.sha256) {
+    throw new Error(`${spec.archive}: official archive SHA-256/size mismatch (expected ${spec.size} bytes / ${spec.sha256}; got ${size} bytes / ${sha256})`);
   }
 }
 

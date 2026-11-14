@@ -87,3 +87,14 @@ jobs:
         run: node scripts/tauri-before-build.cjs
       - name: Run native unit tests
         run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml --target "$BUILD_TARGET" --lib
+      - name: Build Windows offline installer
+        if: runner.os == 'Windows'
+        run: |
+          node -e 'require("node:fs").rmSync("src-tauri/target/"+process.env.BUILD_TARGET+"/release/bundle",{recursive:true,force:true})'
+          npm run tauri:build -- --target "$BUILD_TARGET" --bundles nsis --ci -- --locked
+      - name: Test WebView2 installer decisions
+        if: runner.os == 'Windows'
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -File scripts/test-webview2-installer.ps1
+      - name: Audit final Windows installer and package
+        if: runner.os == 'Windows'
+        run: node scripts/package-release.cjs windows-x64

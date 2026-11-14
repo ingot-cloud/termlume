@@ -50,6 +50,24 @@ function packageMac(bundle, archive, temporary, version) {
     signing: 'ad-hoc', notarized: false };
 }
 
+function findWebView2Installer(files) {
+  const runtime = files.filter(name => /^MicrosoftEdgeWebView2RuntimeInstaller(?:X64)?\.exe$/i.test(path.basename(name)));
+  if (runtime.length !== 1) throw new Error('NSIS must embed exactly one complete WebView2 installer');
+  return runtime[0];
+}
+
+function auditWindowsBundle(extracted) {
+  const webview = require('./webview2.lock.json');
+  const runtime = findWebView2Installer(filesIn(extracted));
+  require('./prepare-windows-tools.cjs').verifyArchive(path.join(extracted, runtime), webview);
+  const audit = require('./verify-windows-tools.cjs').audit(path.join(extracted, 'tools/windows'));
+  const executable = path.join(extracted, 'termlume.exe');
+  const imports = require('./verify-windows-tools.cjs').imports(executable);
+  if (imports.some(name => /^(?:vcruntime|msvcp|concrt)\d/i.test(name))) throw new Error('App requires a separately installed VC++ runtime');
+  return { ...audit, architecture: 'x64', webview2Sha256: webview.sha256,
+    embeddedOfflineInstallerVerified: true, applicationImports: imports };
+}
+
 function packageWindows(bundle, installer, archive, temporary, version) {
   const nsis = path.join(bundle, 'nsis');
   const installers = fs.readdirSync(nsis).filter(name => name.endsWith('.exe'));
@@ -58,15 +76,7 @@ function packageWindows(bundle, installer, archive, temporary, version) {
   fs.copyFileSync(path.join(nsis, installers[0]), installer);
   const extracted = path.join(temporary, 'unpacked');
   run('7z', ['x', installer, `-o${extracted}`, '-y']);
-  const files = filesIn(extracted);
-  const webview = require('./webview2.lock.json');
-  const runtime = files.filter(name => /webview2.*\.exe$/i.test(name));
-  if (runtime.length !== 1) throw new Error('NSIS must embed exactly one complete WebView2 installer');
-  require('./prepare-windows-tools.cjs').verifyArchive(path.join(extracted, runtime[0]), webview);
-  const audit = require('./verify-windows-tools.cjs').audit(path.join(extracted, 'tools/windows'));
-  const executable = path.join(extracted, 'termlume.exe');
-  const imports = require('./verify-windows-tools.cjs').imports(executable);
-  if (imports.some(name => /^(?:vcruntime|msvcp|concrt)\d/i.test(name))) throw new Error('App requires a separately installed VC++ runtime');
+  const audit = auditWindowsBundle(extracted);
   run('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-File',
     path.join(__dirname, 'test-windows-bundled-tools.ps1'), '-InstallDir', extracted]);
   const contents = path.join(temporary, 'zip');
@@ -76,8 +86,7 @@ function packageWindows(bundle, installer, archive, temporary, version) {
     'Termlume Windows x64\r\nRun the included setup.exe to install.\r\nGit, OpenSSH and the complete WebView2 offline installer are embedded.\r\nNo downloads are needed for installation or local workspace use.\r\nSSH/SFTP and remote Git require access to your servers.\r\n');
   run('7z', ['a', '-tzip', archive, '.'], { cwd: contents });
   run('7z', ['t', archive]);
-  return { ...audit, architecture: 'x64', webview2Sha256: webview.sha256,
-    embeddedOfflineInstallerVerified: true, bundledToolsExecuted: true, applicationImports: imports, signing: 'unsigned' };
+  return { ...audit, bundledToolsExecuted: true, signing: 'unsigned' };
 }
 
 function packageRelease(platform, { bundleDirectory, outputDirectory = path.join(root, 'dist/release') } = {}) {
@@ -136,7 +145,7 @@ function verifyAssets(directory, tag, expectedCommit = process.env.RELEASE_COMMI
   return all;
 }
 
-module.exports = { specification, packageRelease, verifyAssets, bundleManifest };
+module.exports = { specification, packageRelease, verifyAssets, bundleManifest, findWebView2Installer, auditWindowsBundle };
 if (require.main === module) {
   try {
     if (process.argv[2] === 'verify') console.log(`Verified ${verifyAssets(path.join(root, 'dist/release'), process.argv[3]).length} assets; SHA256SUMS ready`);

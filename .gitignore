@@ -6,3 +6,4 @@ dist/
 /src-tauri/gen/schemas/
 /src-tauri/vendor/windows/
 /src-tauri/vendor/macos/
+/src-tauri/vendor/webview2/

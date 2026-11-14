@@ -1,7 +1,8 @@
 {
   "bundle": {
     "windows": {
-      "webviewInstallMode": { "type": "offlineInstaller", "silent": true }
+      "webviewInstallMode": { "type": "skip" },
+      "nsis": { "installerHooks": "windows/hooks.nsh" }
     },
     "resources": {
       "vendor/windows/": "tools/windows/"

@@ -32,7 +32,7 @@ macOS 沿用当前临时签名，没有 Developer ID 正式签名或 Apple 公�
 ## 检查与补跑
 
 - 运行 Node 测试、深浅主题和大小窗口界面回归，再使用 `macos-15` arm64 / `windows-2025` x64 构建并运行 Rust 单元测试。使用 `npm ci` 和 Cargo `--locked`。
-- Git、OpenSSH、WebView2 按锁文件校验。Windows 校验最终 NSIS 内嵌的完整 WebView2、工具资源与 DLL 依赖，运行包内 Git/SSH 自检；macOS 校验签名、系统库依赖、ZIP 解压后的逐文件一致及可执行权限，并在禁止网络的子进程中运行 Git。
+- Git、OpenSSH、WebView2 按锁文件校验。Windows 通过安装钩子嵌入锁定且校验过的 WebView2 文件，校验最终 NSIS 内嵌文件、工具资源与 DLL 依赖，运行包内 Git/SSH 自检及六种安装钩子场景；macOS 校验签名、系统库依赖、ZIP 解压后的逐文件一致及可执行权限，并在禁止网络的子进程中运行 Git。
 - 两平台都成功后统一上传；再次核对产物、摘要、版本与提交，检查远端标签未被移动。各平台包也保留在 Actions Artifacts 中 14 天。
 - 使用自动提供的 `GITHUB_TOKEN`，无需个人 Token。测试和构建只有 `contents: read`，上传作业才有 `contents: write`。组织策略需允许所用 GitHub 官方 Actions 与发布作业的写权限。
 - 失败后可 **Re-run failed jobs**；也可在 **Actions → Release packages → Run workflow** 填写原 Release 标签。该入口要求 Release 已存在（允许草稿），不会创建或发布新版本。
@@ -42,7 +42,7 @@ macOS 沿用当前临时签名，没有 Developer ID 正式签名或 Apple 公�
 
 缓存只用于加速，锁文件和最终资源摘要仍会重新核对。Actions 用量以仓库所属套餐和组织限制为准。
 
-`Native tests` 会在相关代码推送到 `main` 或提交 PR 时，分别在 Windows 与 macOS 原生环境运行 Rust 单元测试，提前检查平台差异。
+`Native tests` 会在相关代码推送到 `main` 或提交 PR 时，分别在 Windows 与 macOS 原生环境运行 Rust 单元测试；Windows 还会构建完整离线 NSIS、运行安装钩子场景测试、解包审计并生成离线 ZIP，提前验证实际发布包。应先等待该检查全部通过，再发布新标签。
 
 修复代码后，**Re-run jobs 仍使用旧运行的提交**（[GitHub 补跑规则](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)）；手动填写同一个旧标签也仍构建该标签的源码，不会自动改用最新 `main`。推荐将修复推送后发布下一个补丁版本，例如 `v0.2.1`。如果必须保留失败的 `v0.2.0`，需要明确决定是否更新该标签到修复提交；此操作会改变已发布版本的源码指向，工作流不会自动移动标签或绕过提交一致性检查。不可变 Release 的标签不能更新。
 

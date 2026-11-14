@@ -6,7 +6,15 @@ const root = path.resolve(__dirname, '..');
 
 test('Windows installation embeds the complete offline WebView2 installer', () => {
   const config = JSON.parse(fs.readFileSync(path.join(root, 'src-tauri/tauri.windows.conf.json'), 'utf8'));
-  assert.deepEqual(config.bundle.windows.webviewInstallMode, { type: 'offlineInstaller', silent: true });
+  assert.deepEqual(config.bundle.windows.webviewInstallMode, { type: 'skip' }, 'Tauri must not resolve the mutable latest-runtime URL');
+  assert.equal(config.bundle.windows.nsis.installerHooks, 'windows/hooks.nsh');
+  const hook = fs.readFileSync(path.join(root, 'src-tauri/windows/hooks.nsh'), 'utf8');
+  const dependency = fs.readFileSync(path.join(root, 'src-tauri/windows/webview2.nsh'), 'utf8');
+  assert.match(hook, /NSIS_HOOK_PREINSTALL/);
+  assert.match(hook, /TERMLUME_WEBVIEW2_INSTALLER/);
+  assert.match(dependency, /File.*MicrosoftEdgeWebView2RuntimeInstaller\.exe/);
+  assert.match(dependency, /ExecWait.*\/silent \/install/);
+  assert.doesNotMatch(dependency, /NSISdl|https?:|downloadBootstrapper/);
   assert.equal(config.bundle.windows.minimumWebview2Version, undefined, 'Do not add a minimum-version branch that invokes the online Edge updater');
   const installer = require('../scripts/webview2.lock.json');
   assert(installer.size > 100 * 1024 * 1024, 'A bootstrapper is not an offline runtime installer');

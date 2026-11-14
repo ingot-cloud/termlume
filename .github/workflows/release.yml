@@ -148,6 +148,9 @@ jobs:
           codesign --verify --deep --strict "src-tauri/target/$BUILD_TARGET/release/bundle/macos/Termlume.app"
       - name: Audit and package release assets
         run: node scripts/package-release.cjs "$RELEASE_PLATFORM"
+      - name: Test WebView2 installer decisions
+        if: runner.os == 'Windows'
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -File scripts/test-webview2-installer.ps1
       - name: Test bundled macOS Git without network
         if: runner.os == 'macOS'
         run: bash scripts/test-macos-offline.sh "src-tauri/target/$BUILD_TARGET/release/bundle/macos/Termlume.app"
