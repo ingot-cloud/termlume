@@ -2,14 +2,16 @@
 
 工作流 `.github/workflows/release.yml` 在 Actions 中名为 **Release packages**，支持当前已有的 macOS Apple Silicon 和 Windows x64 离线交付。发布 Release 后先运行检查，再在两种原生 Runner 上构建，全部成功后把产物附加到该 Release。
 
+完整交付流程和完成标准以 [发版操作规范](RELEASE_PLAYBOOK.md) 为准：创建 Release 后还须持续跟进 Actions、核验公开附件，并完成本机真实升级与数据保留验收。本文说明自动打包的技术机制与补跑方式。
+
 ## 发布版本
 
 首次发布包含 App 内更新功能的版本前，先按 [App 内更新](APP_UPDATES.md) 配置仓库的 `TAURI_SIGNING_PRIVATE_KEY` Actions secret。工作流会验证签名密钥与 App 内公钥匹配，再开始两平台构建；私钥不进入仓库或产物。
 
-1. 将工作流与对应版本代码提交、推送到 `main`。
-2. 打开 **Releases → Draft a new release**，创建如 `v0.2.0` 的标签，目标选择包含工作流的提交。
+1. 完成相关检查，将工作流与对应版本代码按提交规范提交、推送到 `main`，核对准确提交的 Windows/macOS 原生检查结果。
+2. 为已核对的完整提交 SHA 固定标签，在 **Releases → Draft a new release** 选择该现有标签。
 3. 填写更新说明并 **Publish release**。预发布可使用 `v0.2.0-beta.1` 并勾选预发布。
-4. 在 **Actions → Release packages** 查看进度，完成后回到同一 Release 的 **Assets** 下载。
+4. 在 **Actions → Release packages** 跟进到全部作业结束，回到同一 Release 核验 **Assets**、摘要、签名及更新清单，再执行本机 App 的检查、下载、安装和自动重启验收。
 
 标签格式为 `vMAJOR.MINOR.PATCH`，可加 `-beta.1` / `-rc.1` 等预发布标识，每段数字不超过 65535。构建时在 Runner 的工作副本中同步 Node、Tauri、Cargo 包与锁文件的版本，不会向仓库回写提交。产物版本、文件名对应标签，构建记录包含原提交 SHA。
 

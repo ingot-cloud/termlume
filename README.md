@@ -12,7 +12,9 @@ Termlume 把主机列表、SSH 终端、SFTP 文件和日志输出放在同一�
 - [视觉与组件规范](STYLE_GUIDE.md)：深浅主题、颜色与尺寸变量、组件状态、参考图和视觉验收。
 
 - [统一验收清单](docs/UNIFIED_ACCEPTANCE.md)：本批功能的操作步骤、通过标准和已知边界。
-- [GitHub Release 自动打包](docs/GITHUB_RELEASES.md)：发布版本后自动构建 macOS / Windows 离线包，并附加到 Release 下载。
+- [发版操作规范](docs/RELEASE_PLAYBOOK.md)：从版本与提交确认、Actions 跟进、产物核验到本机真实升级验收的完整流程。
+- [GitHub Release 自动打包](docs/GITHUB_RELEASES.md)：工作流、签名产物、版本同步及失败补跑机制。
+- [App 内更新](docs/APP_UPDATES.md)：签名配置、客户端行为及历史版本升级兼容提示。
 
 后续工作按产品规划中的任务编号继续；每次交付同步更新实现状态、验收证据和仍待验证的部分。
 
