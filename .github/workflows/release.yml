@@ -135,6 +135,9 @@ jobs:
           key: release-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*tools.lock.json', 'scripts/webview2.lock.json') }}
       - name: Prepare assets and offline dependencies
         run: node scripts/tauri-before-build.cjs
+      - name: Test prepared Windows tools
+        if: runner.os == 'Windows'
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -File scripts/test-windows-bundled-tools.ps1 -RuntimeDir src-tauri/vendor/windows
       - name: Rust unit tests
         run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml --target "$BUILD_TARGET" --lib
       - name: Build application
