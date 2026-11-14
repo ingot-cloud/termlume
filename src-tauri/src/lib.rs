@@ -49,6 +49,15 @@ impl std::ops::Deref for Workspace {
     }
 }
 
+struct ProfileLock(std::fs::File);
+impl Drop for ProfileLock {
+    fn drop(&mut self) {
+        // A child between fork and exec can still hold an inherited file descriptor.
+        // Release the lock when its workspace closes, independently of that descriptor.
+        let _ = self.0.unlock();
+    }
+}
+
 struct Inner {
     store: Mutex<Store>,
     events: Mutex<Option<Channel<Value>>>,
@@ -69,7 +78,7 @@ struct Inner {
     last_activity: Mutex<Instant>,
     key_directories: Mutex<HashSet<PathBuf>>,
     home: PathBuf,
-    _profile_lock: std::fs::File,
+    _profile_lock: ProfileLock,
 }
 impl Workspace {
     fn new(directory: PathBuf, home: PathBuf, legacy: Option<PathBuf>) -> Result<Self, String> {
@@ -103,7 +112,7 @@ impl Workspace {
             last_activity: Mutex::new(Instant::now()),
             key_directories: Mutex::new(HashSet::from([home.join(".ssh")])),
             home,
-            _profile_lock: lock,
+            _profile_lock: ProfileLock(lock),
         })))
     }
     fn emit(&self, event: Value) -> bool {

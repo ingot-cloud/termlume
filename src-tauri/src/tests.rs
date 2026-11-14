@@ -207,6 +207,41 @@ fn make_workspace(
     let ws = Workspace::new(profile.path().to_path_buf(), home.into(), legacy).unwrap();
     (profile, ws)
 }
+
+#[test]
+#[cfg(unix)]
+fn closing_workspace_releases_its_lock_while_a_child_is_waiting_to_exec() {
+    use std::{io::{Read, Write}, os::unix::{net::UnixStream, process::CommandExt}};
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    assert!(Workspace::new(profile.path().into(), home.path().into(), None).is_err());
+    let (mut ready, mut child_ready) = UnixStream::pair().unwrap();
+    let (mut release, mut child_release) = UnixStream::pair().unwrap();
+    ready.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    child_release.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let child = std::thread::spawn(move || {
+        let mut command = std::process::Command::new("/usr/bin/true");
+        // Only socket reads/writes run after fork; no allocation, locks, or workspace access.
+        unsafe {
+            command.pre_exec(move || {
+                child_ready.write_all(b"1")?;
+                child_release.read_exact(&mut [0])?;
+                Ok(())
+            });
+        }
+        command.status()
+    });
+    ready.read_exact(&mut [0]).unwrap();
+    drop(ws);
+    let reopened = Workspace::new(profile.path().into(), home.path().into(), None);
+    release.write_all(b"1").unwrap();
+    assert!(child.join().unwrap().unwrap().success());
+    let reopened = reopened.unwrap();
+    assert!(Workspace::new(profile.path().into(), home.path().into(), None).is_err());
+    drop(reopened);
+    Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+}
+
 fn events(ws: &Workspace) -> mpsc::UnboundedReceiver<Value> {
     let (send, receive) = mpsc::unbounded_channel();
     let weak = Arc::downgrade(&ws.0);
