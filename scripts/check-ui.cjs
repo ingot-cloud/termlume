@@ -594,6 +594,25 @@ async function main() {
       await js("applyVaultState(previewProtected)"); await tick(); await overflow();
       await shot(`security-on-${theme}-${width}.png`);
       await js("api.vault.state().then(applyVaultState)");
+      await js("previewUpdateState={...previewUpdateState,phase:'idle',canDownload:false,revision:previewUpdateState.revision+1};openSettings('updates')");
+      await wait("document.querySelector('#settings-page .update-card')");
+      await tick(); await overflow(); await settingsAlignment('updates');
+      await js("[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='检查更新').click()");
+      await wait("$('settings-page').textContent.includes('当前已是最新版本')");
+      await js("previewListener({type:'update',state:{currentVersion:'0.2.2',phase:'available',version:'0.2.3',notes:'更新说明\\n'.repeat(80)+'<script>unsafe</script>',message:'发现新版本，可以下载更新。',downloaded:0,total:100,canDownload:true}})");
+      assert(await js("!$('settings-page').querySelector('script') && $('settings-page').querySelector('.update-notes').scrollHeight > $('settings-page').querySelector('.update-notes').clientHeight"),'Release notes must remain plain text with bounded scrolling');
+      await js("previewListener({type:'update',state:{...appUpdateState,phase:'downloading',downloaded:25}});window.updateCancelProbe=[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='取消下载');updateCancelProbe.focus();previewListener({type:'update',state:{...appUpdateState,downloaded:50}})");
+      assert(await js("document.activeElement===updateCancelProbe && updateCancelProbe.isConnected && $('settings-page').querySelector('progress').value===50"),'Progress must preserve the cancel button and keyboard focus');
+      await js("updateCancelProbe.click()");
+      await wait("$('settings-page').textContent.includes('下载已取消')");
+      await js("previewListener({type:'update',state:{...appUpdateState,revision:appUpdateState.revision-1,phase:'downloading',message:'stale response'}})");
+      assert(await js("appUpdateState.phase==='available' && !$('settings-page').querySelector('progress')"),'A late download response cannot overwrite a newer cancellation');
+      await js("window.updateEditorWasHidden=fileEditor.hidden;fileEditor.hidden=false;previewListener({type:'update',state:{...appUpdateState,phase:'ready'}});[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='重启并安装').click()");
+      await wait("$('settings-page').textContent.includes('保存并关闭文件编辑器')");
+      await js("fileEditor.hidden=true;[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='重启并安装').click()");
+      await wait("$('settings-page').textContent.includes('请先关闭 SSH 会话')");
+      await js("fileEditor.hidden=window.updateEditorWasHidden");
+      await tick(); await overflow(); await shot(`updates-${theme}-${width}.png`);
       for (const section of ['preferences','groups','identities','snippets','layouts','logs','trust']) {
         await js(`openSettings('${section}')`);
         await wait("document.querySelector('#settings-page .settings-form')"); await tick(); await overflow();

@@ -127,6 +127,9 @@ pub enum TerminalControl {
 }
 
 impl Connections {
+    pub fn has_active(&self) -> bool {
+        self.sessions.lock().unwrap().values().any(|s| !s.cancel.is_cancelled())
+    }
     pub fn get(&self, id: Uuid) -> Option<Arc<Session>> {
         self.sessions.lock().unwrap().get(&id).cloned()
     }

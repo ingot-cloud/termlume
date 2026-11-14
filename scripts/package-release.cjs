@@ -8,12 +8,13 @@ const root = path.resolve(__dirname, '..');
 const digest = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const run = (command, args, options = {}) => execFileSync(command, args, { encoding: 'utf8', ...options });
 
-function specification(platform, version) {
+function specification(platform, version, updater = false) {
   const label = { 'macos-arm64': 'macOS-arm64', 'windows-x64': 'Windows-x64' }[platform];
   if (!label) throw new Error(`Unsupported release platform: ${platform}`);
   const stem = `Termlume-${version}-${label}`;
   return { platform, stem, target: platform === 'macos-arm64' ? 'aarch64-apple-darwin' : 'x86_64-pc-windows-msvc',
-    archives: [`${stem}-offline.zip`, ...(platform === 'windows-x64' ? [`${stem}-setup.exe`] : [])],
+    archives: [`${stem}-offline.zip`, ...(platform === 'windows-x64' ? [`${stem}-setup.exe`] : []),
+      ...(updater ? (platform === 'macos-arm64' ? [`${stem}.app.tar.gz`,`${stem}.app.tar.gz.sig`] : [`${stem}-setup.exe.sig`]) : [])],
     metadata: `${stem}.build.json`, sums: `${stem}.sha256` };
 }
 
@@ -93,7 +94,9 @@ function packageRelease(platform, { bundleDirectory, outputDirectory = path.join
   const version = require(path.join(root, 'package.json')).version;
   const tag = process.env.RELEASE_TAG || `v${version}`;
   if (releaseVersion(tag) !== version) throw new Error('Run release-version.cjs before packaging a different release tag');
-  const spec = specification(platform, version);
+  const updater = process.env.TERMLUME_REQUIRE_SIGNED_UPDATES === '1' || Boolean(process.env.TAURI_SIGNING_PRIVATE_KEY || process.env.TAURI_SIGNING_PRIVATE_KEY_PATH);
+  if (updater && !process.env.TAURI_SIGNING_PRIVATE_KEY && !process.env.TAURI_SIGNING_PRIVATE_KEY_PATH) throw new Error('Updater signing key is required for releases');
+  const spec = specification(platform, version, updater);
   if ((platform === 'macos-arm64' && (process.platform !== 'darwin' || process.arch !== 'arm64'))
     || (platform === 'windows-x64' && (process.platform !== 'win32' || process.arch !== 'x64'))) throw new Error('Package on the matching native platform');
   const commit = run('git', ['rev-parse', 'HEAD'], { cwd: root }).trim();
@@ -106,10 +109,11 @@ function packageRelease(platform, { bundleDirectory, outputDirectory = path.join
     const archive = path.join(temporary, spec.archives[0]);
     const audit = platform === 'macos-arm64' ? packageMac(bundle, archive, temporary, version)
       : packageWindows(bundle, path.join(temporary, spec.archives[1]), archive, temporary, version);
+    if (updater) require('./updater-release.cjs').prepare(platform,bundle,temporary,version);
     const files = Object.fromEntries(spec.archives.map(name => [name, {
       sha256: digest(path.join(temporary, name)), size: fs.statSync(path.join(temporary, name)).size
     }]));
-    const report = { schema: 1, platform, target: spec.target, version, tag, commit,
+    const report = { schema: 1, platform, target: spec.target, version, tag, commit, updater,
       builtAt: new Date().toISOString(), rust: run('rustc', ['--version']).trim(), node: process.version, audit, files };
     fs.writeFileSync(path.join(temporary, spec.metadata), JSON.stringify(report, null, 2) + '\n');
     fs.writeFileSync(path.join(temporary, spec.sums), spec.archives.map(name => `${files[name].sha256}  ${name}\n`).join(''));
@@ -119,12 +123,14 @@ function packageRelease(platform, { bundleDirectory, outputDirectory = path.join
   } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
 }
 
-function verifyAssets(directory, tag, expectedCommit = process.env.RELEASE_COMMIT) {
+function verifyAssets(directory, tag, expectedCommit = process.env.RELEASE_COMMIT, requireUpdater = process.env.TERMLUME_REQUIRE_SIGNED_UPDATES === '1') {
   const version = releaseVersion(tag);
   const all = [], commits = new Set();
   for (const platform of ['macos-arm64', 'windows-x64']) {
-    const spec = specification(platform, version);
-    const report = JSON.parse(fs.readFileSync(path.join(directory, spec.metadata), 'utf8'));
+    const metadata = specification(platform, version).metadata;
+    const report = JSON.parse(fs.readFileSync(path.join(directory, metadata), 'utf8'));
+    if (requireUpdater && report.updater !== true) throw new Error(`Missing signed updater artifacts: ${metadata}`);
+    const spec = specification(platform, version, report.updater === true);
     if (report.schema !== 1 || report.version !== version || report.tag !== tag || report.platform !== platform
       || report.target !== spec.target || !/^[0-9a-f]{40}$/.test(report.commit)
       || (expectedCommit && report.commit !== expectedCommit)) throw new Error(`Release metadata mismatch: ${spec.metadata}`);
@@ -133,6 +139,10 @@ function verifyAssets(directory, tag, expectedCommit = process.env.RELEASE_COMMI
     for (const name of spec.archives) {
       const file = path.join(directory, name), entry = report.files[name];
       if (fs.statSync(file).size !== entry.size || digest(file) !== entry.sha256) throw new Error(`Release asset checksum mismatch: ${name}`);
+    }
+    if (report.updater) {
+      const updater = require('./updater-release.cjs'), update = updater.names(platform,version);
+      updater.verify(fs.readFileSync(path.join(directory,update.archive)),fs.readFileSync(path.join(directory,update.signature),'utf8'),version);
     }
     const checksums = spec.archives.map(name => `${report.files[name].sha256}  ${name}\n`).join('');
     if (fs.readFileSync(path.join(directory, spec.sums), 'utf8') !== checksums) throw new Error(`Checksum list mismatch: ${spec.sums}`);

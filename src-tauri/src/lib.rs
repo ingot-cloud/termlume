@@ -27,6 +27,8 @@ mod ssh;
 mod startup_unlock;
 mod store;
 mod terminal_fonts;
+#[cfg(desktop)]
+mod updates;
 #[cfg(target_os = "macos")]
 mod window_chrome;
 #[cfg(test)]
@@ -59,6 +61,7 @@ struct Inner {
     #[cfg(desktop)]
     editors: transfer::Editors,
     sync_gate: tokio::sync::Mutex<()>,
+    request_gate: tokio::sync::RwLock<()>,
     unlock_gate: tokio::sync::Mutex<()>,
     sync_cancel: Mutex<Option<CancellationToken>>,
     conflict: Mutex<Option<git::Conflict>>,
@@ -92,6 +95,7 @@ impl Workspace {
             #[cfg(desktop)]
             editors: Default::default(),
             sync_gate: Default::default(),
+            request_gate: Default::default(),
             unlock_gate: Default::default(),
             sync_cancel: Mutex::default(),
             conflict: Mutex::default(),
@@ -251,6 +255,11 @@ async fn workspace_request(
     value: Value,
 ) -> Result<Value, String> {
     verified(&window)?;
+    #[cfg(desktop)]
+    if window.state::<updates::Updates>().installing() {
+        return Err("正在安装更新，请稍候。".into());
+    }
+    let _request = workspace.request_gate.read().await;
     dispatch(&workspace, &name, value).await
 }
 async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
@@ -1242,12 +1251,18 @@ fn initial_window_size(work_area: Option<(f64, f64)>) -> (f64, f64) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             workspace_request,
-            workspace_subscribe
-        ])
-        .setup(|app| {
+            workspace_subscribe,
+            updates::update_request
+        ]);
+    #[cfg(not(desktop))]
+    let builder = builder.invoke_handler(tauri::generate_handler![workspace_request, workspace_subscribe]);
+    builder.setup(|app| {
             #[cfg(any(windows, target_os = "macos"))]
             platform::initialize_resources(app.path().resource_dir()?);
             let home = app.path().home_dir()?;
@@ -1261,6 +1276,8 @@ pub fn run() {
             let workspace =
                 Workspace::new(directory, home, legacy).map_err(std::io::Error::other)?;
             app.manage(workspace.clone());
+            #[cfg(desktop)]
+            app.manage(updates::Updates::new(app.package_info().version.to_string()));
             tauri::async_runtime::spawn(git_auto::run(workspace.clone()));
             let idle_workspace = workspace.clone();
             tauri::async_runtime::spawn(async move {

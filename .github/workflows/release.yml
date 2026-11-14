@@ -53,6 +53,11 @@ jobs:
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isImmutable > "$RUNNER_TEMP/release.json"
           node -e 'const r=require(process.env.RUNNER_TEMP+"/release.json"); if(r.isImmutable) throw Error("Release 已锁定，不能追加产物。请先为草稿 Release 手动运行此工作流，构建完成后再发布。");'
       - run: npm ci
+      - name: Verify updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: node scripts/updater-release.cjs check-key
       - run: npm test
       - name: UI regression
         env:
@@ -150,6 +155,10 @@ jobs:
           codesign --force --sign - "src-tauri/target/$BUILD_TARGET/release/bundle/macos/Termlume.app"
           codesign --verify --deep --strict "src-tauri/target/$BUILD_TARGET/release/bundle/macos/Termlume.app"
       - name: Audit and package release assets
+        env:
+          TERMLUME_REQUIRE_SIGNED_UPDATES: '1'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: node scripts/package-release.cjs "$RELEASE_PLATFORM"
       - name: Test WebView2 installer decisions
         if: runner.os == 'Windows'
@@ -177,6 +186,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ needs.check.outputs.tag }}
       RELEASE_COMMIT: ${{ needs.check.outputs.sha }}
+      TERMLUME_REQUIRE_SIGNED_UPDATES: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -199,3 +209,8 @@ jobs:
           test "$actual" = "$RELEASE_COMMIT"
       - name: Upload assets
         run: gh release upload "$RELEASE_TAG" dist/release/* --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Publish update manifest after all packages are uploaded
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body,publishedAt > "$RUNNER_TEMP/updater-release.json"
+          node scripts/updater-release.cjs manifest "$RELEASE_TAG" "$RELEASE_COMMIT" "$RUNNER_TEMP/updater-release.json"
+          gh release upload "$RELEASE_TAG" dist/release/latest.json dist/release/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

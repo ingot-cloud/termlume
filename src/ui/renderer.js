@@ -70,6 +70,8 @@ let hostSearchMatch;
 let libraryView = 'hosts';
 let settingsRun;
 let settingsSection = 'preferences';
+let appUpdateState;
+let appUpdateError = '';
 const sessionLabels = { idle: '等待连接', connecting: '连接中', trust: '等待核对指纹', ready: '已连接', closed: '已断开', running: '运行中', done: '已完成', stopped: '已停止', failed: '失败' };
 
 function node(tag, className, ...children) {
@@ -264,7 +266,7 @@ function openSettings(section = settingsSection, session = origin()) {
   const render = { preferences: () => editPreferences(page), groups: () => manageGroups(page),
     identities: () => manageIdentities(page), snippets: () => manageSnippets(session, page),
     layouts: () => manageLayouts(page), logs: () => manageLogs(page), trust: () => manageTrust(page),
-    security: async () => renderSecurityPage() }[section];
+    security: async () => renderSecurityPage(), updates: () => showAppUpdates(page) }[section];
   $('settings-page').setAttribute('aria-label', '设置');
   $('settings-page').replaceChildren(settingsStatus('正在读取设置…'));
   void render?.().catch(error => {
@@ -793,6 +795,84 @@ function settingsStatus(text, ...actions) {
   const notice = node('p', 'muted', text);
   notice.setAttribute('role', 'status');
   return node('div', 'page-body settings-status', notice, ...actions);
+}
+
+async function showAppUpdates(page) {
+  acceptAppUpdateState(await api.updates.status());
+  if (page.active) renderAppUpdates();
+}
+
+function acceptAppUpdateState(next) {
+  if (!appUpdateState || (next.revision ?? 0) >= (appUpdateState.revision ?? 0)) appUpdateState = next;
+}
+
+function renderAppUpdates() {
+  if (settingsRun?.section !== 'updates' || !appUpdateState || vaultStatus.locked) return;
+  const page = $('settings-page');
+  const state = appUpdateState;
+  const busy = ['checking', 'downloading', 'verifying', 'installing'].includes(state.phase);
+  const renderKey = JSON.stringify([state.currentVersion,state.phase,state.version,state.notes,state.message,state.checkedAt,state.canDownload,appUpdateError]);
+  const updateProgress = () => {
+    const progress = page.querySelector('.update-progress');
+    const detail = page.querySelector('.update-progress-detail');
+    if (!progress || !detail) return;
+    if (state.total) { progress.max = state.total; progress.value = state.downloaded; }
+    const mb = value => `${(value / 1024 / 1024).toFixed(1)} MB`;
+    detail.textContent = state.total ? `${mb(state.downloaded)} / ${mb(state.total)} · ${Math.min(100, Math.floor(state.downloaded / state.total * 100))}%` : `已下载 ${mb(state.downloaded)}`;
+  };
+  if (page.querySelector('.update-card') && page.dataset.updateKey === renderKey) { updateProgress(); return; }
+  page.dataset.updateKey = renderKey;
+  page.setAttribute('aria-label', '关于与更新');
+  const title = node('div', 'security-heading', settingsIcon('settings'), node('h2', '', 'Termlume'));
+  const current = node('p', 'muted', `当前版本 v${state.currentVersion}`);
+  const info = node('p', 'update-status', state.message);
+  info.setAttribute('role', state.phase === 'error' ? 'alert' : 'status');
+  const card = node('section', 'security-card update-card', title, current, info);
+  if (state.version && ['available','pending','downloading','verifying','ready','installing'].includes(state.phase)) {
+    card.append(node('p', '', `新版本 v${state.version}`));
+  }
+  if (state.notes) {
+    const notes = node('pre', 'update-notes', state.notes);
+    notes.setAttribute('aria-label', '新版本说明');
+    card.append(notes);
+  }
+  if (['downloading','verifying'].includes(state.phase)) {
+    const progress = node('progress', 'update-progress');
+    progress.setAttribute('aria-label', '更新下载进度');
+    card.append(progress, node('p', 'muted update-progress-detail'));
+  }
+  const automatic = input('', 'checkbox');
+  automatic.checked = localStorage.getItem('updates-on-start') !== 'false';
+  automatic.addEventListener('change', () => localStorage.setItem('updates-on-start', String(automatic.checked)));
+  card.append(node('label', 'checkbox-row', automatic, '启动时检查新版本'));
+  if (state.checkedAt) card.append(node('p', 'muted', `最近检查：${new Date(state.checkedAt).toLocaleString()}`));
+  const errorView = node('p', 'dialog-error', appUpdateError);
+  errorView.setAttribute('role', 'alert');
+  card.append(errorView);
+  const controls = node('div', 'settings-actions');
+  const act = action => async () => {
+    appUpdateError = '';
+    try {
+      if (action === 'install' && !fileEditor.hidden) throw new Error('请先保存并关闭文件编辑器，再安装更新。');
+      acceptAppUpdateState(await api.updates[action]());
+    } catch (failure) { appUpdateError = message(failure); }
+    renderAppUpdates();
+  };
+  const check = button(state.phase === 'checking' ? '正在检查…' : '检查更新', act('check'), 'outlined');
+  check.disabled = busy || state.phase === 'ready';
+  controls.append(check);
+  if (state.phase === 'downloading') controls.append(button('取消下载', act('cancel'), 'outlined'));
+  if (state.canDownload && !busy && state.phase !== 'ready') controls.append(button('下载更新', act('download'), 'primary'));
+  if (state.phase === 'ready') controls.append(button('重启并安装', act('install'), 'primary'));
+  if (state.phase === 'installing') controls.append(node('span', 'muted', '正在安装…'));
+  const form = node('div', 'settings-form', node('div', 'settings-fields', card), node('div', 'settings-form-actions', controls));
+  const previous = page.querySelector('.settings-fields');
+  const scroll = previous?.scrollTop || 0;
+  const focused = previous?.contains(document.activeElement) && document.activeElement.type === 'checkbox';
+  page.replaceChildren(form);
+  form.querySelector('.settings-fields').scrollTop = scroll;
+  updateProgress();
+  if (focused) automatic.focus({ preventScroll: true });
 }
 
 const defaultGitSettings = { paused: false, onUnlock: false, afterChanges: false, intervalMinutes: 0 };
@@ -4898,6 +4978,12 @@ function renderJobActions(job, row) {
 }
 
 api.onEvent((event) => {
+  if (event.type === 'update') {
+    acceptAppUpdateState(event.state);
+    renderAppUpdates();
+    if (event.state.phase === 'available') status(`发现 Termlume v${event.state.version}，可在设置中下载更新。`);
+    return;
+  }
   if (event.type === 'vault') { applyVaultState(event.state); return; }
   if (event.type === 'git-auto') {
     const { state } = event;
@@ -5249,11 +5335,19 @@ for (const [feature, section, label, icon] of [
   ['preferences','preferences','外观与终端','settings'], ['vault','security','安全与同步','lock'], ['groups','groups','分组管理','group'],
   ['identities','identities','登录配置','key'], ['snippets','snippets','命令库','terminal'],
   ['layouts','layouts','会话布局','new-tab'], ['logs','logs','会话日志','file'],
-  ['trust','trust','Known Hosts','lock']
+  ['trust','trust','Known Hosts','lock'], ['updates','updates','关于与更新','settings']
 ]) if (api[feature]) {
   const control = sidebarAction(label, icon, () => openSettings(section));
   control.dataset.section = section;
   $('workspace-tools').append(control);
+}
+if (api.updates) {
+  void api.updates.status().then(acceptAppUpdateState).catch(() => {});
+  setTimeout(() => {
+    if (localStorage.getItem('updates-on-start') !== 'false') {
+      void api.updates.check().then(state => { acceptAppUpdateState(state); renderAppUpdates(); }).catch(() => {});
+    }
+  }, 8000);
 }
 if(api.preferences) matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{if(uiPreferences.theme==='system')applyPreferences();});
 if(api.hosts.csvPreview) $('import-hosts').after(button('导入 CSV',()=>importHosts(true),'outlined'));

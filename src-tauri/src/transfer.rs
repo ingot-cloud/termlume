@@ -432,6 +432,9 @@ pub struct Transfers {
 const HISTORY_LIMIT: usize = 200;
 
 impl Transfers {
+    pub fn has_active(&self) -> bool {
+        self.queue.lock().unwrap().jobs.values().any(|j| matches!(*j.status.lock().unwrap(), "queued" | "running" | "committing"))
+    }
     pub fn active_session(&self, id: Uuid) -> bool {
         self.queue.lock().unwrap().jobs.values().any(|j| {
             j.file.session.id == id

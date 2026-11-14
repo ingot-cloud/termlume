@@ -4,6 +4,8 @@
 
 ## 发布版本
 
+首次发布包含 App 内更新功能的版本前，先按 [App 内更新](APP_UPDATES.md) 配置仓库的 `TAURI_SIGNING_PRIVATE_KEY` Actions secret。工作流会验证签名密钥与 App 内公钥匹配，再开始两平台构建；私钥不进入仓库或产物。
+
 1. 将工作流与对应版本代码提交、推送到 `main`。
 2. 打开 **Releases → Draft a new release**，创建如 `v0.2.0` 的标签，目标选择包含工作流的提交。
 3. 填写更新说明并 **Publish release**。预发布可使用 `v0.2.0-beta.1` 并勾选预发布。
@@ -24,6 +26,7 @@
 | `Termlume-0.2.0-Windows-x64-offline.zip` | 上述安装器与说明；解压后运行安装器，不是便携版 |
 | 两平台的 `.build.json` | 版本、标签、提交、架构、工具链及依赖审计结果 |
 | 两平台的 `.sha256` 和 `SHA256SUMS` | 产物及发布文件的 SHA-256 校验列表 |
+| macOS `.app.tar.gz`、两平台更新包 `.sig` 和 `latest.json` | App 内签名更新；全部安装包上传成功后才发布更新清单 |
 
 GitHub 自带的 **Source code (zip/tar.gz)** 是源码包，不是可运行应用。
 

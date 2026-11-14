@@ -16,6 +16,8 @@
     }).catch(() => {});
   };
   window.termlume = {
+    updates: Object.fromEntries(['status','check','download','cancel','install'].map(action =>
+      [action, () => invoke('update_request', { action })])),
     chrome: {
       startDragging: () => appWindow.startDragging(),
       async toggleMaximize() {

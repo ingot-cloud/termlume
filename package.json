@@ -1,7 +1,7 @@
 {
   "name": "termlume",
   "productName": "Termlume",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "private": true,
   "description": "Termlume macOS SSH workspace",
   "main": "src/main.cjs",

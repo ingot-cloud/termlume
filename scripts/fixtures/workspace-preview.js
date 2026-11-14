@@ -101,7 +101,17 @@ const previewSnippets = [
   {id:'multi',name:'服务检查',command:'pwd\nuptime',tags:['ops'],pinned:false,order:5},
   ...structuredClone(previewCommandDefaults)
 ];
+localStorage.setItem('updates-on-start', 'false');
+let previewUpdateState = {revision:0,currentVersion:'0.2.2',phase:'idle',version:null,notes:'',message:'从 GitHub Release 获取正式版本。',downloaded:0,total:null,canDownload:false};
+const previewUpdate = (phase,message) => ({...previewUpdateState,phase,message,revision:++previewUpdateState.revision,checkedAt:Date.now()});
 window.termlume = {
+  updates: {
+    status:async()=>({...previewUpdateState}),
+    check:async()=>previewUpdate('current','当前已是最新版本。'),
+    download:async()=>previewUpdate('ready','签名验证通过。关闭 SSH 会话和文件编辑器后即可重启安装。'),
+    cancel:async()=>previewUpdate('available','下载已取消，可以重新下载。'),
+    install:async()=>{throw new Error('请先关闭 SSH 会话，再安装更新。');}
+  },
   chrome: { startDragging: async () => previewCalls.push(['window-drag']),
     toggleMaximize: async () => previewCalls.push(['window-maximize']) },
   vault:{state:async()=>({enabled:false,locked:false,fileTransfers:true}),activity(){},touchIdAvailable:async()=>false,
@@ -180,7 +190,13 @@ window.termlume = {
   logs:{list:async()=>[]},history:{list:async()=>[]},
   trust:{list:async()=>[]},
   forwards:{list:async()=>({rules:[],running:[]})},
-  onEvent(listener){previewListener=listener;}
+  onEvent(listener){previewListener=event=>{
+    if(event.type==='update') {
+      if(event.state.revision==null)event.state.revision=previewUpdateState.revision+1;
+      if(event.state.revision>=previewUpdateState.revision)previewUpdateState=event.state;
+    }
+    listener(event);
+  };}
 };
 window.termlume.ssh.serverInfo = async id => { previewCalls.push(['server-info', id]); return previewServerInfo; };
 

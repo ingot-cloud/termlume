@@ -1,6 +1,6 @@
 [package]
 name = "termlume"
-version = "0.1.0"
+version = "0.2.2"
 edition = "2021"
 description = "Termlume SSH workspace"
 
@@ -30,6 +30,15 @@ tempfile = "3"
 tokio-util = "0.7"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2.14.1"
+semver = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWindow", "NSView", "NSButton", "NSControl", "NSResponder"] }
