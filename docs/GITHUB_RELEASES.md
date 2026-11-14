@@ -44,7 +44,7 @@ macOS 沿用当前临时签名，没有 Developer ID 正式签名或 Apple 公�
 
 `Native tests` 会在相关代码推送到 `main` 或提交 PR 时，分别在 Windows 与 macOS 原生环境运行 Rust 单元测试；Windows 还会构建完整离线 NSIS、运行安装钩子场景测试、解包审计并生成离线 ZIP，提前验证实际发布包。应先等待该检查全部通过，再发布新标签。
 
-修复代码后，**Re-run jobs 仍使用旧运行的提交**（[GitHub 补跑规则](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)）；手动填写同一个旧标签也仍构建该标签的源码，不会自动改用最新 `main`。推荐将修复推送后发布下一个补丁版本，例如 `v0.2.1`。如果必须保留失败的 `v0.2.0`，需要明确决定是否更新该标签到修复提交；此操作会改变已发布版本的源码指向，工作流不会自动移动标签或绕过提交一致性检查。不可变 Release 的标签不能更新。
+修复代码后，**Re-run jobs 仍使用旧运行的提交**（[GitHub 补跑规则](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)）；手动填写同一个旧标签也仍构建该标签的源码，不会自动改用最新 `main`。推荐将修复推送后发布下一个补丁版本，例如 `v0.2.2`。如果必须复用失败的旧版本号，需要明确决定是否更新该标签到修复提交；此操作会改变已发布版本的源码指向，工作流不会自动移动标签或绕过提交一致性检查。不可变 Release 的标签不能更新。
 
 ## 本地复现
 

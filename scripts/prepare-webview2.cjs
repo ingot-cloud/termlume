@@ -22,7 +22,8 @@ function stage(file, output = path.join(root, 'src-tauri/vendor/webview2'), spec
   }
   // Capture the include's own directory at preprocessing time. No workspace path
   // is inserted into NSIS source text, and macro expansion keeps it stable.
-  const include = `; Generated from scripts/webview2.lock.json. Do not edit.\n!define TERMLUME_WEBVIEW2_INSTALLER "\${__FILEDIR__}/${spec.archive}"\n!define TERMLUME_WEBVIEW2_SHA256 "${spec.sha256}"\n`;
+  // NSIS on Windows requires backslashes when splitting compiler file paths.
+  const include = `; Generated from scripts/webview2.lock.json. Do not edit.\n!define TERMLUME_WEBVIEW2_INSTALLER "\${__FILEDIR__}\\${spec.archive}"\n!define TERMLUME_WEBVIEW2_SHA256 "${spec.sha256}"\n`;
   fs.writeFileSync(path.join(output, 'installer.nsh'), include);
   return destination;
 }

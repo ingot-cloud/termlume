@@ -24,7 +24,7 @@ test('WebView2 staging points NSIS at the exact verified file, independently of 
   const destination = stage(source, output, spec);
   verifyArchive(destination, spec);
   const include = fs.readFileSync(path.join(output, 'installer.nsh'), 'utf8');
-  assert(include.includes(`!define TERMLUME_WEBVIEW2_INSTALLER "\${__FILEDIR__}/${spec.archive}"`));
+  assert(include.includes(`!define TERMLUME_WEBVIEW2_INSTALLER "\${__FILEDIR__}\\${spec.archive}"`));
   assert(include.includes(spec.sha256));
   assert.doesNotMatch(include, /https?:|go\.microsoft/);
 });
