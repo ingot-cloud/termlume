@@ -6,6 +6,16 @@ const previewHosts = [
   {id:'jump',name:'运维跳板',address:'jump.example.test',username:'ops',port:22,auth:'agent',tags:['ops']}
 ];
 const previewCalls = [];
+const previewGroups = [
+  {id:'prod',name:'生产环境'}, {id:'stage',name:'预发环境'}
+];
+function previewGroupList() {
+  const path = group => group.parentId ? `${path(previewGroups.find(g => g.id === group.parentId))} / ${group.name}` : group.name;
+  return previewGroups.map(group => {
+    const fullPath = path(group);
+    return { ...group, path: fullPath, hosts: previewHosts.filter(h => h.group === fullPath || h.group?.startsWith(fullPath + ' / ')).map(h => ({id:h.id,name:h.name})) };
+  });
+}
 const previewServerInfo = `
 __TERMLUME_INFO__version
 1
@@ -106,7 +116,23 @@ window.termlume = {
     }},
   hosts:{list:async()=>previewHosts,recent:async()=>({api:3,stage:2,jump:1}),touch:async()=>{},hasPassword:async()=>false,hasKeyPassphrase:async id=>previewKeySecrets.has(id),revealPassword:async()=>'',pickKey:async()=>'/preview/key',csvPreview:async()=>null,
     save:async value=>{previewCalls.push(['save-host',value]);const {localKeyPassphrase,clearKeyPassphrase,...fields}=value;const host={...fields,id:value.id||'new-host'};if(localKeyPassphrase)previewKeySecrets.set(host.id,localKeyPassphrase);const i=previewHosts.findIndex(h=>h.id===host.id);if(i>=0)previewHosts.splice(i,1);previewHosts.push(host);return previewHosts;}},
-  groups:{list:async()=>[{id:'prod',name:'生产环境',path:'生产环境',hosts:[]},{id:'stage',name:'预发环境',path:'预发环境',hosts:[]}]},
+  groups:{list:async()=>structuredClone(previewGroupList()),save:async request=>{
+    previewCalls.push(['save-group',request]);
+    const oldPaths = new Map(previewGroupList().map(g => [g.path,g.id]));
+    const group={...request.group,id:request.group.id||`group-${previewCalls.length}`};
+    const index=previewGroups.findIndex(g=>g.id===group.id);
+    if(index<0)previewGroups.push(group);else previewGroups[index]=group;
+    const paths=new Map(previewGroupList().map(g=>[g.id,g.path]));
+    for(const host of previewHosts) {
+      const id=host.groupId||oldPaths.get(host.group);
+      if(id) {host.groupId=id;host.group=paths.get(id);}
+    }
+    return {groups:structuredClone(previewGroupList()),hosts:previewHosts};
+  },remove:async ({group})=>{
+    if(previewGroups.some(g=>g.parentId===group.id)||previewGroupList().find(g=>g.id===group.id)?.hosts.length)throw new Error('请先移走主机与子分组。');
+    previewGroups.splice(previewGroups.findIndex(g=>g.id===group.id),1);
+    return {groups:structuredClone(previewGroupList()),hosts:previewHosts};
+  }},
   identities:{list:async()=>previewIdentities,save:async request=>{
     previewCalls.push(['save-identity',request]);
     const identity = { ...request.identity, id: request.identity.id || 'saved-identity', hosts: [], groups: [] };

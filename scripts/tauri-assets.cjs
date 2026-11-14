@@ -7,6 +7,7 @@ const output = join(root, 'dist', 'tauri-ui');
 const assets = {
   'style.css': 'src/ui/style.css',
   'workspace-state.js':'src/ui/workspace-state.js',
+  'host-tree.js':'src/ui/host-tree.js',
   'command-library.js':'src/ui/command-library.js',
   'server-info.js': 'src/ui/server-info.js',
   'renderer.js': 'src/ui/renderer.js',

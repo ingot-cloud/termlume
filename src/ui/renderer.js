@@ -2042,16 +2042,25 @@ async function manageGroups(page) {
   if(!api.groups) return;
   while(page.active && !vaultStatus.locked) {
     groupAssets=await api.groups.list();let choice;
-    const rows=groupAssets.map(g=>node('section','forward-rule',node('strong','',g.path),node('p','muted',`${g.hosts.length} 台主机 · 端口 ${g.port||'继承 / 22'} · ${g.identityId?'已设登录配置':'继承上级登录配置'}`),node('div','forward-actions',button('编辑',()=>{choice={group:g};close();},'outlined'),button('删除',()=>{choice={remove:g};close();},'outlined danger'))));
-    await ask('分组管理',rows.length?rows:[node('p','muted','可创建空分组、嵌套分组与默认 SSH 设置。')],'关闭',()=>true,[button('新建分组',()=>{choice={create:true};close();},'outlined')]);
+    const tree = groupTree(window.hostTree.build(groupAssets, hosts), new Set(groupAssets.filter(g => !collapsedSettingsGroups.has(g.id)).map(g => g.id)), {
+      label: '分组管理',
+      detail: branch => `${branch.group.hosts?.length ?? branch.count} 台主机 · 端口 ${branch.group.port || '继承 / 22'} · ${branch.group.identityId ? '已设登录配置' : '继承上级登录配置'}`,
+      onToggle: (branch, expanded) => expanded ? collapsedSettingsGroups.delete(branch.group.id) : collapsedSettingsGroups.add(branch.group.id),
+      actions: g => node('div', 'group-tree-actions',
+        button('添加子组', () => { choice = { parent: g }; close(); }, 'outlined', `给 ${g.path} 添加子组`),
+        button('编辑', () => { choice = { group: g }; close(); }, 'outlined', `编辑分组 ${g.path}`),
+        button('删除', () => { choice = { remove: g }; close(); }, 'outlined danger', `删除分组 ${g.path}`))
+    });
+    await ask('分组管理',groupAssets.length?[tree]:[node('p','muted','可创建空分组、嵌套分组与默认 SSH 设置。')],'关闭',()=>true,[button('新建分组',()=>{choice={create:true};close();},'outlined')]);
     if(!choice) break;
     if(choice.remove) {if(await confirm('删除分组',`删除「${choice.remove.path}」？请先移走主机与子分组。`,'删除')) {const result=await api.groups.remove({group:choice.remove,expected:choice.remove});groupAssets=result.groups;hosts=result.hosts;}continue;}
     const g=choice.group;const name=input(g?.name);const parent=node('select');const port=input(g?.port||'','number');port.min=1;port.max=65535;
     const identities=await api.identities.list();const identity=node('select');const theme=node('select');for(const[value,label]of [['','继承 / 终端偏好'],['dark','深色'],['light','浅色']]){const o=node('option','',label);o.value=value;theme.append(o);}theme.value=g?.terminalTheme||'';
-    for(const [value,label] of [['','无上级分组'],...groupAssets.filter(p=>p.id!==g?.id).map(p=>[p.id,p.path])]) {const o=node('option','',label);o.value=value;parent.append(o);}parent.value=g?.parentId||'';
+    const excluded = g ? window.hostTree.descendants(groupAssets, g.id) : new Set();
+    for(const [value,label] of [['','无上级分组'],...groupAssets.filter(p=>!excluded.has(p.id)).map(p=>[p.id,p.path])]) {const o=node('option','',label);o.value=value;parent.append(o);}parent.value=g?.parentId||choice.parent?.id||'';
     identity.append(new Option('继承上级 / 未设置', ''), ...identities.map(identityChoiceOption));identity.value=g?.identityId||'';
-    await ask(g?'编辑分组':'新建分组',[node('p','muted',`影响 ${g?.hosts.length||0} 台主机（含子分组），仅启用继承的主机使用默认值。`),field('分组名称',name),field('上级分组',selectControl(parent,'上级分组',{searchable:true,placeholder:'搜索分组名称或路径'})),field('默认 SSH 端口（留空继承）',port),field('默认登录配置',identitySelectControl(identity,'分组登录配置')),node('p','muted','组内主机勾选「使用分组的登录配置」后，会复用此处选择的 SSH 用户名和认证方式。'),field('默认终端配色',selectControl(theme,'分组终端配色'))],'保存分组',async()=>{
-      const result=await api.groups.save({group:{id:g?.id,name:name.value,parentId:parent.value||undefined,port:port.value?Number(port.value):undefined,identityId:identity.value||undefined,terminalTheme:theme.value||undefined},expected:g});groupAssets=result.groups;hosts=result.hosts;renderHosts();return true;
+    await ask(g?'编辑分组':choice.parent?'添加子组':'新建分组',[node('p','muted',`影响 ${g?.hosts.length||0} 台主机（含子分组），仅启用继承的主机使用默认值。`),field('分组名称',name),field('上级分组',selectControl(parent,'上级分组',{searchable:true,placeholder:'搜索分组名称或路径'})),field('默认 SSH 端口（留空继承）',port),field('默认登录配置',identitySelectControl(identity,'分组登录配置')),node('p','muted','组内主机勾选「使用分组的登录配置」后，会复用此处选择的 SSH 用户名和认证方式。'),field('默认终端配色',selectControl(theme,'分组终端配色'))],'保存分组',async()=>{
+      const result=await api.groups.save({group:{id:g?.id,name:name.value,parentId:parent.value||undefined,port:port.value?Number(port.value):undefined,identityId:identity.value||undefined,terminalTheme:theme.value||undefined},expected:g});groupAssets=result.groups;hosts=result.hosts;if(parent.value)collapsedSettingsGroups.delete(parent.value);renderHosts();return true;
     });
   }
   await refreshHosts();
@@ -2466,6 +2475,114 @@ function openGroup(group) {
   $('host-library').scrollTop = 0;
 }
 
+const expandedHostGroups = new Set();
+const collapsedSettingsGroups = new Set();
+let treeSearchKey = '', expandedSearchGroups;
+try {
+  const ids = JSON.parse(localStorage.getItem('host-tree-expanded') || '[]');
+  if (Array.isArray(ids)) for (const id of ids) if (typeof id === 'string') expandedHostGroups.add(id);
+} catch { /* Start with collapsed groups when a saved preference is unavailable. */ }
+
+// Native disclosure buttons keep Tab/Enter behavior; arrow keys navigate the visible hierarchy.
+function groupTree(tree, expanded, options) {
+  let sequence = 0;
+  const namespace = `group-tree-${options.hostRow ? 'hosts' : 'settings'}`;
+  function children(branch, depth = 0) {
+    const list = node('ul', 'group-tree');
+    for (const child of branch.groups) {
+      const g = child.group;
+      const toggle = button('', () => {
+        const open = !expanded.has(g.id);
+        if (open) expanded.add(g.id); else expanded.delete(g.id);
+        toggle.setAttribute('aria-expanded', String(open));
+        content.hidden = !open;
+        options.onToggle?.(child, open, content);
+      }, 'group-open tree-primary tree-group-toggle', `分组 ${g.path}`);
+      toggle.title = g.path;
+      toggle.append(node('span', 'tree-chevron', '›'), settingsIcon('group'),
+        node('span', 'host-identity', summaryText('strong', g.name),
+          summaryText('small', options.detail?.(child) || `${child.count} 台主机`)));
+      const content = children(child, depth + 1);
+      content.classList.add('tree-children');
+      content.id = `${namespace}-${++sequence}`;
+      content.hidden = !expanded.has(g.id);
+      toggle.setAttribute('aria-controls', content.id);
+      toggle.setAttribute('aria-expanded', String(!content.hidden));
+      if (!content.children.length) {
+        const empty = node('li', 'tree-empty muted', options.hostRow ? '此分组暂无主机或子分组' : '暂无子分组');
+        empty.style.marginInlineStart = `${Math.min(depth + 1, 8) * 16}px`;
+        content.append(empty);
+      }
+      const row = node('div', 'host-row group-row tree-group-row', toggle);
+      row.style.marginInlineStart = `${Math.min(depth, 8) * 16}px`;
+      if (options.actions) row.append(options.actions(g));
+      const item = node('li', 'tree-item', row, content);
+      item.dataset.treeGroup = g.id;
+      list.append(item);
+    }
+    if (options.hostRow) for (const host of branch.hosts) {
+      const row = options.hostRow(host);
+      row.style.marginInlineStart = `${Math.min(depth, 8) * 16}px`;
+      row.querySelector('.host-open').classList.add('tree-primary');
+      list.append(node('li', 'tree-item tree-host', row));
+    }
+    return list;
+  }
+  const list = children(tree);
+  list.setAttribute('aria-label', options.label);
+  list.addEventListener('keydown', event => {
+    const control = event.target.closest('.tree-primary');
+    if (!control || !['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const controls = [...list.querySelectorAll('.tree-primary')].filter(item => item.getClientRects().length);
+    const index = controls.indexOf(control);
+    const item = control.closest('.tree-item');
+    if (event.key === 'ArrowRight') {
+      if (control.getAttribute('aria-expanded') === 'false') control.click();
+      else item.querySelector(':scope > .tree-children .tree-primary')?.focus();
+    } else if (event.key === 'ArrowLeft') {
+      if (control.getAttribute('aria-expanded') === 'true') control.click();
+      else item.parentElement.closest('.tree-item')?.querySelector('.tree-primary')?.focus();
+    } else {
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? controls.length - 1
+        : Math.max(0, Math.min(controls.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
+      controls[next]?.focus();
+    }
+  });
+  return list;
+}
+
+function renderHostTree(matching, query, tag, draft) {
+  let tree = window.hostTree.build(groupAssets, [...hosts].sort(recentFirst));
+  const key = JSON.stringify([query, tag]);
+  const searching = Boolean(query || tag);
+  if (searching) {
+    const ids = new Set(matching.map(host => host.id));
+    tree = window.hostTree.filter(tree, host => ids.has(host.id), group => !tag && matchesQuery(query, group.path));
+    if (treeSearchKey !== key) {
+      expandedSearchGroups = new Set();
+      const expand = branch => { for (const child of branch.groups) { expandedSearchGroups.add(child.group.id); expand(child); } };
+      expand(tree);
+    }
+  }
+  treeSearchKey = searching ? key : '';
+  const view = groupTree(tree, searching ? expandedSearchGroups : expandedHostGroups, {
+    label: '主机树', hostRow: hostCard,
+    onToggle: (_branch, _open, content) => {
+      if (!searching) try { localStorage.setItem('host-tree-expanded', JSON.stringify([...expandedHostGroups])); } catch { /* Keep in memory. */ }
+      if (content.hidden && [...content.querySelectorAll('.host-open')].some(item => item.dataset.hostId === selectedHostId)) {
+        selectedHostId = '';
+        for (const item of content.querySelectorAll('.host-open')) item.setAttribute('aria-pressed', 'false');
+        updateHostActions();
+      }
+    }
+  });
+  $('host-list').replaceChildren(tree.groups.length || tree.hosts.length ? view
+    : node('p', 'muted', draft ? '按回车或点「填写主机」，核对连接信息后保存。' : searching ? '没有匹配的主机或分组' : '暂无主机或分组'));
+  const selected = [...view.querySelectorAll('.host-open')].find(item => item.dataset.hostId === selectedHostId);
+  if (selected?.closest('[hidden]')) { selectedHostId = ''; selected.setAttribute('aria-pressed', 'false'); updateHostActions(); }
+}
+
 function groupCard(group, count) {
   const card = node('button', 'group-open', settingsIcon('group'), node('span', 'host-identity',
     summaryText('strong', group), node('small', '', `${count} 台主机`)), node('span', 'group-arrow', '›'));
@@ -2611,6 +2728,7 @@ function recentFirst(a, b) {
 
 function renderHosts() {
   closeHostMenu();
+  const treeLayout = workspace.dataset.hostLayout === 'tree';
   const groups = new Map(groupAssets.map(g=>[g.path,0]));
   for (const host of hosts) {
     if (host.group) groups.set(host.group, (groups.get(host.group) || 0) + 1);
@@ -2622,7 +2740,7 @@ function renderHosts() {
     tagControl.value = '';
     tagControl.dispatchEvent(new Event('input'));
   }
-  const scope = currentGroup ? hosts.filter((host) => host.group === currentGroup) : hosts;
+  const scope = currentGroup && !treeLayout ? hosts.filter((host) => host.group === currentGroup) : hosts;
   const tags = ['', ...[...new Set(scope.flatMap((host) => host.tags || []).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh-CN'))];
   if (tags.length !== tagControl.length || tags.some((tag, index) => tagControl.options[index].value !== tag)) {
     const selected = tagControl.value;
@@ -2639,7 +2757,7 @@ function renderHosts() {
   const target = hostTarget(text);
   const searching = Boolean(query || tag);
   const matching = scope.filter((host) => (!tag || host.tags?.includes(tag)) && hostMatches(host, query, target));
-  const visibleHosts = currentGroup || searching ? matching : matching.filter((host) => !host.group);
+  const visibleHosts = treeLayout || currentGroup || searching ? matching : matching.filter((host) => !host.group);
   if (!visibleHosts.some((host) => host.id === selectedHostId)) selectedHostId = '';
   visibleHosts.sort(recentFirst);
   const matchingGroups = new Set(matching.map((host) => host.group));
@@ -2652,15 +2770,16 @@ function renderHosts() {
     })
     .sort(([a], [b]) => a.localeCompare(b, 'zh-CN'));
   if (!visibleGroups.some(([group]) => group === selectedGroup)) selectedGroup = '';
-  $('host-breadcrumb').hidden = !currentGroup;
+  $('host-breadcrumb').hidden = treeLayout || !currentGroup;
   $('current-group').textContent = $('current-group').title = currentGroup;
-  $('remove-group').hidden = !currentGroup;
+  $('remove-group').hidden = treeLayout || !currentGroup;
   const exact = query ? matching.filter((host) => target ? matchesTarget(host, target) : host.name.toLowerCase() === query) : [];
   const candidates = target || exact.length ? exact : matching;
   const saved = query && candidates.length === 1 ? candidates[0] : undefined;
   const draft = target && !exact.length;
   hostSearchMatch = saved ? { run: () => openHost(saved) } : draft ? { draft: true, run: () => editHost(undefined, undefined, target) } : undefined;
   updateHostActions();
+  if (treeLayout) { renderHostTree(matching, query, tag, draft); return; }
   const groupEntries = visibleGroups.map(([group, count]) => groupCard(group, count));
   const hostEntries = visibleHosts.map(hostCard);
   if (!currentGroup && !groupEntries.length) groupEntries.push(node('p', 'muted', searching ? '没有匹配的分组' : '暂无分组'));
@@ -4965,7 +5084,7 @@ for (const type of ['pointerdown', 'keydown', 'wheel']) {
 }
 $('add-host').addEventListener('click', () => editHost().catch((error) => status(message(error))));
 const hostLayout = $('host-layout');
-try { if (localStorage.getItem('host-layout') === 'rows') hostLayout.value = 'rows'; } catch { /* Card view is the default. */ }
+try { const saved = localStorage.getItem('host-layout'); if (['cards', 'rows', 'tree'].includes(saved)) hostLayout.value = saved; } catch { /* Card view is the default. */ }
 workspace.dataset.hostLayout = hostLayout.value;
 const hostLayoutPicker = selectControl(hostLayout);
 hostLayoutPicker.classList.add('host-layout');
@@ -4974,6 +5093,8 @@ selectControl($('unlock-mode'));
 hostLayout.addEventListener('change', () => {
   workspace.dataset.hostLayout = hostLayout.value;
   try { localStorage.setItem('host-layout', hostLayout.value); } catch { /* Use the in-memory choice. */ }
+  if (hostLayout.value === 'tree') currentGroup = selectedGroup = '';
+  renderHosts();
 });
 const toggleNav = $('toggle-nav');
 let navigationPreference;

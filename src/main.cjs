@@ -251,6 +251,7 @@ const resources = new Map([
   ['/index.html', [path.join(rendererDir, 'index.html'), 'text/html']],
   ['/style.css', [path.join(rendererDir, 'style.css'), 'text/css']],
   ['/workspace-state.js',[path.join(rendererDir,'workspace-state.js'),'text/javascript']],
+  ['/host-tree.js',[path.join(rendererDir,'host-tree.js'),'text/javascript']],
   ['/command-library.js',[path.join(rendererDir,'command-library.js'),'text/javascript']],
   ['/server-info.js', [path.join(rendererDir, 'server-info.js'), 'text/javascript']],
   ['/renderer.js', [path.join(rendererDir, 'renderer.js'), 'text/javascript']],

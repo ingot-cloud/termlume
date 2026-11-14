@@ -97,6 +97,66 @@ async function main() {
     const { data } = await run('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync(path.join(root, 'dist/ux-review', name), Buffer.from(data, 'base64'));
   };
+  const hostTreeChecks = async width => {
+    await js(`(async()=>{window.treeOriginalHosts=structuredClone(previewHosts);window.treeOriginalGroups=structuredClone(previewGroups);
+      previewGroups.push({id:'child',name:'应用',parentId:'prod'},{id:'leaf',name:'数据库节点',parentId:'child'});
+      Object.assign(previewHosts.find(h=>h.id==='db'),{groupId:'leaf',group:'生产环境 / 应用 / 数据库节点'});
+      expandedHostGroups.clear();collapsedSettingsGroups.clear();selectTab(undefined,'hosts');$('host-search').value='';$('tag-filter').value='';await refreshHosts();
+      $('host-layout').value='tree';$('host-layout').dispatchEvent(new Event('change'))})()`);
+    const toggle = id => `document.querySelector('#host-list [data-tree-group="${id}"] > .tree-group-row .tree-group-toggle')`;
+    const arrow = async key => {
+      await run('Input.dispatchKeyEvent',{type:'keyDown',key,code:key,windowsVirtualKeyCode:{ArrowRight:39,ArrowLeft:37,ArrowDown:40}[key]});
+      await run('Input.dispatchKeyEvent',{type:'keyUp',key,code:key});await tick();
+    };
+    assert(await js(`$('host-list').querySelector(':scope > ul > .tree-host .host-open[data-host-id=jump]') && ${toggle('prod')}.getAttribute('aria-expanded')==='false' && !document.querySelector('#host-list [data-tree-group="child"]').getClientRects().length`),
+      'Root must show groups and ungrouped hosts, with nested groups initially collapsed');
+    await js(`${toggle('prod')}.focus()`);await arrow('ArrowRight');await arrow('ArrowRight');
+    assert(await js(`document.activeElement===${toggle('child')}`),'Right arrow must enter the first child');
+    await arrow('ArrowRight');await arrow('ArrowRight');await arrow('ArrowRight');
+    assert(await js("document.querySelector('#host-list .host-open[data-host-id=db]').getClientRects().length"),'Three levels must reveal the nested host');
+    await arrow('ArrowLeft');await arrow('ArrowLeft');
+    assert(await js(`document.activeElement===${toggle('child')}`),'Left arrow must collapse then return to the parent');
+    await js(`${toggle('leaf')}.click();document.querySelector('#host-list .host-open[data-host-id=db]').dispatchEvent(new MouseEvent('click',{bubbles:true,detail:1}));${toggle('prod')}.click()`);
+    assert(await js("selectedHostId===''"),'Collapsing a selected descendant must clear its hidden selection');
+    await js("$('host-search').value='db.example.test';$('host-search').dispatchEvent(new Event('input'))");
+    assert(await js(`[${toggle('prod')},${toggle('child')},${toggle('leaf')}].every(b=>b.getAttribute('aria-expanded')==='true') && document.querySelector('#host-list .host-open[data-host-id=db]').getClientRects().length && !document.querySelector('#host-list .host-open[data-host-id=jump]')`),
+      'Search must reveal the complete ancestor chain without unrelated root hosts');
+    await js("$('host-search').value='missing-tree-host';$('host-search').dispatchEvent(new Event('input'))");
+    assert(await js("!$('host-list').querySelector('.host-open,.tree-group-toggle') && $('host-connect').disabled"));
+    await js("$('host-search').value='';$('host-search').dispatchEvent(new Event('input'))");
+    assert(await js(`${toggle('prod')}.getAttribute('aria-expanded')==='false'`),'Clearing search must restore the previous collapsed state');
+    await js("$('tag-filter').value='database';$('tag-filter').dispatchEvent(new Event('change'))");
+    assert(await js("document.querySelector('#host-list .host-open[data-host-id=db]').getClientRects().length && document.querySelectorAll('#host-list .host-open').length===1"),'Tag filtering must retain ancestors of nested matches');
+    await js("$('tag-filter').value='';$('tag-filter').dispatchEvent(new Event('change'));for(const b of $('host-list').querySelectorAll('.tree-group-toggle[aria-expanded=false]'))b.click()");
+    await tick();await overflow();await shot(`host-tree-dark-${width}.png`);
+    await js("uiPreferences.theme='light';applyPreferences()");await tick();await overflow();await shot(`host-tree-light-${width}.png`);
+    await js("uiPreferences.theme='dark';applyPreferences();openSettings('groups')");
+    await wait("$('settings-page').querySelector('.group-tree')");
+    assert(await js("[...$('settings-page').querySelectorAll('.tree-group-toggle')].every(b=>b.getAttribute('aria-expanded')==='true') && $('settings-page').querySelector('[data-tree-group=leaf]').closest('.tree-children')"),
+      'Group management must display the nested hierarchy expanded by default');
+    await tick();await overflow();await shot(`group-tree-dark-${width}.png`);
+    await js("uiPreferences.theme='light';applyPreferences()");await tick();await overflow();await shot(`group-tree-light-${width}.png`);
+    await js(`uiPreferences.theme='dark';applyPreferences();$('settings-page').querySelector('[aria-label="给 生产环境 / 应用 添加子组"]').click()`);
+    await wait("$('settings-page').getAttribute('aria-label')==='添加子组'");
+    assert(await js("[...$('settings-page').querySelectorAll('select')].find(s=>s.querySelector('option[value=child]')).value==='child'"),'Add subgroup must preselect its parent');
+    await js("$('settings-page').querySelector('input').value='新子组';$('settings-page').querySelector('form').requestSubmit()");
+    await wait("$('settings-page').querySelector('.group-tree') && previewGroups.some(g=>g.name==='新子组')");
+    assert(await js("[...$('settings-page').querySelectorAll('[data-tree-group=child] > .tree-children > .tree-item strong')].some(e=>e.textContent==='新子组')"),'Saved subgroup must appear beneath its selected parent');
+    await js("$('settings-page').querySelector('[aria-label=\"编辑分组 生产环境\"]').click()");
+    await wait("$('settings-page').getAttribute('aria-label')==='编辑分组'");
+    assert(await js("![...$('settings-page').querySelectorAll('select option')].some(o=>['prod','child','leaf'].includes(o.value))"),'Parent picker must exclude self and descendants');
+    await js("$('settings-page').querySelector('input').value='正式环境';$('settings-page').querySelector('form').requestSubmit()");
+    await wait("$('settings-page').querySelector('.group-tree') && previewGroups.find(g=>g.id==='prod').name==='正式环境'");
+    assert(await js("$('settings-page').querySelector('[data-tree-group=leaf]').closest('[data-tree-group=prod]') && previewHosts.find(h=>h.id==='db').group==='正式环境 / 应用 / 数据库节点'"),'Rename must preserve descendant IDs and host placement');
+    // A deeply nested group must remain usable without growing past the viewport.
+    await js("for(let i=0;i<12;i++)previewGroups.push({id:'deep-'+i,name:'很长的子分组名称 '+i,parentId:i?'deep-'+(i-1):'leaf'});openSettings('groups')");
+    await wait("$('settings-page').querySelector('[data-tree-group=deep-11]')");await tick();await overflow();
+    await js("(async()=>{selectTab(undefined,'hosts');await refreshHosts();for(const layout of ['rows','cards','tree']){$('host-layout').value=layout;$('host-layout').dispatchEvent(new Event('change'));}})()");
+    assert(await js("workspace.dataset.hostLayout==='tree' && localStorage.getItem('host-layout')==='tree'"));
+    await js("for(const b of $('host-list').querySelectorAll('.tree-group-toggle[aria-expanded=false]'))b.click()");await tick();await overflow();
+    await js("(async()=>{previewHosts.splice(0,previewHosts.length,...treeOriginalHosts);previewGroups.splice(0,previewGroups.length,...treeOriginalGroups);expandedHostGroups.clear();collapsedSettingsGroups.clear();localStorage.removeItem('host-tree-expanded');$('host-layout').value='cards';$('host-layout').dispatchEvent(new Event('change'));await refreshHosts()})()");
+    console.log(`${width}px: PASS host/group trees, nested search/tags, keyboard, child creation, rename, cyclic parent exclusion and deep/narrow layouts`);
+  };
   const drag = async (selector, dx, dy) => {
     const { x, y } = await js(`(() => {
       const r = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
@@ -440,6 +500,15 @@ async function main() {
     assert(await js(`document.querySelector(${JSON.stringify(pane)}).contains(document.activeElement)`),
       'Keyboard focus must stay inside the active overlay');
   };
+  if (process.argv.includes('--tree-only')) {
+    for (const [width, height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await hostTreeChecks(width);
+    }
+    return;
+  }
   if (!process.argv.includes('--shortcuts-only')) {
   await run('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'no-preference'}]});
   for (const [width, height] of [[1140, 740], [550, 490]]) {
@@ -450,6 +519,7 @@ async function main() {
     assert.match(report, /^✓/, report);
     console.log(`${width}×${height}: ${report.split('（')[0]}`);
     await js("document.getElementById('smoke-results').hidden=true");
+    await hostTreeChecks(width);
     for (const theme of ['dark', 'light']) {
       await js(`uiPreferences.theme='${theme}';applyPreferences();selectTab(undefined,'hosts')`); await tick();
       const contrast = await js(`(() => {
