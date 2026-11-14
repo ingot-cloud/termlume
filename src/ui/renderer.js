@@ -853,7 +853,7 @@ function renderAppUpdates() {
   const act = action => async () => {
     appUpdateError = '';
     try {
-      if (action === 'install' && !fileEditor.hidden) throw new Error('请先保存并关闭文件编辑器，再安装更新。');
+      if (action === 'install' && fileEditor.open) throw new Error('请先保存并关闭文件编辑器，再安装更新。');
       acceptAppUpdateState(await api.updates[action]());
     } catch (failure) { appUpdateError = message(failure); }
     renderAppUpdates();

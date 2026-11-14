@@ -607,11 +607,13 @@ async function main() {
       await wait("$('settings-page').textContent.includes('下载已取消')");
       await js("previewListener({type:'update',state:{...appUpdateState,revision:appUpdateState.revision-1,phase:'downloading',message:'stale response'}})");
       assert(await js("appUpdateState.phase==='available' && !$('settings-page').querySelector('progress')"),'A late download response cannot overwrite a newer cancellation');
-      await js("window.updateEditorWasHidden=fileEditor.hidden;fileEditor.hidden=false;previewListener({type:'update',state:{...appUpdateState,phase:'ready'}});[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='重启并安装').click()");
-      await wait("$('settings-page').textContent.includes('保存并关闭文件编辑器')");
-      await js("fileEditor.hidden=true;[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='重启并安装').click()");
+      assert(await js("fileEditor instanceof HTMLDialogElement && !fileEditor.open && !fileEditor.hidden"),'A closed native file-editor dialog has no hidden attribute and must not block installation');
+      await js("previewListener({type:'update',state:{...appUpdateState,phase:'ready'}});[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='重启并安装').click()");
       await wait("$('settings-page').textContent.includes('请先关闭 SSH 会话')");
-      await js("fileEditor.hidden=window.updateEditorWasHidden");
+      await js("fileEditor.show();[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='重启并安装').click()");
+      await wait("$('settings-page').textContent.includes('保存并关闭文件编辑器')");
+      await js("fileEditor.close();[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='重启并安装').click()");
+      await wait("$('settings-page').textContent.includes('请先关闭 SSH 会话')");
       await tick(); await overflow(); await shot(`updates-${theme}-${width}.png`);
       for (const section of ['preferences','groups','identities','snippets','layouts','logs','trust']) {
         await js(`openSettings('${section}')`);
