@@ -144,6 +144,8 @@ jobs:
         if: runner.os == 'Windows'
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -File scripts/test-windows-bundled-tools.ps1 -RuntimeDir src-tauri/vendor/windows
       - name: Rust unit tests
+        env:
+          TERMLUME_TEST_WINDOWS_MANIFEST: '1'
         run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml --target "$BUILD_TARGET" --lib
       - name: Build application
         run: |

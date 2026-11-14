@@ -509,3 +509,5 @@ v0.2.1 的两平台原生测试与应用构建已通过，Windows 在最终 NSIS
 验证：97 项 Node 测试通过；完整 macOS Rust/SSH/SFTP/Git 隔离回归 49 项通过，无忽略；最后的更新专项 6 项通过，包含真实签名下载、实际下载取消、篡改/伪造版本拒绝及临时 App 安装替换和执行权限保留。真实 macOS 更新 tar 经解压一致性、代码签名、更新签名及可信版本校验通过。1140×740 与 550×490 的全部既有界面回归及新增深浅主题更新场景通过，覆盖长说明滚动、进度焦点、取消后的旧响应和安装拦截；两份工作流通过 actionlint。
 
 本机 /Applications/Termlume.app 已重新构建、临时签名、备份更新并重启，9 个文件与构建一致，运行路径及摘要核对通过。原生实际点击「检查更新」，成功读取 GitHub 并显示当前 v0.2.2 已是最新版本；验证启动检查开关，当前保持开启。原工作区、主机、分组和偏好保留，更新前无 SSH 会话或活动传输。尚无更高版本的签名 Release，真实 GitHub 到下一版本的完整升级与 Windows 原生安装留待后续发布验证，未移动或修改 v0.2.2 标签。交付记录见 dist/Termlume-updater-local-update.build.json。
+
+首轮更新功能 Native tests 的 macOS 作业通过；Windows 编译成功后在启动库测试程序时返回 `0xc0000139 / STATUS_ENTRYPOINT_NOT_FOUND`，尚未执行测试。新增的 Tauri MockRuntime 测试链接了 Common Controls v6，而 tauri-build 默认只为应用二进制嵌入 manifest。构建脚本在 `TERMLUME_TEST_WINDOWS_MANIFEST=1` 的 Windows MSVC 测试调用中嵌入对应依赖声明；两份工作流仅在 Rust 测试步骤设置该变量。正常应用构建继续沿用默认资源与签名规则，未关闭或忽略更新测试。修正后的本机完整隔离回归 50 项全部通过，无忽略；工作流 actionlint、XML 解析、Rust 格式及差异检查通过，Windows 的实际运行结果以修正后的 Native tests 为准。

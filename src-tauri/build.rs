@@ -1,4 +1,18 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=TERMLUME_TEST_WINDOWS_MANIFEST");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+        && std::env::var("TERMLUME_TEST_WINDOWS_MANIFEST").as_deref() == Ok("1")
+    {
+        // tauri-build embeds the app manifest in binaries, but not lib unit tests.
+        // MockRuntime also links Tauri's Common Controls v6 imports.
+        // Limit these flags to test invocations; the app keeps its normal resources.
+        let manifest = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
+            .join("windows-test-manifest.xml");
+        println!("cargo:rerun-if-changed={}", manifest.display());
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         build_macos_bridge();
     }

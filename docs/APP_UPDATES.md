@@ -23,6 +23,8 @@
 
 发布流程会在前置检查中签署随机挑战，验证配置的私钥与内嵌公钥匹配；没有正确签名配置时，在耗时构建前明确失败。私钥只传给验证及签名步骤，不传给 `npm ci` 等其他步骤。普通 Native tests 不需要生产签名私钥，仍验证离线安装包。
 
+Windows 的原生测试调用需设置 `TERMLUME_TEST_WINDOWS_MANIFEST=1`，两份 Actions 工作流已在测试步骤中设置。Tauri 的模拟运行时也链接 Common Controls v6；库单元测试不会自动带上应用资源，因此需单独嵌入测试 manifest，避免测试启动时出现 `STATUS_ENTRYPOINT_NOT_FOUND`。随后构建 App 时不设置该变量，继续使用 Tauri 的默认应用 manifest。此处理参考 [Tauri 上游问题](https://github.com/tauri-apps/tauri/issues/11028)，不跳过更新下载或签名测试。
+
 ## Actions 产物
 
 原有离线包、审计与校验文件保留，并增加：
