@@ -2140,7 +2140,17 @@ async fn macos_local_forward_relays_and_releases_resources() {
 async fn shared_identity_records_resolve_update_and_sync_without_local_keys() {
     let home = tempfile::tempdir().unwrap();
     let (_p, ws) = make_workspace(home.path(), None);
-    let added=call(&ws,"identities:save",json!({"identity":{"name":"运维身份","username":"ops","auth":"key","keyPath":"/tmp/local-identity-key"}})).await;
+    let key_path = home.path().join("local identity 私钥");
+    std::fs::write(&key_path, "fixture").unwrap();
+    assert!(key_path.is_absolute());
+    assert!(dispatch(
+        &ws,
+        "identities:save",
+        json!({"identity":{"name":"相对路径","username":"ops","auth":"key","keyPath":"local-identity-key"}}),
+    )
+    .await
+    .is_err());
+    let added=call(&ws,"identities:save",json!({"identity":{"name":"运维身份","username":"ops","auth":"key","keyPath":key_path}})).await;
     let identity = added["identities"][0].clone();
     let id = identity["id"].clone();
     for address in ["one.test", "two.test"] {
@@ -2153,9 +2163,20 @@ async fn shared_identity_records_resolve_update_and_sync_without_local_keys() {
     }
     let hosts = call(&ws, "hosts:list", Value::Null).await;
     assert_eq!(hosts[0]["username"], "ops");
-    assert_eq!(hosts[1]["keyPath"], "/tmp/local-identity-key");
+    assert_eq!(hosts[1]["keyPath"], json!(key_path));
     let expected = call(&ws, "identities:list", Value::Null).await[0].clone();
     assert_eq!(expected["hosts"].as_array().unwrap().len(), 2);
+    // Check portability while the key is still configured, before switching to Agent.
+    {
+        let store = ws.store.lock().unwrap();
+        let data = store.data().unwrap();
+        let snapshot = serde_json::to_value(data.snapshot()).unwrap();
+        assert_eq!(data.identities[0].key_path.as_ref(), Some(&key_path));
+        let identities: Vec<_> = snapshot.as_array().unwrap().iter()
+            .filter(|row| row["asset"]["kind"] == "identity").collect();
+        assert_eq!(identities.len(), 1);
+        assert!(identities[0]["asset"]["value"].get("keyPath").is_none());
+    }
     assert!(dispatch(
         &ws,
         "identities:delete",
@@ -2180,9 +2201,8 @@ async fn shared_identity_records_resolve_update_and_sync_without_local_keys() {
         .unwrap()
         .iter()
         .any(|r| r["asset"]["kind"] == "identity"));
-    assert!(!serde_json::to_string(&rows)
-        .unwrap()
-        .contains("/tmp/local-identity-key"));
+    assert!(!serde_json::to_value(&rows).unwrap().as_array().unwrap().iter()
+        .any(|row| row["asset"]["value"].get("keyPath").is_some()));
     let mut other = Data::default();
     other.apply(store::portable_rows(rows).unwrap(), None);
     assert_eq!(other.connection_hosts()[0].username, "admin");

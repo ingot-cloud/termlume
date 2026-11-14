@@ -1,0 +1,89 @@
+name: Native tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src-tauri/**'
+      - 'src/ui/**'
+      - 'src/command-defaults.json'
+      - 'scripts/**'
+      - 'package*.json'
+      - '.github/workflows/native-tests.yml'
+  pull_request:
+    paths:
+      - 'src-tauri/**'
+      - 'src/ui/**'
+      - 'src/command-defaults.json'
+      - 'scripts/**'
+      - 'package*.json'
+      - '.github/workflows/native-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+  CARGO_BUILD_JOBS: '2'
+  MACOSX_DEPLOYMENT_TARGET: '10.15'
+
+jobs:
+  test:
+    name: Test ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            rustflags: ''
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            rustflags: '-C target-feature=+crt-static'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_TARGET: ${{ matrix.target }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$BUILD_TARGET"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: release-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}
+          restore-keys: release-rust-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            dist/macos-tools-cache
+            dist/windows-tools-cache
+            ~/AppData/Local/tauri
+          key: release-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*tools.lock.json', 'scripts/webview2.lock.json') }}
+      - name: Prepare native dependencies and frontend assets
+        run: node scripts/tauri-before-build.cjs
+      - name: Run native unit tests
+        run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml --target "$BUILD_TARGET" --lib
