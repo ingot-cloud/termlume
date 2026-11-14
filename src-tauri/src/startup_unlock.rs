@@ -1,82 +1,61 @@
-use crate::{error, vault::Key};
+use crate::{error, vault::{self, Key, Sealed}};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
 
 pub const FAILED: &str = "本机自动解锁失败，请使用主密码、恢复密钥或触控 ID 解锁。";
-#[cfg(target_os = "macos")]
-const SERVICE: &str = "app.termlume.desktop vault startup unlock";
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedKey {
+    version: u32,
+    payload: Sealed,
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Credential {
     pub vault_id: Uuid,
     pub token: Uuid,
+    // Absent only in old Keychain-backed settings, retained for migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protected: Option<ProtectedKey>,
 }
 
 impl Credential {
+    pub fn new(vault_id: Uuid) -> Self {
+        Self { vault_id, token: Uuid::new_v4(), protected: None }
+    }
+    pub fn is_legacy(&self) -> bool { self.protected.is_none() }
+
     pub fn account(&self, settings: &Path) -> Result<String, String> {
-        let directory = settings
-            .parent()
-            .ok_or("工作区路径无效。")?
-            .canonicalize()
-            .map_err(error)?;
+        let directory = settings.parent().ok_or("工作区路径无效。")?
+            .canonicalize().map_err(error)?;
         serde_json::to_string(&(directory, self.vault_id, self.token)).map_err(error)
     }
-}
 
-pub fn save(account: &str, key: &Key) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        return security_framework::passwords::set_generic_password(SERVICE, account, &key[..])
-            .map_err(|_| "无法将自动解锁凭据保存到系统钥匙串。".into());
+    fn context(&self, settings: &Path) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&("termlume-startup-unlock", 1, self.account(settings)?)).map_err(error)
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (account, key);
-        Err("当前平台暂不支持本机自动解锁。".into())
+
+    pub fn protect(&self, settings: &Path, device_key: &Key, key: &Key) -> Result<Self, String> {
+        Ok(Self {
+            vault_id: self.vault_id,
+            token: self.token,
+            protected: Some(ProtectedKey {
+                version: 1,
+                payload: vault::seal(device_key, &key[..], &self.context(settings)?)?,
+            }),
+        })
     }
-}
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn termlume_startup_key_read(
-        service: *const std::ffi::c_char,
-        account: *const std::ffi::c_char,
-        output: *mut u8,
-    ) -> bool;
-}
-
-pub fn read(account: &str) -> Result<Key, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let service = std::ffi::CString::new(SERVICE).map_err(error)?;
-        let account = std::ffi::CString::new(account).map_err(error)?;
+    pub fn open(&self, settings: &Path, device_key: &Key) -> Result<Key, String> {
+        let protected = self.protected.as_ref().ok_or(FAILED)?;
+        if protected.version != 1 { return Err(FAILED.into()); }
+        let bytes = vault::open(device_key, &protected.payload, &self.context(settings)?)?;
         let mut key = Key::default();
-        // This noninteractive query writes exactly 32 bytes only on success.
-        if unsafe {
-            termlume_startup_key_read(service.as_ptr(), account.as_ptr(), key.as_mut_ptr())
-        } {
-            return Ok(key);
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = account;
-    Err(FAILED.into())
-}
-
-pub fn delete(account: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        return match security_framework::passwords::delete_generic_password(SERVICE, account) {
-            Ok(()) => Ok(()),
-            Err(err) if err.code() == -25300 => Ok(()), // errSecItemNotFound
-            Err(_) => Err("无法删除系统钥匙串中的自动解锁凭据，请重试。".into()),
-        };
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = account;
-        Err("当前平台暂不支持本机自动解锁。".into())
+        if bytes.len() != key.len() { return Err(FAILED.into()); }
+        key.copy_from_slice(&bytes);
+        Ok(key)
     }
 }

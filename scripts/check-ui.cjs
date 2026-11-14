@@ -32,7 +32,7 @@ browser.stdio[4].on('data', chunk => {
     if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
   }
 });
-const deadline = setTimeout(() => { console.error('UI checks timed out.', stderr); browser.kill(); process.exitCode = 1; }, 120000);
+const deadline = setTimeout(() => { console.error('UI checks timed out.', stderr); browser.kill(); process.exitCode = 1; }, 180000);
 async function main() {
   const { targetId } = await request('Target.createTarget', { url: 'about:blank' });
   const { sessionId } = await request('Target.attachToTarget', { targetId, flatten: true });
@@ -50,6 +50,30 @@ async function main() {
     throw new Error(`Timed out: ${expression}`);
   };
   const tick = () => js('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+  const stableSearchDialog = async (pane, search, queries, maxWidth, maxHeight) => {
+    const geometry = () => js(`(() => {
+      const pane=document.querySelector(${JSON.stringify(pane)});
+      const rect=element=>element?['x','y','width','height'].map(key=>element.getBoundingClientRect()[key]):null;
+      const footer=pane.querySelector(':scope > form > .actions, :scope > .actions, .dropdown-count');
+      return {frame:rect(pane),search:rect(pane.querySelector(${JSON.stringify(search)})),footer:rect(footer),
+        viewport:[innerWidth,innerHeight],titlebar:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--titlebar-height'))};
+    })()`);
+    const before = await geometry();
+    for (const query of queries) {
+      await js(`(() => {const input=document.querySelector(${JSON.stringify(pane)}).querySelector(${JSON.stringify(search)});input.value=${JSON.stringify(query)};input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+      await tick();
+      const after = await geometry();
+      for (const key of ['frame','search','footer']) {
+        assert.equal(Boolean(after[key]), Boolean(before[key]));
+        if (before[key]) assert(after[key].every((value,index)=>Math.abs(value-before[key][index])<=1),
+          `${pane} ${key} must stay fixed while filtering ${JSON.stringify(query)}: ${JSON.stringify({before,after})}`);
+      }
+    }
+    const [x,y,width,height] = before.frame;
+    assert(width<=maxWidth+1 && height<=maxHeight+1 && x>=7 && y>=before.titlebar+7 &&
+      x+width<=before.viewport[0]-7 && y+height<=before.viewport[1]-7,
+      `${pane} must retain its size cap and window margins: ${JSON.stringify(before)}`);
+  };
   const overflow = async () => {
     const failures = await js(`({page:document.documentElement.scrollWidth>innerWidth,buttons:[...document.querySelectorAll('button')].filter(b=>b.getClientRects().length&&b.clientWidth&&(b.scrollWidth>b.clientWidth+1||b.scrollHeight>b.clientHeight+1)).map(b=>b.getAttribute('aria-label')||b.textContent)})`);
     assert.deepEqual(failures, { page: false, buttons: [] });
@@ -416,6 +440,7 @@ async function main() {
     assert(await js(`document.querySelector(${JSON.stringify(pane)}).contains(document.activeElement)`),
       'Keyboard focus must stay inside the active overlay');
   };
+  if (!process.argv.includes('--shortcuts-only')) {
   await run('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'no-preference'}]});
   for (const [width, height] of [[1140, 740], [550, 490]]) {
     await run('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
@@ -465,10 +490,11 @@ async function main() {
       await wait("!dialog.getAnimations().some(a=>a.playState==='running')"); await overflow();
       await windowChrome('#dialog');
       await shot(`host-editor-${theme}-${width}.png`);
-      await js("dialog.querySelector('[aria-label=\"连接路径\"]').scrollIntoView({block:'center'})");
+      await js("dialog.querySelector('[aria-label=\"连接路径\"]').closest('details').open = true; dialog.querySelector('[aria-label=\"连接路径\"]').scrollIntoView({block:'center'})");
       await tick();
       await js("dialog.querySelector('[aria-label=\"连接路径\"]').click()");
       await tick(); await overflow(); await shot(`jump-search-${theme}-${width}.png`);
+      await stableSearchDialog('.dropdown-searchable','input[type="search"]',['不存在的主机-geometry',''],640,380);
       await js('closeDropdown()');
       await js('dialog.close()'); await tick();
       await js("document.querySelector('.host-open[data-host-id=\"key-host\"]').parentElement.querySelector('.host-quick-edit').click()");
@@ -476,8 +502,12 @@ async function main() {
       await wait("!dialog.getAnimations().some(a=>a.playState==='running')");
       await js("document.querySelector('.host-key-selection').scrollIntoView({block:'center'})");
       await tick(); await overflow(); await shot(`host-key-${theme}-${width}.png`);
-      await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='选择私钥').click()");
+      await js("window.originalKeyScan=api.keys.scan;window.pendingKeyScans=[];api.keys.scan=(...args)=>new Promise(resolve=>pendingKeyScans.push(()=>resolve(originalKeyScan(...args))));[...dialog.querySelectorAll('button')].find(b=>b.textContent==='选择私钥').click()");
+      const loadingKeyBounds = await js("(()=>{const r=$('key-dialog').getBoundingClientRect();return [r.x,r.y,r.width,r.height]})()");
+      await js("api.keys.scan=originalKeyScan;pendingKeyScans.forEach(release=>release())");
       await wait("document.querySelector('#key-dialog[open] [role=radio]')"); await overflow();
+      assert((await js("(()=>{const r=$('key-dialog').getBoundingClientRect();return [r.x,r.y,r.width,r.height]})()")).every((value,index)=>Math.abs(value-loadingKeyBounds[index])<=1),
+        'Private key picker must keep its frame while loading changes into results');
       await windowChrome('#key-dialog');
       await shot(`key-picker-${theme}-${width}.png`);
       await js("[...document.querySelectorAll('#key-dialog .actions button')].find(b=>b.textContent==='关闭').click();dialog.close()"); await tick();
@@ -498,6 +528,7 @@ async function main() {
         await js(`openSettings('${section}')`);
         await wait("document.querySelector('#settings-page .settings-form')"); await tick(); await overflow();
         await settingsAlignment(section);
+        if (section === 'snippets') await shot(`command-library-${theme}-${width}.png`);
       }
       await js("openSettings('preferences')"); await wait("document.querySelector('#settings-page .settings-form')");
       await shot(`settings-${theme}-${width}.png`);
@@ -508,11 +539,32 @@ async function main() {
       await shot(`quick-connect-filters-${theme}-${width}.png`);
       await js('removeTab(active); selectTab([...tabs.values()].find(tab=>tab.kind===\'shell\'))');
       await js('chooseSession()'); await tick(); await overflow();
+      await stableSearchDialog('#session-switcher','input[type="search"]',['不存在的会话-geometry','API',''],720,500);
       await shot(`session-filters-${theme}-${width}.png`);
       await js("$('session-switcher').close()"); await tick();
       await js('void openPalette()'); await wait('dialog.open'); await tick(); await overflow();
+      await stableSearchDialog('#dialog','input[type="search"]',['disk','不存在的命令-geometry',''],640,600);
       await shot(`palette-filters-${theme}-${width}.png`);
       await js('dialog.close()'); await tick();
+      await js("void openPalette('commands')"); await wait('dialog.open'); await tick(); await overflow();
+      await stableSearchDialog('#dialog','input[type="search"]',['磁盘空间','不存在的命令-geometry',''],640,600);
+      await shot(`quick-commands-${theme}-${width}.png`);
+      if(theme==='dark') {
+        await run('Emulation.setDeviceMetricsOverride',{width:1800,height:1200,deviceScaleFactor:1,mobile:false}); await tick();
+        const capped=await js('({width:dialog.offsetWidth,height:dialog.offsetHeight})');
+        assert(capped.width<=640 && capped.height<=600, 'Quick commands must stop growing on a large window');
+        await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false}); await tick();
+      }
+      await js('dialog.close()'); await tick();
+      if(theme==='dark') {
+        await js("window.dialogStressCount=previewSnippets.length;for(let index=0;index<100;index++)previewSnippets.push({id:'dialog-stress-'+index,name:'窗口回归命令 '+index,command:'echo '+index,tags:['dialog-stress'],pinned:index<8,order:1000+index});void openPalette('commands')");
+        await wait('dialog.open'); await tick();
+        assert(await js("(()=>{const list=dialog.querySelector('.palette-list'),fields=dialog.querySelector('.dialog-fields');const actions=dialog.querySelector('.actions').getBoundingClientRect(),frame=dialog.getBoundingClientRect();return list.clientHeight>0&&list.scrollHeight>list.clientHeight&&fields.scrollHeight<=fields.clientHeight+1&&actions.bottom<=frame.bottom-8})()"),
+          'Long command results must scroll internally while search and footer remain visible');
+        await stableSearchDialog('#dialog','input[type="search"]',['窗口回归命令 99','不存在的命令-geometry',''],640,600);
+        await shot(`quick-commands-overflow-${width}.png`);
+        await js('dialog.close();previewSnippets.splice(dialogStressCount)'); await tick();
+      }
       await js(`selectTab(tabs.get(${JSON.stringify(selectionOrigin)}) || undefined, 'settings')`);
       const beforeFourPanes = await js('({ active: active?.id, split: splitLayout, filesOpen, ids: [...tabs.keys()] })');
       await js(`(async () => {
@@ -647,6 +699,101 @@ async function main() {
   await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='取消').click()");
   assert.equal(await js('dialog.open'),false);
   console.log('PASS: workspace navigation, four-pane layouts and both separators, compact file panel, and file-editor drag, resize, fullscreen and restore at both window sizes.');
+  }
+  const userAgent = await js('navigator.userAgent');
+  for (const [platform, modifiers, prefix] of [['Win32', 2, 'Ctrl+'], ['MacIntel', 4, '⌘']]) {
+    await run('Emulation.setDeviceMetricsOverride', { width: platform === 'Win32' ? 550 : 1140, height: 740, deviceScaleFactor: 1, mobile: false });
+    await run('Emulation.setUserAgentOverride', { userAgent, platform });
+    await run('Page.navigate', { url: pathToFileURL(path.join(root, 'dist/ux-review/workspace.html')).href + `?platform=${platform}#shortcuts` });
+    await wait(`location.hash === '#shortcuts' && navigator.platform === '${platform}' && typeof keyboard !== 'undefined' && keyboard.isMac === ${platform === 'MacIntel'} && hostsLoaded`);
+    const key = async (name, code, virtual, extra = 0) => {
+      await run('Input.dispatchKeyEvent', { type: 'keyDown', key: name, code, windowsVirtualKeyCode: virtual, modifiers: modifiers | extra });
+      await run('Input.dispatchKeyEvent', { type: 'keyUp', key: name, code, windowsVirtualKeyCode: virtual, modifiers: modifiers | extra });
+      await tick();
+    };
+    assert.equal(await js("document.querySelector('#palette-button kbd').textContent"), `${prefix}K`);
+    assert((await js("document.getElementById('add-tab').title")).includes(`${prefix}T`));
+    await overflow();
+    await key('t', 'KeyT', 84);
+    assert.equal(await js('active.kind'), 'new');
+    await key('w', 'KeyW', 87);
+    assert.equal(await js('tabs.size'), 0);
+    const collapsed = await js('workspace.dataset.navCollapsed');
+    await key('b', 'KeyB', 66);
+    assert.notEqual(await js('workspace.dataset.navCollapsed'), collapsed);
+    await key('b', 'KeyB', 66);
+    await js('void openHost(previewHosts[0])');
+    await wait('active?.status === "ready"');
+    await js('previewCalls.length = 0; active.terminal.focus()');
+    await key('k', 'KeyK', 75);
+    assert(await js('dialog.open'));
+    assert.equal(await js("previewCalls.filter(([type]) => type === 'input').length"), 0);
+    await js('dialog.close()');
+    await key('f', 'KeyF', 70);
+    assert(await js("!document.getElementById('terminal-find').hidden"));
+    await js("document.getElementById('close-find').click()");
+    const fontSize = await js('active.terminal.options.fontSize');
+    await key('=', 'Equal', 187);
+    assert.equal(await js('active.terminal.options.fontSize'), fontSize + 1);
+    await key('0', 'Digit0', 48);
+    assert.equal(await js('active.terminal.options.fontSize'), fontSize);
+    await key('e', 'KeyE', 69);
+    assert(await js('filesOpen'));
+    await key('e', 'KeyE', 69);
+    assert.equal(await js('filesOpen'), false);
+    await key('t', 'KeyT', 84);
+    await key('1', 'Digit1', 49);
+    assert.equal(await js('active.kind'), 'shell');
+    await key('j', 'KeyJ', 74);
+    assert(await js('sessionSwitcher.open'));
+    await js('sessionSwitcher.close()');
+    await tick();
+    if (platform === 'Win32') {
+      await key('Tab', 'Tab', 9);
+      assert.equal(await js('active.kind'), 'new');
+      await key('Tab', 'Tab', 9, 8);
+      assert.equal(await js('active.kind'), 'shell');
+    }
+    assert.equal(await js("previewCalls.filter(([type]) => type === 'input').length"), 0, 'App shortcuts must not send terminal controls');
+    // A synthetic selected-copy key tests xterm routing without touching the OS clipboard.
+    await js(`active.terminal.write('copy fixture'); active.terminal.select(0, 0, 4);
+      active.terminal.textarea.dispatchEvent(new KeyboardEvent('keydown', { key:'c', code:'KeyC', keyCode:67, bubbles:true, cancelable:true,
+        ctrlKey:${platform === 'Win32'}, metaKey:${platform !== 'Win32'} }))`);
+    assert.equal(await js("previewCalls.filter(([type]) => type === 'input').length"), 0);
+    await js('active.terminal.clearSelection(); active.terminal.focus()');
+    for (const [name, virtual] of [['c', 67], ['d', 68], ['r', 82]]) {
+      await run('Input.dispatchKeyEvent', { type: 'keyDown', key: name, code: `Key${name.toUpperCase()}`, windowsVirtualKeyCode: virtual, modifiers: 2 });
+      await run('Input.dispatchKeyEvent', { type: 'keyUp', key: name, code: `Key${name.toUpperCase()}`, windowsVirtualKeyCode: virtual, modifiers: 2 });
+    }
+    assert.deepEqual(await js("previewCalls.filter(([type]) => type === 'input').map(([, value]) => value.data)"), ['\x03', '\x04', '\x12']);
+    await js("openTerminalPath(active, '/srv/app/config.json')");
+    await wait("Boolean(fileEditor.querySelector('.cm-content'))");
+    await js("fileEditor.querySelector('.cm-content').focus(); document.execCommand('insertText', false, ' ')");
+    await key('s', 'KeyS', 83);
+    assert.equal(await js("previewCalls.filter(([type]) => type === 'save-text').length"), 1);
+    assert((await js("[...fileEditor.querySelectorAll('button')].find(b => b.textContent === '保存').title")).includes(`${prefix}S`));
+    await overflow();
+    await js("[...fileEditor.querySelectorAll('button')].find(b => b.textContent === '取消').click()");
+    await js("applyVaultState({...vaultStatus, enabled:true, locked:false, startupUnlockSupported:true, startupUnlockRequired:true}); void openSettings('security')");
+    await wait("Boolean(document.getElementById('vault-startup-unlock'))");
+    assert(await js("document.getElementById('vault-startup-unlock').checked"));
+    await js("document.getElementById('vault-startup-unlock').click()");
+    await tick();
+    assert.equal(await js("document.getElementById('vault-startup-unlock').checked"), false);
+    assert(await js("document.getElementById('settings-page').textContent.includes('本机的加密凭据')"));
+    assert.equal(await js("document.getElementById('settings-page').textContent.includes('钥匙串')"), false);
+    await js("selectTab(undefined, 'hosts'); currentGroup = ''; void editHost()");
+    await wait("Boolean(dialog.querySelector('.host-form-section'))");
+    assert(await js("dialog.querySelector('.group-inheritance-options').hidden"));
+    assert.equal(await js("dialog.querySelector('[aria-label=\"连接路径\"]').closest('details').open"), false);
+    assert.equal(await js("dialog.querySelector('[aria-label=\"认证方式\"]').closest('.dropdown').querySelector('select').value"), 'password');
+    await overflow();
+    await shot(`host-create-${platform}.png`);
+    await js('dialog.close()');
+    console.log(`${platform}: PASS platform hints, tabs, search, find, files, zoom, editor save, copy routing and shell controls`);
+    console.log(`${platform}: PASS app-encrypted automatic-unlock setting and platform-neutral help`);
+    console.log(`${platform}: PASS simplified new-host form and collapsed advanced connection settings`);
+  }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   clearTimeout(deadline);

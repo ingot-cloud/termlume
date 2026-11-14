@@ -7,13 +7,12 @@ use russh::keys::{
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::LazyLock,
     time::Duration,
 };
-use uuid::Uuid;
+#[cfg(target_os = "macos")]
+use std::{io::Write, process::{Command, Stdio}};
 use zeroize::Zeroizing;
 
 use crate::{error, store::write_exclusive, vault::bounded_read};
@@ -40,8 +39,17 @@ pub async fn agent() -> Result<AgentClient<tokio::net::UnixStream>, String> {
     let socket = agent_socket().ok_or("找不到本机 SSH Agent，请确认已启动并加载密钥。")?;
     AgentClient::connect_uds(socket).await.map_err(error)
 }
+#[cfg(windows)]
+pub async fn agent() -> Result<AgentClient<tokio::net::windows::named_pipe::NamedPipeClient>, String> {
+    let pipe = std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|value| value.to_string_lossy().starts_with(r"\\.\pipe\"))
+        .unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".into());
+    tokio::time::timeout(Duration::from_secs(5), AgentClient::connect_named_pipe(pipe))
+        .await.map_err(|_| "连接 Windows SSH Agent 超时。".to_owned())?
+        .map_err(|_| "SSH Agent 未运行，请启动已有 Agent 并加载密钥，或选择本机私钥/SSH 密码；连接不需要安装系统 OpenSSH。".into())
+}
 pub async fn agent_keys() -> Value {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         if let Ok(Ok(keys)) = tokio::time::timeout(Duration::from_millis(1500), async {
             let mut agent = agent().await?;
@@ -177,6 +185,8 @@ pub fn generate(directory: &Path, name: &str, passphrase: &str) -> Result<Value,
 }
 
 pub fn copy(value: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    return crate::platform::windows::copy_text(value);
     #[cfg(target_os = "macos")]
     {
         let mut child = Command::new("/usr/bin/pbcopy")
@@ -193,40 +203,8 @@ pub fn copy(value: &str) -> Result<(), String> {
             return Ok(());
         }
     }
+    #[cfg(not(windows))]
     Err("无法访问系统剪贴板。".into())
-}
-
-#[cfg(target_os = "macos")]
-const SERVICE: &str = "app.termlume.desktop SSH password";
-pub fn get_password(token: Uuid) -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let bytes =
-            security_framework::passwords::get_generic_password(SERVICE, &token.to_string())
-                .map_err(error)?;
-        return String::from_utf8(bytes).map_err(error);
-    }
-    #[allow(unreachable_code)]
-    Err("系统凭据存储暂不可用。".into())
-}
-pub fn set_password(token: Uuid, secret: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        return security_framework::passwords::set_generic_password(
-            SERVICE,
-            &token.to_string(),
-            secret.as_bytes(),
-        )
-        .map_err(error);
-    }
-    #[allow(unreachable_code)]
-    Err("系统凭据存储暂不可用。".into())
-}
-pub fn delete_password(token: Uuid) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = security_framework::passwords::delete_generic_password(SERVICE, &token.to_string());
-    }
 }
 
 #[derive(Default)]

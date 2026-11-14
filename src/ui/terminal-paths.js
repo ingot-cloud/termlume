@@ -142,7 +142,7 @@
       callback(links.map(({ path, text, range }) => ({
         text, range,
         activate: (event) => {
-          if (event.metaKey && event.button === 0) {
+          if (window.keyboardShortcuts.primary(event) && event.button === 0) {
             const last = directories.at(-1);
             activate(path, text, !last || range.start.y - 1 >= last.marker.line);
           }

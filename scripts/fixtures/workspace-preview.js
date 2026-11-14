@@ -85,9 +85,11 @@ const previewKeys = [
 let previewPreferences = {theme:'dark',terminalTheme:'dark',fontFamily:'Menlo, monospace',fontSize:14,recordCommands:false};
 const previewIdentities = [{id:'ops',name:'运维登录配置',username:'ops',auth:'agent',hosts:[],groups:[]}];
 const previewLayouts = [];
+const previewCommandDefaults = /* COMMAND_DEFAULTS */ [];
 const previewSnippets = [
-  {id:'disk',name:'磁盘巡检',command:'df -h',tags:['ops','disk']},
-  {id:'multi',name:'服务检查',command:'pwd\nuptime',tags:['ops']}
+  {id:'disk',name:'磁盘巡检',command:'df -h',tags:['ops','disk'],pinned:true,order:0},
+  {id:'multi',name:'服务检查',command:'pwd\nuptime',tags:['ops'],pinned:false,order:5},
+  ...structuredClone(previewCommandDefaults)
 ];
 window.termlume = {
   chrome: { startDragging: async () => previewCalls.push(['window-drag']),
@@ -114,7 +116,17 @@ window.termlume = {
     return { identityId: identity.id, hosts: previewHosts };
   }},
   keys:{scan:async()=>({directory:'/preview/.ssh',keys:previewKeys}),agent:async()=>({available:true,keys:[]})},
-  snippets:{list:async()=>previewSnippets,run:async value=>previewCalls.push(['run',value])},
+  snippets:{list:async()=>structuredClone(previewSnippets),run:async value=>previewCalls.push(['run',value]),
+    save:async ({snippet,expected})=>{
+      previewCalls.push(['save-snippet',snippet]);
+      const index=previewSnippets.findIndex(s=>s.id===snippet.id);
+      if(index>=0 && JSON.stringify(previewSnippets[index])!==JSON.stringify(expected)) throw new Error('命令已变化，请刷新后重试。');
+      const saved={...snippet,id:snippet.id||`snippet-${previewCalls.length}`};
+      if(index<0)previewSnippets.push(saved);else previewSnippets[index]=saved;
+      return structuredClone(previewSnippets);
+    },
+    remove:async ({snippet})=>{const index=previewSnippets.findIndex(s=>s.id===snippet.id);const original=previewCommandDefaults.find(s=>s.id===snippet.id);if(original)previewSnippets[index]=structuredClone(original);else previewSnippets.splice(index,1);},
+    reorder:async ({ids})=>{ids.forEach((id,index)=>{previewSnippets.find(s=>s.id===id).order=(index+1)*10;});previewSnippets.sort((a,b)=>a.order-b.order);}},
   ssh:{jumpHosts:true,connect:async value=>{previewCalls.push(['connect',value]);queueMicrotask(()=>previewListener({type:'session',id:value.id,status:'ready'}));},input:async value=>previewCalls.push(['input',value]),resize:value=>previewResizes.push(value),ack(){},close:async()=>{},directory:async()=>'/srv/app'},
   commands:{preview:async()=> 'df -h',close:async()=>{},stop:async()=>{}},
   files:{

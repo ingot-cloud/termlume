@@ -5,27 +5,6 @@ import Security
 
 private let vaultKeyLength = 32
 
-@_cdecl("termlume_startup_key_read")
-func startupKeyRead(
-    _ service: UnsafePointer<CChar>, _ account: UnsafePointer<CChar>, _ output: UnsafeMutableRawPointer
-) -> Bool {
-    let query: [CFString: Any] = [
-        kSecClass: kSecClassGenericPassword,
-        kSecAttrService: String(cString: service),
-        kSecAttrAccount: String(cString: account),
-        kSecReturnData: true,
-        kSecUseAuthenticationUI: kSecUseAuthenticationUIFail
-    ]
-    var result: CFTypeRef?
-    guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-          var bytes = result as? Data else { return false }
-    result = nil
-    defer { bytes.resetBytes(in: bytes.startIndex..<bytes.endIndex) }
-    guard bytes.count == vaultKeyLength else { return false }
-    bytes.copyBytes(to: output.assumingMemoryBound(to: UInt8.self), count: bytes.count)
-    return true
-}
-
 @available(macOS 10.15, *)
 private struct TouchIDCredential: Codable {
     // CryptoKit exports an opaque blob that only this Secure Enclave can restore.

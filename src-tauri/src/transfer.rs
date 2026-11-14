@@ -133,6 +133,8 @@ fn remote_join(dir: &str, name: &str) -> String {
 
 fn local_name(name: &str) -> Result<&str, String> {
     file_name(name)?;
+    #[cfg(windows)]
+    crate::platform::windows_file_name(name)?;
     let mut parts = Path::new(name).components();
     if !matches!(parts.next(), Some(Component::Normal(part)) if part == name)
         || parts.next().is_some()
@@ -204,7 +206,7 @@ async fn scan_folder(
     remaining: &mut usize,
     cancel: &CancellationToken,
 ) -> Result<(DownloadFolder, u64), String> {
-    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+    if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
         return Err("此平台暂不支持下载整个目录。".into());
     }
     let root = remote_path(&sftp.canonicalize(path).await.map_err(error)?)?;
@@ -1202,12 +1204,14 @@ impl Job {
 }
 
 fn publish_folder(source: &Path, target: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    return crate::platform::windows::publish_folder(source, target);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use rustix::fs::{renameat_with, RenameFlags, CWD};
         renameat_with(CWD, source, CWD, target, RenameFlags::NOREPLACE).map_err(error)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = (source, target);
         Err("此平台暂不支持下载整个目录。".into())
@@ -1613,7 +1617,7 @@ pub async fn open_editor(
         .tempdir()
         .map_err(error)?;
     let name = path.rsplit('/').next().ok_or("文件名无效。")?;
-    file_name(name)?;
+    local_name(name)?;
     let local = temp.path().join(name);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1640,7 +1644,12 @@ pub async fn open_editor(
             })
             .await?;
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        {
+            let local = local.clone();
+            crate::blocking(move || crate::platform::windows::open_text_editor(&local)).await?;
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
         return Err("外部编辑暂仅支持 macOS。".into());
     }
     let id = Uuid::new_v4();

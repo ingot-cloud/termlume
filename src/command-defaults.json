@@ -1,0 +1,6 @@
+[
+  {"id":"82a04590-186b-4c33-a7cd-000000000001","name":"磁盘空间","command":"df -h","tags":["磁盘","系统"],"pinned":true,"order":10,"builtin":"disk"},
+  {"id":"82a04590-186b-4c33-a7cd-000000000002","name":"查看日志末尾","command":"tail -n {{lines}} {{path}}","tags":["日志"],"pinned":false,"order":20,"builtin":"tail"},
+  {"id":"82a04590-186b-4c33-a7cd-000000000003","name":"跟踪日志","command":"tail -n {{lines}} -f {{path}}","tags":["日志"],"pinned":false,"order":30,"builtin":"follow"},
+  {"id":"82a04590-186b-4c33-a7cd-000000000004","name":"服务日志","command":"journalctl --unit={{service}} -n {{lines}} --no-pager","tags":["日志","服务"],"pinned":false,"order":40,"builtin":"journal"}
+]

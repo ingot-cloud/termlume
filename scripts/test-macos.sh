@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+node scripts/prepare-macos-tools.cjs
 export TERMLUME_TEST_FIXTURE
 TERMLUME_TEST_FIXTURE=$(mktemp -d /tmp/termlume-tests.XXXXXX)
 fixture=$TERMLUME_TEST_FIXTURE
@@ -34,6 +35,8 @@ HostKey $fixture/host
 AuthorizedKeysFile $fixture/authorized_keys
 StrictModes no
 UsePAM no
+AcceptEnv LC_CTYPE
+SetEnv LANG=C
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin no

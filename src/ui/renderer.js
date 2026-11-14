@@ -2,6 +2,8 @@
 
 const api = window.termlume;
 const terminalPaths = window.terminalPaths;
+const keyboard = window.keyboardShortcuts;
+keyboard.hints(document);
 const { selectControl, editableControl, close: closeDropdown } = window.dropdowns;
 const $ = (id) => document.getElementById(id);
 const workspace = $('workspace');
@@ -376,6 +378,9 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
     dialog.replaceChildren(header, form);
     dialog.classList.toggle('host-drawer', Boolean(options.drawer));
     dialog.classList.toggle('split-dialog', Boolean(options.split));
+    const collection = 'input[type="search"], .palette-list, .key-list, .forward-list, .target-list';
+    dialog.classList.toggle('collection-dialog', !options.drawer && fields.some(field =>
+      field.matches?.(collection) || field.querySelector?.(collection)));
     const cancelEvent = (event) => {
       event.preventDefault();
       if (canClose()) closePrompt();
@@ -829,7 +834,7 @@ async function disableVault() {
   const mode = unlockMethod();
   try {
     const state = await prompt('关闭主密码保护', [
-      node('p', '', '本机工作区将改为不加密保存，应用锁和 Git 同步也会关闭。只存在于加密工作区中的 SSH 密码会移除，已存在系统钥匙串的密码会保留。'),
+      node('p', '', '主密码保护、应用锁和 Git 同步将关闭，工作区仍由应用在本机加密保存。仅在保险库中的 SSH 密码会移除，已在本机保存的密码会保留。'),
       node('p', 'muted', '已导出的备份和 Git 历史仍保留，仍需原主密码或恢复密钥才能打开。'),
       field('验证方式', selectControl(mode, '验证方式')), field('主密码或恢复密钥', secret)
     ], '确认关闭', () => api.vault.disable({ secret: secret.value, useRecovery: mode.value === 'recovery' }));
@@ -982,7 +987,7 @@ function renderSecurityPage() {
     const lockEnabled = startupUnlockRequired !== false;
     if (vaultStatus.startupUnlockSupported && api.vault.setStartupUnlockRequired) {
       appLock.append(securitySwitch('vault-startup-unlock', '使用应用锁',
-        '开启后，启动时需要解锁 Termlume。关闭后，本机会使用系统钥匙串自动解锁，工作区、备份和同步快照仍加密保存。',
+        '开启后，启动时需要解锁 Termlume。关闭后，应用使用仅保存在本机的加密凭据自动解锁，工作区、备份和同步快照仍加密保存。',
         lockEnabled, async required => {
           applyVaultState(await api.vault.setStartupUnlockRequired(required));
           status(required ? '已开启应用锁。' : '已关闭应用锁，本机启动时将自动解锁。');
@@ -1274,7 +1279,7 @@ function manageKeys(onSelect, currentPath) {
   });
 }
 
-function passwordEditor(host, auth, hasPassword, sameTarget) {
+function passwordEditor(host, auth, hasPassword, sameTarget, isLinked = () => false) {
   const password = input('', 'password');
   password.autocomplete = 'new-password';
   password.spellcheck = false;
@@ -1292,10 +1297,10 @@ function passwordEditor(host, auth, hasPassword, sameTarget) {
   let generation = 0;
   let timer;
   let loading = false;
-  const eligible = () => hasPassword && sameTarget();
+  const eligible = () => hasPassword && sameTarget() && !isLinked();
   const visible = () => password.type === 'text' || !revealed.hidden;
   const update = () => {
-    pane.hidden = auth.value !== 'password';
+    pane.hidden = auth.value !== 'password' || isLinked();
     const saved = eligible();
     password.placeholder = saved ? '留空保留已保存的密码' : '留空可在连接时输入';
     toggle.textContent = visible() ? '隐藏' : !password.value && saved ? '查看已保存' : '显示';
@@ -1303,7 +1308,7 @@ function passwordEditor(host, auth, hasPassword, sameTarget) {
     toggle.disabled = loading || password.form?.getAttribute('aria-busy') === 'true' || (!password.value && !saved);
     hint.textContent = hasPassword && !saved
       ? '连接信息有变更，请为新目标输入密码。'
-      : '填写后保存到 macOS 钥匙串。';
+      : '填写后由 Termlume 加密保存在本机。';
   };
   const hide = () => {
     generation++;
@@ -1853,12 +1858,12 @@ async function saveSessionLayout() {
   name.maxLength = 120;
   name.placeholder = '例如：应用与数据库';
   const saved = await prompt('保存会话布局', [
-    node('p', 'muted', '保存当前分屏中的会话、排列和尺寸。以后可按 ⌘K 搜索布局名称直接打开。'),
+    node('p', 'muted', `保存当前分屏中的会话、排列和尺寸。以后可按 ${keyboard.label('K')} 搜索布局名称直接打开。`),
     field('布局名称', name),
     node('p', 'muted', sessionLayoutSummary(layout)),
     node('ul', 'layout-hosts', ...sessions.map(tab => node('li', '', tab.title || tab.host.name)))
   ], '保存布局', () => api.layouts.save({ layout: { ...layout, name: name.value.trim() } }));
-  if (saved) status(`已保存会话布局「${name.value.trim()}」，按 ⌘K 搜索名称即可打开。`);
+  if (saved) status(`已保存会话布局「${name.value.trim()}」，按 ${keyboard.label('K')} 搜索名称即可打开。`);
 }
 
 let openingSessionLayout = false;
@@ -1914,7 +1919,7 @@ async function manageLayouts(page) {
         button('重命名', () => { choice = { rename: layout }; close(); }, 'outlined'),
         button('删除', () => { choice = { remove: layout }; close(); }, 'outlined danger'))));
     await ask('会话布局', [
-      node('p', 'muted', '管理已保存的会话和分屏排列。在分屏工作区的标签上点「保存布局」图标创建，按 ⌘K 搜索布局名称打开。'),
+      node('p', 'muted', `管理已保存的会话和分屏排列。在分屏工作区的标签上点「保存布局」图标创建，按 ${keyboard.label('K')} 搜索布局名称打开。`),
       ...(rows.length ? rows : [node('p', 'muted', '还没有会话布局。先拖拽会话形成分屏，再点工作区标签上的「保存布局」图标。')])
     ], '关闭', () => true);
     if (!choice) break;
@@ -1940,31 +1945,92 @@ async function manageSnippets(session, page) {
   const close = () => finishSettingsPrompt(page);
 
   const attempt = session?.attempts;
-  while(page.active && !vaultStatus.locked) {
-    const snippets=await api.snippets.list();let choice;const search=input('','search');search.placeholder='搜索名称、标签和命令';const list=node('div','forward-list');
-    const render=()=>{const query=search.value.toLowerCase();list.replaceChildren(...snippets.filter(s=>`${s.name} ${s.command} ${s.tags.join(' ')}`.toLowerCase().includes(query)).map(s=>node('section','forward-rule',node('strong','',s.name),node('pre','operation-results',s.command),node('div','forward-actions',
-      ...((session?.status==='ready')?[...(!/[\r\n]/.test(s.command) ? [button('粘贴',()=>{choice={paste:s};close();},'outlined')] : []),button('执行',()=>{choice={run:s};close();},'outlined')]:[]),button('编辑',()=>{choice={snippet:s};close();},'outlined'),button('删除',()=>{choice={remove:s};close();},'outlined danger')))));};
-    search.addEventListener('input',render);render();await ask('命令库',[search,list],'关闭',()=>true,[button('新建命令',()=>{choice={create:true};close();},'outlined')]);if(!choice)break;
-    if(choice.paste){await useSnippet(session,choice.paste,true,attempt);return;}
-    if(choice.run){await useSnippet(session,choice.run,false,attempt);return;}
-    if(choice.remove){if(await confirm('删除命令',`删除「${choice.remove.name}」？`,'删除'))await api.snippets.remove({snippet:choice.remove,expected:choice.remove});continue;}
-    const s=choice.snippet;const name=input(s?.name);const tags=input(s?.tags.join(', ')||'');const command=node('textarea');command.rows=8;command.value=s?.command||'';
-    await ask(s?'编辑命令':'新建命令',[field('名称',name),field('标签（逗号分隔）',tags),field('命令文本',command)],'保存命令',()=>api.snippets.save({snippet:{id:s?.id,name:name.value,command:command.value,tags:tags.value.split(/[,，]/).map(t=>t.trim()).filter(Boolean)},expected:s}));
+  let query = '';
+  while (page.active && !vaultStatus.locked) {
+    const snippets = commandLibrary.sorted(await api.snippets.list());
+    if (!page.active) return;
+    let choice;
+    const pick = value => { choice = value; close(); };
+    const search = input(query, 'search');
+    search.placeholder = '搜索名称、标签和命令';
+    search.setAttribute('aria-label', '搜索命令库');
+    const list = node('div', 'command-library-list');
+    const render = () => {
+      query = search.value;
+      const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+      const visible = snippets.filter(s => words.every(word => `${s.name} ${s.command} ${s.tags.join(' ')}`.toLowerCase().includes(word)));
+      list.replaceChildren(...visible.map(s => {
+        const index = snippets.indexOf(s);
+        const up = button('↑', () => pick({ move: s, delta: -1 }), 'outlined', `上移 ${s.name}`);
+        const down = button('↓', () => pick({ move: s, delta: 1 }), 'outlined', `下移 ${s.name}`);
+        up.disabled = index === 0 || Boolean(words.length);
+        down.disabled = index === snippets.length - 1 || Boolean(words.length);
+        const pin = button(s.pinned ? '★ 快捷' : '☆ 设为快捷', () => pick({ pin: s }), 'outlined command-pin', `${s.pinned ? '取消快捷' : '设为快捷'} ${s.name}`);
+        pin.setAttribute('aria-pressed', String(Boolean(s.pinned)));
+        const heading = node('div', 'command-library-heading', node('strong', '', s.name),
+          ...(s.builtin ? [node('span', 'command-badge', '内置')] : []));
+        const actions = node('div', 'command-library-actions', pin, up, down,
+          button('编辑', () => pick({ snippet: s }), 'outlined', `编辑 ${s.name}`),
+          button(s.builtin ? '恢复默认' : '删除', () => pick({ remove: s }), 'outlined', `${s.builtin ? '恢复默认' : '删除'} ${s.name}`));
+        if (readySession(session, attempt)) {
+          if (!/[\r\n]/.test(s.command)) actions.append(button('填入终端', () => pick({ use: s }), 'outlined', `填入终端 ${s.name}`));
+          actions.append(button('独立执行', () => pick({ run: s }), 'outlined', `独立执行 ${s.name}`));
+        }
+        const row = node('section', 'command-library-row', heading, node('code', 'command-library-code', s.command), actions);
+        row.dataset.commandId = s.id;
+        return row;
+      }));
+      if (!visible.length) list.append(node('p', 'muted', '没有匹配的命令。'));
+    };
+    search.addEventListener('input', render); render();
+    const toolbar = node('div', 'command-library-toolbar', search, button('新建命令', () => pick({ create: true }), 'primary'));
+    await ask('命令库', [toolbar, node('p', 'muted command-library-help', '设为快捷的命令显示在顶部按钮区。使用 ↑ ↓ 调整顺序；清除搜索后可排序。'), list], '关闭', () => true);
+    if (!choice) break;
+    if (choice.use) { await useLibraryCommand(session, choice.use, undefined, attempt); return; }
+    if (choice.run) { await useLibraryCommand(session, choice.run, false, attempt); return; }
+    if (choice.pin) {
+      await api.snippets.save({ snippet: { ...choice.pin, pinned: !choice.pin.pinned }, expected: choice.pin });
+      continue;
+    }
+    if (choice.move) {
+      const ids = snippets.map(s => s.id), index = ids.indexOf(choice.move.id), target = index + choice.delta;
+      [ids[index], ids[target]] = [ids[target], ids[index]];
+      await api.snippets.reorder({ ids, expected: snippets });
+      continue;
+    }
+    if (choice.remove) {
+      const s = choice.remove;
+      if (await confirm(s.builtin ? '恢复内置命令' : '删除命令', s.builtin ? `将「${s.name}」的内容、快捷状态和顺序恢复为默认值？` : `删除「${s.name}」？`, s.builtin ? '恢复默认' : '删除')) {
+        await api.snippets.remove({ snippet: s, expected: s });
+      }
+      continue;
+    }
+    const s = choice.snippet, name = input(s?.name), tags = input(s?.tags.join(', ') || '');
+    name.required = true; name.maxLength = 120;
+    const command = node('textarea'); command.rows = 7; command.value = s?.command || ''; command.required = true;
+    const pinned = node('input'); pinned.type = 'checkbox'; pinned.checked = s ? Boolean(s.pinned) : true;
+    await ask(s ? '编辑命令' : '新建命令', [field('名称', name), field('命令文本', command),
+      node('p', 'muted', '可使用 {{path}}、{{service}}、{{lines}}，使用时填写日志路径、服务名和行数。路径与服务名会自动转义。'),
+      field('标签（逗号分隔）', tags), node('label', 'checkbox-row', pinned, '设为顶部快捷按钮')], '保存命令', () =>
+      api.snippets.save({ snippet: { ...s, name: name.value, command: command.value,
+        tags: tags.value.split(/[,，]/).map(t => t.trim()).filter(Boolean), pinned: pinned.checked,
+        order: s?.order ?? Math.max(0, ...snippets.map(item => item.order || 0)) + 10 }, expected: s }));
   }
 }
 
-async function useSnippet(session, snippet, paste = false, attempt = session?.attempts) {
+async function useSnippet(session, snippet, paste = false, attempt = session?.attempts, parameters) {
   if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择目标。');
+  const command = parameters ? commandLibrary.render(snippet.command, parameters) : snippet.command;
   if (paste) {
-    if (/[\r\n]/.test(snippet.command)) throw new Error('多行命令请使用执行预览。');
-    fillTerminalCommand(session, snippet.command, attempt);
+    if (/[\r\n]/.test(command)) throw new Error('多行命令请使用执行预览。');
+    fillTerminalCommand(session, command, attempt);
     return;
   }
-  if (!await confirm('执行保存的命令', `${session.host.name} · ${endpoint(session.host)}\n以当前 SSH 用户在独立命令通道执行：\n${snippet.command}`, '执行')) return;
+  if (!await confirm('执行保存的命令', `${session.host.name} · ${endpoint(session.host)}\n以当前 SSH 用户在独立命令通道执行：\n${command}`, '执行')) return;
   if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择目标。');
   const tab = {id: sessionId(), kind: 'command', sessionId: session.id, host: session.host, action: 'custom', status: 'connecting'};
   attachTerminal(tab); tabs.set(tab.id, tab); selectTab(tab);
-  try { await api.snippets.run({id: tab.id, sessionId: session.id, snippetId: snippet.id, expected: snippet}); }
+  try { await api.snippets.run({id: tab.id, sessionId: session.id, snippetId: snippet.id, expected: snippet, parameters}); }
   catch (error) { updateSession(tab, 'failed', message(error)); }
 }
 
@@ -1991,7 +2057,7 @@ async function manageGroups(page) {
   await refreshHosts();
 }
 
-const identityPurpose = '登录配置保存 SSH 用户名和认证方式，可给多台主机复用。在主机的「SSH 连接 → 登录配置」中选择，也可在「分组管理」中设为默认登录配置。';
+const identityPurpose = '登录配置保存 SSH 用户名和认证方式，可给多台主机复用。在主机的「更多设置 → 登录配置」中选择，也可在「分组管理」中设为默认登录配置。';
 const identityAuthLabels = { agent: 'SSH Agent', key: '本机私钥', password: 'SSH 密码' };
 
 async function editIdentity(identity, sourceHost, page, identities = []) {
@@ -2217,7 +2283,7 @@ async function editHost(host, draftTab, target) {
   }
   jump.value = host?.jumpHostId || '';
   const jumpPicker = hostSelectControl(jump, '连接路径', routeOptions.filter(item => item.address), { hint: '仅列出可用的直连主机' });
-  const routeHint = node('p', 'muted', api.ssh.jumpHosts ? '单跳连接：SSH、文件和日志共用此路径。跳板机须为已保存的直连主机。' : '跳板连接需使用 macOS 应用。');
+  const routeHint = node('p', 'muted', api.ssh.jumpHosts ? '单跳连接：SSH、文件和日志共用此路径。跳板机须为已保存的直连主机。' : '跳板连接需使用 Termlume 桌面应用。');
   const auth = node('select');
   for (const [value, label] of [['', '请选择认证方式'], ['agent', 'SSH Agent'], ['key', '本机私钥'], ['password', 'SSH 密码']]) {
     const option = node('option', '', label);
@@ -2241,10 +2307,18 @@ async function editHost(host, draftTab, target) {
   const normalizedAddress = () => addressField.value.trim().replace(/^\[(.*)\]$/, '$1').toLowerCase();
   const matches = (item) => item.address.toLowerCase() === normalizedAddress() && item.port === Number(port.value) && item.username === username.value.trim();
   const sameTarget = () => Boolean(host?.auth === 'password' && auth.value === 'password' && matches(host));
-  const editor = api.hosts.revealPassword ? passwordEditor(host, auth, hasPassword, sameTarget) : null;
+  const editor = api.hosts.revealPassword ? passwordEditor(host, auth, hasPassword, sameTarget,
+    () => Boolean(identity.value) || inheritIdentity.checked) : null;
   const inheritanceHint=node('p','muted');inheritanceHint.setAttribute('aria-live','polite');
+  const inheritanceOptions = node('div', 'group-inheritance-options',
+    node('label','checkbox-row',inheritPort,'继承分组端口（未设置时 22）'),
+    node('label','checkbox-row',inheritIdentity,'使用分组的登录配置'),
+    node('label','checkbox-row',inheritTheme,'继承分组终端配色'), inheritanceHint);
   const inheritedSource=property=>{let g=groupAssets.find(g=>g.path===group.value);const seen=new Set();while(g&&!seen.has(g.id)){seen.add(g.id);if(g[property]!==undefined&&g[property]!==null&&g[property]!=='')return g;g=groupAssets.find(p=>p.id===g.parentId);}return undefined;};
   const updateAuth = () => {
+    const grouped = Boolean(group.value.trim());
+    inheritanceOptions.hidden = !grouped;
+    if (!grouped) inheritPort.checked = inheritIdentity.checked = inheritTheme.checked = false;
     const portSource=inheritedSource('port'),identitySource=inheritedSource('identityId'),themeSource=inheritedSource('terminalTheme');
     const inheritedIdentity=identities.find(i=>i.id===identitySource?.identityId);
     const hints=[];
@@ -2254,6 +2328,7 @@ async function editHost(host, draftTab, target) {
     inheritanceHint.textContent=hints.join('；');inheritanceHint.hidden=!hints.length;
     const linked=Boolean(identity.value)||inheritIdentity.checked;
     const selectedIdentity = identities.find(item => item.id === identity.value);
+    identityHint.hidden = !selectedIdentity && !inheritIdentity.checked;
     identityHint.textContent = selectedIdentity
       ? `使用登录配置「${selectedIdentity.name}」中的用户名和认证方式。可到「设置 → 登录配置」统一修改。`
       : '选择登录配置，可让多台主机复用相同的 SSH 用户名和认证方式。也可以选择「单独配置此主机」。';
@@ -2265,7 +2340,7 @@ async function editHost(host, draftTab, target) {
     keySecretPane.hidden = auth.value !== 'key' || !api.hosts.hasKeyPassphrase;
     const savedKey = hasKeyPassphrase && key.value === host?.keyPath;
     keySecret.placeholder = savedKey ? '留空保留已保存的口令' : '未加密私钥可留空';
-    keySecretHint.textContent = savedKey ? '已保存在 macOS 钥匙串；连接时自动使用。' : '保存后连接时自动使用，不加入备份或 Git 同步。';
+    keySecretHint.textContent = savedKey ? '已由 Termlume 加密保存在本机；连接时自动使用。' : '由 Termlume 在本机加密保存，连接时自动使用，不加入备份或 Git 同步。';
     clearKeyRow.hidden = !savedKey;
     if (!savedKey) { clearKeySecret.checked = false; keySecret.disabled = false; }
     if (auth.value !== 'key') keySecret.value = '';
@@ -2314,7 +2389,10 @@ async function editHost(host, draftTab, target) {
     pasteHint.textContent = '已填入连接信息，请核对后保存。';
     updateDuplicate();
   });
-  const details = node('details', 'host-form-section', node('summary', '', '更多设置'), field('标签', tags), field('备注', note), field('常用日志路径', logPath), field('常用 systemd 服务', service),...(api.snippets?[field('终端配色（未继承时）',terminalThemePicker),field('SSH 保活间隔（秒，0 关闭）',keepalive),field('连接超时（秒）',timeout),field('启动命令',startup),node('label','checkbox-row',autoStartup,'每次新建连接后在终端自动执行上述命令'),node('label','checkbox-row',reconnect,'异常断线后自动重连（最多 3 次；仅 Agent 或已保存密码）'),node('p','muted','自动重连会创建新会话，也会重新执行已启用的启动命令；转发规则须手动恢复。')]:[]));
+  const details = node('details', 'host-form-section', node('summary', '', '更多设置'),
+    field('连接路径', jumpPicker), routeHint,
+    ...(api.identities ? [field('登录配置', identityPicker), node('p', 'muted', '选择登录配置可复用用户名和认证方式。')] : []),
+    field('标签', tags), field('备注', note), field('常用日志路径', logPath), field('常用 systemd 服务', service),...(api.snippets?[field('终端配色（未继承时）',terminalThemePicker),field('SSH 保活间隔（秒，0 关闭）',keepalive),field('连接超时（秒）',timeout),field('启动命令',startup),node('label','checkbox-row',autoStartup,'每次新建连接后在终端自动执行上述命令'),node('label','checkbox-row',reconnect,'异常断线后自动重连（最多 3 次；仅 Agent 或已保存密码）'),node('p','muted','自动重连会创建新会话，也会重新执行已启用的启动命令；转发规则须手动恢复。')]:[]));
   const management = host && node('details', 'host-form-section', node('summary', '', '管理主机'), node('div', 'management-actions',
     ...(hasPassword ? [button('清除已保存密码', () => { closePrompt('clear-password'); }, 'outlined')] : []),
     button('忘记指纹', () => { closePrompt('forget'); }, 'outlined'),
@@ -2332,9 +2410,9 @@ async function editHost(host, draftTab, target) {
   try {
     result = await prompt(host ? '编辑主机' : '新建主机', [
       node('section', 'host-form-section', node('h3', '', '地址'), field('主机地址', addressField), pasteHint),
-      node('section', 'host-form-section', node('h3', '', '常规'), field('显示名称', name), field('分组', groupPicker),...(api.groups?[node('label','checkbox-row',inheritPort,'继承分组端口（未设置时 22）'),node('label','checkbox-row',inheritIdentity,'使用分组的登录配置'),node('label','checkbox-row',inheritTheme,'继承分组终端配色'),inheritanceHint]:[])),
+      node('section', 'host-form-section', node('h3', '', '常规'), field('显示名称', name), field('分组', groupPicker), ...(api.groups ? [inheritanceOptions] : [])),
       node('section', 'host-form-section', node('h3', '', 'SSH 连接'),
-        node('div', 'dialog-row', field('SSH 用户名', username), field('端口', port)), ...(api.identities?[field('登录配置',identityPicker),identityHint]:[]), field('认证方式', authPicker), field('连接路径', jumpPicker), routeHint,
+        node('div', 'dialog-row', field('SSH 用户名', username), field('端口', port)), field('认证方式', authPicker), identityHint,
         keyRow, keySecretPane, ...(editor ? [editor.pane] : []), duplicateRow),
       details, ...(management ? [management] : [])
     ], '保存并连接', async (action) => {
@@ -2645,7 +2723,7 @@ function attachTerminal(tab) {
     event.preventDefault();
     void chooseTerminalPath(tab, selected).catch((error) => status(message(error)));
   });
-  terminal.attachCustomKeyEventHandler((event) => !event.metaKey);
+  terminal.attachCustomKeyEventHandler(event => keyboard.terminalKey(event, terminal.hasSelection()));
   terminal.onData((data) => {
     paths.invalidate(data);
     if (tab.status === 'ready') api.ssh.input({ id: tab.id, data });
@@ -3252,7 +3330,7 @@ async function connect(tab, enterPassword = false, automatic = false) {
   updateSession(tab, 'connecting', '正在准备 SSH 连接…');
   try {
     const jumpHost = tab.host.jumpHostId ? hosts.find((host) => host.id === tab.host.jumpHostId) : undefined;
-    if (tab.host.jumpHostId && !api.ssh.jumpHosts) throw new Error('跳板连接需使用 macOS 应用。');
+    if (tab.host.jumpHostId && !api.ssh.jumpHosts) throw new Error('跳板连接需使用 Termlume 桌面应用。');
     if (tab.host.jumpHostId && (!jumpHost || jumpHost.jumpHostId)) throw new Error('跳板机不可用，请编辑主机并核对连接路径。');
     if (jumpHost?.auth === 'key' && !jumpHost.keyPath) throw new Error(`请先为跳板机「${jumpHost.name}」选择本机私钥。`);
     tab.jumpHost = jumpHost;
@@ -3401,7 +3479,78 @@ function updateSession(tab, next, detail = '') {
   renderTabs();
 }
 
+async function useLibraryCommand(session, snippet, paste = !/[\r\n]/.test(snippet.command), attempt = session?.attempts) {
+  if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择命令。');
+  const keys = commandLibrary.parameters(snippet.command);
+  if (!keys.length) return useSnippet(session, snippet, paste, attempt);
+  const profile = hosts.find(host => host.id === session.host.id) || session.host;
+  const values = { path: profile.logPath || '', service: profile.service || 'sshd.service', lines: 100 };
+  const fields = [node('p', 'muted', `目标 ${session.host.name} · ${endpoint(session.host)}`)];
+  const preview = node('code', 'command-preview');
+  const update = () => { try { preview.textContent = commandLibrary.render(snippet.command, values); } catch (error) { preview.textContent = message(error); } };
+  for (const key of keys) {
+    const control = input(String(values[key]), key === 'lines' ? 'number' : 'text');
+    control.required = true;
+    if (key === 'lines') { control.min = 1; control.max = 10000; }
+    control.addEventListener('input', () => { values[key] = key === 'lines' ? Number(control.value) : control.value; update(); });
+    fields.push(field(({ path: '日志文件绝对路径', service: '服务名', lines: '行数' })[key], control));
+  }
+  update();
+  const confirmed = await prompt(snippet.name, [...fields, preview], paste ? '填入终端' : '预览执行', () => {
+    if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择命令。');
+    commandLibrary.render(snippet.command, values);
+    return true;
+  });
+  if (confirmed) await useSnippet(session, snippet, paste, attempt, values);
+}
+
+async function openQuickCommands() {
+  const source = active, session = origin(), attempt = session?.attempts;
+  const snippets = commandLibrary.sorted(await api.snippets.list());
+  if (vaultStatus.locked || active !== source || dialog.open) return;
+  const search = input('', 'search');
+  search.placeholder = '搜索命令名称、标签和内容'; search.setAttribute('aria-label', search.placeholder);
+  const choices = node('div', 'palette-list quick-command-panel');
+  let selected, entries = [];
+  const choose = action => { selected = action; dialog.close(); };
+  const update = () => {
+    const words = search.value.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    const matches = snippets.filter(s => words.every(word => `${s.name} ${s.command} ${s.tags.join(' ')}`.toLowerCase().includes(word)));
+    entries = []; choices.replaceChildren();
+    for (const [pinned, label] of [[true, '常用快捷'], [false, '其他命令']]) {
+      const group = matches.filter(s => Boolean(s.pinned) === pinned);
+      if (!group.length) continue;
+      choices.append(node('h3', 'palette-group', label));
+      const section = node('div', pinned ? 'quick-command-grid' : 'quick-command-list');
+      for (const snippet of group) {
+        const multiline = /[\r\n]/.test(snippet.command), parameters = commandLibrary.parameters(snippet.command).length > 0;
+        const run = () => useLibraryCommand(session, snippet, !multiline, attempt);
+        const control = button('', () => choose(run), `palette-choice ${pinned ? 'quick-command-tile' : 'quick-command-row'}`);
+        control.append(summaryText('span', pinned ? snippet.name : `${multiline ? '独立执行' : parameters ? '填写参数' : '填入终端'} · ${snippet.name}`),
+          summaryText('small', parameters ? '填写参数后预览' : multiline ? '预览后独立执行' : snippet.command));
+        control.disabled = !readySession(session, attempt);
+        if (!control.disabled) entries.push(run);
+        section.append(control);
+      }
+      choices.append(section);
+    }
+    if (!matches.length) choices.append(node('p', 'muted', '没有匹配的命令。'));
+    const submit = search.form?.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = !entries.length;
+  };
+  search.addEventListener('input', update);
+  const target = node('p', 'palette-target muted', session ? `命令目标：${session.host.name} · ${endpoint(session.host)}` : '连接主机后可使用命令');
+  const selection = prompt('快捷命令', [search, target, choices], '使用首项', () => entries[0],
+    [button('管理命令库', () => choose(() => manageSnippets(session)), 'outlined')]);
+  wireSearchChoices(search.form, search, choices, '.palette-choice:not(:disabled)');
+  update();
+  const first = await selection;
+  if (!vaultStatus.locked && (selected || first)) await (selected || first)();
+  else focusTerminal(source);
+}
+
 async function openPalette(scope = 'all') {
+  if (scope === 'commands' && api.snippets) return openQuickCommands();
   const source = active;
   const session = origin();
   const attempt = session?.attempts;
@@ -3422,7 +3571,7 @@ async function openPalette(scope = 'all') {
   const choose = run => { selected = run; dialog.close(); };
   const update = () => {
     const all = [];
-    const types = { '主机':'host', '已打开的会话':'session', '会话布局':'layout', '内置动作':'command', '保存的命令':'command', '会话操作':'command' };
+    const types = { '主机':'host', '已打开的会话':'session', '会话布局':'layout', '内置动作':'command', '保存的命令':'command', '命令库':'command', '会话操作':'command' };
     const add = (group, label, detail, run, keywords = '', relatedHosts = []) =>
       all.push({ group, label, detail, run, keywords, type: types[group] || 'tool', relatedHosts });
     if (scope !== 'commands') {
@@ -3437,13 +3586,13 @@ async function openPalette(scope = 'all') {
         add('主机', host.name, [endpoint(host), host.group, ...(host.tags || [])].filter(Boolean).join(' · '), () => openHost(host), host.note, [host]);
     }
     if (readySession(session, attempt)) {
-      for (const [action, label] of Object.entries(actionLabels).filter(([action]) => action !== 'custom'))
+      for (const [action, label] of Object.entries(actionLabels).filter(([action]) => !api.snippets && action !== 'custom'))
         add('内置动作', label, session.host.name, () => { if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择命令。'); return configureCommand(session, action); }, '', [session.host]);
-      for (const snippet of snippets) {
+      for (const snippet of commandLibrary.sorted(snippets)) {
         const keywords = `${snippet.command} ${snippet.tags.join(' ')}`;
         const multiline = /[\r\n]/.test(snippet.command);
-        if (!multiline) add('保存的命令', `填入终端 · ${snippet.name}`, '按回车后执行', () => useSnippet(session, snippet, true, attempt), keywords, [session.host]);
-        if (multiline || scope !== 'commands') add('保存的命令', `独立执行 · ${snippet.name}`, session.host.name, () => useSnippet(session, snippet, false, attempt), keywords, [session.host]);
+        if (!multiline) add('命令库', `填入终端 · ${snippet.name}`, '按回车后执行', () => useLibraryCommand(session, snippet, true, attempt), keywords, [session.host]);
+        if (multiline || scope !== 'commands') add('命令库', `独立执行 · ${snippet.name}`, session.host.name, () => useLibraryCommand(session, snippet, false, attempt), keywords, [session.host]);
       }
       add('会话操作', '在新标签连接', session.host.name, () => openHost(session.host, {force: true}), '', [session.host]);
     }
@@ -3919,7 +4068,7 @@ async function chooseTerminalPath(source = active, selected, knownDirectory) {
   const value = input(selected ? terminalPaths.resolve(selected, directory) || selected : directory);
   value.placeholder = '/var/log/app.log';
   const fields = [field('路径', value),
-    node('p', 'muted', '可按住 ⌘ 单击路径，也可选中文字后右键打开此窗口。请核对远端路径。')];
+    node('p', 'muted', `可按住 ${keyboard.modifier} 单击路径，也可选中文字后右键打开此窗口。请核对远端路径。`)];
   if (source.kind === 'shell') {
     const report = String.raw`termlume_report_dir() { if [[ $PWD != *[[:cntrl:]]* ]]; then printf '\033]1337;CurrentDir=%s\007' "$PWD"; fi; }`;
     const bash = report + String.raw`; PROMPT_COMMAND+=(termlume_report_dir); PS1+='\[\e]133;B\a\]'`;
@@ -4037,6 +4186,8 @@ function openRemoteFile(tab, path, downloadPath) {
       refresh();
     }
   }, 'primary');
+  save.title = `保存到远端 (${keyboard.label('S')})`;
+  save.setAttribute('aria-keyshortcuts', keyboard.aria('S'));
   const requestClose = () => {
     if (busy || (dirty() && !window.confirm('关闭文件并放弃未保存的修改？'))) return;
     fileEditor.close();
@@ -4934,35 +5085,39 @@ window.addEventListener('keydown', (event) => {
   if (event.defaultPrevented || event.isComposing || dialog.open || fileEditor.open || $('key-dialog').open || sessionSwitcher.open || vaultStatus.locked || hostMenu) return;
   if (event.key === 'Escape' && !$('terminal-find').hidden) { event.preventDefault(); $('close-find').click(); return; }
   if (event.key === 'Escape' && serverInfoOpen && $('server-info').contains(document.activeElement)) { event.preventDefault(); toggleServerInfo(); return; }
-  if (!event.metaKey || event.ctrlKey || event.altKey) return;
-  const key = event.key.toLowerCase();
-  if (key === 'b' && !event.shiftKey) { event.preventDefault(); toggleNav.click(); return; }
-  if (key === 'e' && !event.shiftKey && origin()) { event.preventDefault(); toggleFiles(); return; }
-  if (key === 't' && !event.shiftKey) { event.preventDefault(); void addNewTab(); return; }
-  if (key === 'w' && !event.shiftKey && active) { event.preventDefault(); void closeWorkspaceTab(active).catch((error) => status(message(error))); return; }
-  if (!event.shiftKey && /^[1-9]$/.test(key)) {
-    const tab = workspaceFocus(workspaceEntries()[Number(key) - 1]);
-    if (tab) { event.preventDefault(); selectTab(tab); }
+  const action = keyboard.action(event);
+  if (!action) return;
+  event.preventDefault();
+  if (action === 'navigation') { toggleNav.click(); return; }
+  if (action === 'files') { if (origin()) toggleFiles(); return; }
+  if (action === 'new-tab') { void addNewTab(); return; }
+  if (action === 'close-tab') {
+    if (active) void closeWorkspaceTab(active).catch((error) => status(message(error)));
     return;
   }
-  if (event.shiftKey && ['BracketLeft', 'BracketRight'].includes(event.code) && tabs.size) {
-    event.preventDefault();
+  if (action.startsWith('tab-')) {
+    const tab = workspaceFocus(workspaceEntries()[Number(action.slice(4)) - 1]);
+    if (tab) selectTab(tab);
+    return;
+  }
+  if (['previous-tab', 'next-tab'].includes(action)) {
     const entries = workspaceEntries();
-    const index = entries.findIndex(entry => entry.panes.includes(active?.id));
-    const step = event.code === 'BracketRight' ? 1 : -1;
-    selectTab(workspaceFocus(entries[(index + step + entries.length) % entries.length]));
+    if (entries.length) {
+      const index = entries.findIndex(entry => entry.panes.includes(active?.id));
+      const step = action === 'next-tab' ? 1 : -1;
+      selectTab(workspaceFocus(entries[(index + step + entries.length) % entries.length]));
+    }
     return;
   }
-  if (event.key.toLowerCase() === 'k') { event.preventDefault(); openGlobalSearch(); }
-  if (event.key.toLowerCase() === 'j' && tabs.size > 1) { event.preventDefault(); chooseSession(); }
-  if (key === 'f' && active?.terminal && (!active.connectionPage || active.connectionPage.hidden)) {
-    event.preventDefault();
+  if (action === 'search') { openGlobalSearch(); return; }
+  if (action === 'sessions') { if (tabs.size > 1) chooseSession(); return; }
+  if (action === 'find' && active?.terminal && (!active.connectionPage || active.connectionPage.hidden)) {
     $('terminal-find').hidden = false;
     $('terminal-find').querySelector('input').focus();
   }
-  if (active?.terminal && ['+', '=', '-', '0'].includes(event.key)) {
-    event.preventDefault();
-    active.terminal.options.fontSize = event.key === '0' ? uiPreferences.fontSize : Math.min(32, Math.max(9, active.terminal.options.fontSize + (event.key === '-' ? -1 : 1)));
+  if (active?.terminal && action.startsWith('zoom-')) {
+    active.terminal.options.fontSize = action === 'zoom-reset' ? uiPreferences.fontSize
+      : Math.min(32, Math.max(9, active.terminal.options.fontSize + (action === 'zoom-out' ? -1 : 1)));
     active.fit.fit();
   }
 });

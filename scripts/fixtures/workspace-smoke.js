@@ -1,4 +1,5 @@
 (async () => {
+  if (location.hash === '#shortcuts') return;
   const results = [];
   const assert = (condition, label) => { if (!condition) throw new Error(label); results.push(label); };
   const tick = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -207,6 +208,37 @@
     selectTab(production); $('library-button').click(); await tick();
     assert(workspace.dataset.view === 'settings' && !dialog.open, '切回工作台恢复设置页面，不自动切换主机页');
     openSettings('snippets'); await tick();
+    const commandSnapshot = structuredClone(previewSnippets);
+    const builtinDisk = previewSnippets.find(s => s.builtin === 'disk');
+    assert($('settings-page').querySelectorAll('.command-badge').length === 4, '命令库直接列出四条可编辑的内置命令');
+    $('settings-page').querySelector(`[aria-label="编辑 ${builtinDisk.name}"]`).click(); await tick();
+    const commandForm = $('settings-page').querySelector('form');
+    commandForm.querySelector('input[type="text"]').value = '定制磁盘空间';
+    commandForm.querySelector('textarea').value = 'df -h /srv';
+    commandForm.querySelector('input[type="checkbox"]').checked = false;
+    commandForm.requestSubmit(); await tick();
+    const changedDisk = previewSnippets.find(s => s.id === builtinDisk.id);
+    assert(changedDisk.command === 'df -h /srv' && !changedDisk.pinned, '内置命令可编辑命令内容和顶部快捷状态并保存');
+    const multiCommand = previewSnippets.find(s => s.id === 'multi');
+    $('settings-page').querySelector(`[aria-label="设为快捷 ${multiCommand.name}"]`).click(); await tick();
+    assert(previewSnippets.find(s => s.id === 'multi').pinned, '命令库列表可直接设置顶部快捷');
+    $('settings-page').querySelector(`[aria-label="上移 ${multiCommand.name}"]`).click(); await tick();
+    assert(commandLibrary.sorted(previewSnippets)[0].id === 'multi', '命令库上移操作保存用户排列');
+    selectTab(production);
+    const quickLibrary = openPalette('commands'); await tick();
+    assert(dialog.querySelector('.quick-command-grid .quick-command-tile > span').textContent === multiCommand.name,
+      '常用命令以顶部快捷按钮展示并遵循命令库顺序');
+    assert(![...dialog.querySelectorAll('.quick-command-tile')].some(b => b.textContent.includes('定制磁盘空间')) &&
+      dialog.querySelector('.quick-command-list').textContent.includes('定制磁盘空间'), '取消快捷后保留在下方其他命令列表');
+    const commandSearch = dialog.querySelector('input'); commandSearch.value = '定制磁盘'; commandSearch.dispatchEvent(new Event('input'));
+    assert(dialog.querySelectorAll('.palette-choice').length === 1, '快捷命令搜索使用已修改的内置命令');
+    findButton(dialog, '管理命令库').click(); await quickLibrary; await tick();
+    assert(workspace.dataset.view === 'settings' && !dialog.open && $('settings-page').textContent.includes('定制磁盘空间'),
+      '快捷命令中的管理入口直达同一命令库');
+    previewSnippets.splice(0, previewSnippets.length, ...commandSnapshot);
+    openSettings('snippets', production); await tick();
+    assert($('settings-page').querySelector('[aria-label="填入终端 磁盘巡检"]') &&
+      $('settings-page').querySelector('[aria-label="独立执行 磁盘巡检"]'), '命令库保留单行填入与独立执行两个入口');
     findButton($('settings-page'),'新建命令').click(); await tick();
     assert($('settings-page').textContent.includes('命令文本') && !dialog.open, '命令编辑直接在设置页面进行');
     openSettings('groups'); await tick();
@@ -277,7 +309,7 @@
     findButton(security, '保存同步策略').click(); await tick();
     assert(vaultStatus.gitSettings.onUnlock, '自动同步策略保存到当前设备');
     $('vault-protection').click(); await tick();
-    assert(dialog.open && dialog.textContent.includes('不加密保存'), '关闭主密码保护前说明影响并要求验证');
+    assert(dialog.open && dialog.textContent.includes('仍由应用在本机加密保存') && dialog.textContent.includes('Git 同步将关闭'), '关闭主密码保护前说明影响、保留本机加密并要求验证');
     findButton(dialog, '取消').click(); await tick();
     assert($('vault-protection').checked && $('vault-git-enabled').checked, '取消关闭后保留保护和 Git 同步');
     api.vault.touchIdAvailable = async () => false;
@@ -295,6 +327,30 @@
     assert(dialog.open && dialog.dataset.closing === 'true', '抽屉关闭时先滑出，再结束对话框');
     await drawerClosed; await tick();
     assert(!workspace.inert && !document.body.classList.contains('overlay-open'), '关闭抽屉恢复工作区交互');
+    const createHostForm = editHost(); await tick();
+    const inheritance = dialog.querySelector('.group-inheritance-options');
+    const groupInput = dialog.querySelector('[aria-label="分组"]');
+    const routeControl = dialog.querySelector('[aria-label="连接路径"]');
+    assert(inheritance.hidden && !routeControl.closest('details').open,
+      '新建主机默认隐藏分组继承选项，连接路径收起在更多设置');
+    groupInput.value = '新建测试分组'; groupInput.dispatchEvent(new Event('input')); await tick();
+    assert(!inheritance.hidden && inheritance.querySelectorAll('input[type="checkbox"]').length === 3,
+      '输入新分组后才显示端口、登录配置和配色继承');
+    inheritance.querySelector('input').click();
+    groupInput.value = ''; groupInput.dispatchEvent(new Event('input')); await tick();
+    assert(inheritance.hidden && [...inheritance.querySelectorAll('input')].every(input => !input.checked)
+      && !dialog.querySelector('input[type="number"]').disabled,
+      '清空分组同步清除隐藏的继承状态并恢复端口编辑');
+    const authInput = dialog.querySelector('[aria-label="认证方式"]').closest('.dropdown').querySelector('select');
+    assert(!dialog.querySelector('.credential-row').closest('.credential-pane').hidden && dialog.querySelector('.host-key-selection').parentElement.hidden,
+      '默认 SSH 密码认证只显示密码内容');
+    authInput.value = 'key'; authInput.dispatchEvent(new Event('change'));
+    assert(dialog.querySelector('.credential-row').closest('.credential-pane').hidden && !dialog.querySelector('.host-key-selection').parentElement.hidden,
+      '切换私钥认证仅显示私钥和口令内容');
+    authInput.value = 'agent'; authInput.dispatchEvent(new Event('change'));
+    assert(dialog.querySelector('.credential-row').closest('.credential-pane').hidden && dialog.querySelector('.host-key-selection').parentElement.hidden,
+      '切换 Agent 认证不显示密码或私钥输入');
+    dialog.close(); await createHostForm;
     const more=$('host-list').querySelector('.host-edit:last-child'); more.click(); await tick();
     assert(hostMenu.panel.querySelectorAll('button').length >= 5 && [...hostMenu.panel.querySelectorAll('button')].every(b=>b.scrollWidth<=b.clientWidth+1 && b.scrollHeight<=b.clientHeight+1), '主机更多菜单文字完整容纳在按钮内');
     assert([...hostMenu.panel.querySelectorAll('button'), $('import-hosts'), ...$('import-hosts').parentElement.querySelectorAll('button')].every(b=>!/(?:…|\.{3})$/.test(b.textContent.trim())), '导入及主机操作菜单使用完整文字，不带省略号后缀');
@@ -633,6 +689,7 @@
     const chooseResource = search => search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
 
     const routeForm = editHost(production.host); await tick();
+    dialog.querySelector('[aria-label="连接路径"]').closest('details').open = true;
     let resourcePicker = await searchResourcePicker(dialog, '连接路径', 'RESOURCE-118 audit');
     const routeSelect = dialog.querySelector('[aria-label="连接路径"]').closest('.dropdown').querySelector('select');
     assert(![...routeSelect.options].some(option => [production.host.id, resourceHosts[119].id].includes(option.value)),
@@ -654,6 +711,11 @@
     chooseResource(resourcePicker.search); await tick();
     assert(dialog.querySelector('[aria-label="登录配置"]').closest('.dropdown').querySelector('select').value === 'resource-identity-79',
       '选择登录配置保留其 ID 关联');
+    assert(dialog.querySelector('.credential-row').closest('.credential-pane').hidden,
+      '复用登录配置时不显示主机独立密码输入');
+    window.dispatchEvent(new Event('blur'));
+    assert(dialog.querySelector('.credential-row').closest('.credential-pane').hidden,
+      '窗口失焦隐藏凭据后不会重新显示不适用的密码框');
     dialog.close(); await routeForm;
 
     const importIdentity = editIdentity(undefined, undefined, undefined, previewIdentities); await tick();

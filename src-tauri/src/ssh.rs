@@ -431,7 +431,8 @@ fn validate_credentials(host: &Host, credentials: &Credentials) -> Result<(), St
 pub fn saved_key_passphrase(data: &Data, host: &Host) -> Option<crate::store::KeyPassphrase> {
     data.key_passphrases
         .get(&host.id)
-        .filter(|saved| host.auth == "key" && host.key_path.as_ref() == Some(&saved.key_path))
+        .filter(|saved| host.auth == "key" && host.key_path.as_ref() == Some(&saved.key_path)
+            && data.local_secrets.contains_key(&saved.token))
         .cloned()
 }
 
@@ -477,7 +478,7 @@ fn password_source(data: &Data, host: &Host) -> Option<PasswordSource> {
                 password: password.clone(),
             });
         }
-        if let Some(LocalPassword::Native { token, .. }) = data.local_passwords.get(&id) {
+        if let Some(LocalPassword::Saved { token, .. }) = data.local_passwords.get(&id).filter(|_| data.has_local_password(id)) {
             return Some(PasswordSource::IdentityLocal {
                 id,
                 version: identity.version,
@@ -492,7 +493,7 @@ fn password_source(data: &Data, host: &Host) -> Option<PasswordSource> {
     {
         return Some(PasswordSource::Portable(password.clone()));
     }
-    if let Some(LocalPassword::Native { token, fingerprint }) = data.local_passwords.get(&host.id) {
+    if let Some(LocalPassword::Saved { token, fingerprint }) = data.local_passwords.get(&host.id).filter(|_| data.has_local_password(host.id)) {
         return Some(PasswordSource::Local {
             token: *token,
             fingerprint: fingerprint.clone(),
@@ -505,15 +506,16 @@ pub fn has_saved_password(data: &Data, host: &Host) -> bool {
     password_source(data, host).is_some()
 }
 
-async fn read_password(source: &PasswordSource) -> Result<Zeroizing<String>, String> {
+async fn read_password(ws: &Workspace, source: &PasswordSource) -> Result<Zeroizing<String>, String> {
     let secret = match source {
         PasswordSource::Portable(password) => password.password.clone(),
         PasswordSource::IdentityPortable { password, .. } => password.secret.clone(),
         PasswordSource::Local { token, .. } | PasswordSource::IdentityLocal { token, .. } => {
             let token = *token;
-            crate::blocking(move || keys::get_password(token))
+            let ws = ws.clone();
+            return crate::blocking(move || ws.store.lock().unwrap().read_secret(token))
                 .await
-                .map_err(|_| "无法读取已保存的密码，请重新输入。")?
+                .map_err(|_| "无法读取已保存的密码，请重新输入并保存。".into());
         }
     };
     Ok(Zeroizing::new(secret))
@@ -536,7 +538,7 @@ pub async fn reveal_saved_password(ws: &Workspace, id: Uuid) -> Result<Zeroizing
         let source = password_source(data, &host).ok_or("此主机没有已保存的密码。")?;
         (store.epoch, host.clone(), source)
     };
-    let secret = read_password(&source).await?;
+    let secret = read_password(ws, &source).await?;
     let store = ws.store.lock().unwrap();
     crate::ensure_epoch(&store, epoch)?;
     check_password(store.data()?, &host, &source)?;
@@ -566,7 +568,7 @@ fn bind_password(
     }
     data.local_passwords.insert(
         host.id,
-        LocalPassword::Native {
+        LocalPassword::Saved {
             token: *token,
             fingerprint: Some(fingerprint.into()),
         },
@@ -584,63 +586,56 @@ async fn remember(
     epoch: u64,
     previous_password: Option<PasswordSource>,
 ) -> Result<(), String> {
-    let token = Uuid::new_v4();
     let fingerprint = fingerprint.to_owned();
     let host = host.clone();
     let ws = ws.clone();
     let cancel = session.cancel.clone();
     crate::blocking(move || {
-        keys::set_password(token, &password)?;
-        let result = (|| {
-            let mut store = ws.store.lock().unwrap();
-            crate::ensure_epoch(&store, epoch)?;
-            let mut data = store.data()?.clone();
-            if cancel.is_cancelled()
-                || !data.connection_host(host.id)?.same_connection(&host)
-                || data.fingerprint(&host) != Some(&fingerprint)
-                || password_source(&data, &host) != previous_password
-            {
-                return Err("主机或保险库已变化。".into());
-            }
-            let credential = host.identity_id.unwrap_or(host.id);
-            data.local_passwords.insert(
-                credential,
-                LocalPassword::Native {
-                    token,
-                    fingerprint: host.identity_id.is_none().then(|| fingerprint.clone()),
-                },
-            );
-            if let Some(id) = host.identity_id {
-                let identity = data
-                    .identities
-                    .iter_mut()
-                    .find(|i| i.id == id)
-                    .ok_or("登录配置已删除。")?;
-                identity.password = if share && store.key.is_some() {
-                    Some(crate::assets::Secret {
-                        secret: password.to_string(),
-                    })
-                } else {
-                    None
-                };
-            } else {
-                data.portable_passwords.remove(&host.id);
-                if share && store.key.is_some() {
-                    data.portable_passwords.insert(
-                        host.id,
-                        Password {
-                            password: password.to_string(),
-                            fingerprint,
-                        },
-                    );
-                }
-            }
-            store.update(data)
-        })();
-        if result.is_err() {
-            keys::delete_password(token);
+        let mut store = ws.store.lock().unwrap();
+        crate::ensure_epoch(&store, epoch)?;
+        let mut data = store.data()?.clone();
+        if cancel.is_cancelled()
+            || !data.connection_host(host.id)?.same_connection(&host)
+            || data.fingerprint(&host) != Some(&fingerprint)
+            || password_source(&data, &host) != previous_password
+        {
+            return Err("主机或保险库已变化。".into());
         }
-        result
+        let credential = host.identity_id.unwrap_or(host.id);
+        let token = data.save_secret(&password);
+        data.local_passwords.insert(
+            credential,
+            LocalPassword::Saved {
+                token,
+                fingerprint: host.identity_id.is_none().then(|| fingerprint.clone()),
+            },
+        );
+        if let Some(id) = host.identity_id {
+            let identity = data
+                .identities
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or("登录配置已删除。")?;
+            identity.password = if share && store.key.is_some() {
+                Some(crate::assets::Secret {
+                    secret: password.to_string(),
+                })
+            } else {
+                None
+            };
+        } else {
+            data.portable_passwords.remove(&host.id);
+            if share && store.key.is_some() {
+                data.portable_passwords.insert(
+                    host.id,
+                    Password {
+                        password: password.to_string(),
+                        fingerprint,
+                    },
+                );
+            }
+        }
+        store.update(data)
     })
     .await
 }
@@ -692,16 +687,17 @@ async fn connect_peer(
     };
     let saved_key = if let Some(source) = &key_source {
         let token = source.token;
-        Some(Zeroizing::new(
-            crate::blocking(move || keys::get_password(token))
+        let ws = ws.clone();
+        Some(
+            crate::blocking(move || ws.store.lock().unwrap().read_secret(token))
                 .await
                 .map_err(|_| "无法读取已保存的私钥口令，请在编辑主机中重新配置。")?,
-        ))
+        )
     } else {
         None
     };
     let saved = match source {
-        Some(source) => Some((read_password(&source).await?, source)),
+        Some(source) => Some((read_password(ws, &source).await?, source)),
         None => None,
     };
     let failure = Arc::new(Mutex::new(None));
@@ -786,6 +782,98 @@ async fn connect_peer(
     Ok((client, remember))
 }
 
+// Only change character handling when the server's default is not UTF-8. Select
+// an installed locale so minimal Linux hosts and macOS both get a valid value.
+fn utf8_locale(output: &str) -> Option<&str> {
+    let mut lines = output.lines();
+    if matches!(
+        lines.next()?.trim().to_ascii_lowercase().as_str(),
+        "utf-8" | "utf8"
+    ) {
+        return None;
+    }
+    let locales: Vec<_> = lines
+        .map(str::trim)
+        .filter(|locale| {
+            locale.len() <= 128
+                && locale
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.@-".contains(&b))
+                && locale
+                    .to_ascii_lowercase()
+                    .replace('-', "")
+                    .ends_with(".utf8")
+        })
+        .collect();
+    ["c.utf8", "en_us.utf8"]
+        .into_iter()
+        .find_map(|preferred| {
+            locales
+                .iter()
+                .copied()
+                .find(|locale| locale.to_ascii_lowercase().replace('-', "") == preferred)
+        })
+        .or_else(|| locales.first().copied())
+}
+
+async fn terminal_locale(client: &Client) -> Option<String> {
+    let mut channel = tokio::time::timeout(Duration::from_secs(2), client.channel_open_session())
+        .await
+        .ok()?
+        .ok()?;
+    let probe = async {
+        channel
+            .exec(true, b"locale charmap; locale -a".to_vec())
+            .await
+            .ok()?;
+        let mut output = Vec::new();
+        let mut exit = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } if output.len() + data.len() <= 65536 => {
+                    output.extend_from_slice(&data)
+                }
+                ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                ChannelMsg::Data { .. } | ChannelMsg::Failure => return None,
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        if exit != Some(0) {
+            return None;
+        }
+        utf8_locale(std::str::from_utf8(&output).ok()?).map(str::to_owned)
+    };
+    let locale = tokio::time::timeout(Duration::from_secs(2), probe)
+        .await
+        .ok()
+        .flatten();
+    let _ = channel.close().await;
+    locale
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::utf8_locale;
+
+    #[test]
+    fn selects_an_installed_utf8_locale_without_overriding_utf8_defaults() {
+        assert_eq!(
+            utf8_locale("ANSI_X3.4-1968\nC\nC.utf8\nen_US.utf8\nPOSIX\n"),
+            Some("C.utf8")
+        );
+        assert_eq!(
+            utf8_locale("US-ASCII\nC\nen_US.UTF-8\nzh_CN.UTF-8\n"),
+            Some("en_US.UTF-8")
+        );
+        assert_eq!(utf8_locale("US-ASCII\nC\nzh_CN.utf8\n"), Some("zh_CN.utf8"));
+        assert_eq!(utf8_locale("UTF-8\nC\nC.utf8\n"), None);
+        assert_eq!(utf8_locale("US-ASCII\nC\nPOSIX\n"), None);
+        assert_eq!(utf8_locale("US-ASCII\n$(bad).utf8\n"), None);
+        assert_eq!(utf8_locale(""), None);
+    }
+}
+
 async fn run_session(
     ws: &Workspace,
     session: &Arc<Session>,
@@ -847,7 +935,12 @@ async fn run_session(
             passwords.push(remember);
         }
         ws.emit(json!({"type":"progress","id":session.id,"message":"正在打开远端终端…"}));
+        let locale = terminal_locale(&client).await;
         let mut channel = client.channel_open_session().await.map_err(error)?;
+        if let Some(locale) = locale {
+            // Environment requests are optional: servers may reject AcceptEnv.
+            channel.set_env(false, "LC_CTYPE", locale).await.map_err(error)?;
+        }
         let (cols, rows) = req.dimensions.dimensions();
         channel
             .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
@@ -895,7 +988,7 @@ async fn run_session(
             .is_err();
             if !session.cancel.is_cancelled() {
                 ws.emit(json!({"type":"password","id":session.id,"host":password.host,"failed":failed,
-                    "message":if failed {"SSH 已连接，密码保存失败，请检查 macOS 钥匙串。"} else {"已加密保存 SSH 密码。"}}));
+                    "message":if failed {"SSH 已连接，密码保存失败，请检查本机工作区是否可写。"} else {"已加密保存 SSH 密码。"}}));
             }
         });
     }
@@ -987,7 +1080,7 @@ async fn authenticate(client: &mut Client, host: &Host, secret: &str) -> Result<
                 .success()
         }
         "agent" => {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             {
                 let mut agent = keys::agent().await?;
                 let identities = agent.request_identities().await.map_err(error)?;
@@ -1011,7 +1104,7 @@ async fn authenticate(client: &mut Client, host: &Host, secret: &str) -> Result<
                 }
                 accepted
             }
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             {
                 return Err("当前平台的 SSH Agent 暂不可用。".into());
             }

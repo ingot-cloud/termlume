@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, protocol, safeStorage } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, protocol } = require('electron');
 const { randomUUID } = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -9,6 +9,7 @@ const { Transfers } = require('./transfers.cjs');
 const { scanKeys, generateKey, agentKeys } = require('./keys.cjs');
 const { importSSHConfig } = require('./ssh-config.cjs');
 const vault = require('./vault.cjs');
+const credentials = require('./local-credentials.cjs');
 const { branchName, defaultBranch, remoteURL, resolveAuth, useRepository, mergeSnapshots, sameRecord } = require('./git-vault.cjs');
 
 const pageURL = 'termlume://workspace/index.html';
@@ -206,10 +207,6 @@ function passwordTarget(host, fingerprint) {
   return JSON.stringify([host.id, host.address.toLowerCase(), host.port, host.username, fingerprint]);
 }
 
-async function requirePasswordEncryption() {
-  if (process.platform !== 'darwin' || !await safeStorage.isAsyncEncryptionAvailable()) throw new Error('macOS 钥匙串暂不可用。');
-}
-
 async function savedPassword(host) {
   const encrypted = store.passwordFor(host);
   const fingerprint = store.fingerprint(host);
@@ -217,10 +214,8 @@ async function savedPassword(host) {
   if (portable && (!fingerprint || fingerprint === portable.fingerprint)) return { ...portable, fromVault: true };
   try {
     if (!encrypted || !fingerprint) throw new Error();
-    await requirePasswordEncryption();
-    const { result } = await safeStorage.decryptStringAsync(Buffer.from(encrypted, 'base64'));
-    const { target, password } = JSON.parse(result);
-    if (target !== passwordTarget(host, fingerprint) || typeof password !== 'string' || !password || password.length > 4096
+    const password = credentials.decrypt(path.dirname(store.file), passwordTarget(host, fingerprint), encrypted);
+    if (typeof password !== 'string' || !password || password.length > 4096
       || !store.data?.hosts.includes(host) || store.passwordFor(host) !== encrypted || store.fingerprint(host) !== fingerprint) throw new Error();
     return { password, fingerprint };
   } catch {
@@ -236,15 +231,14 @@ function rememberPassword(id, host, password, share) {
       && store.data?.hosts.includes(host) && fingerprint && store.fingerprint(host) === fingerprint;
     try {
       if (!stillCurrent()) return;
-      await requirePasswordEncryption();
-      const encrypted = await safeStorage.encryptStringAsync(JSON.stringify({ target: passwordTarget(host, fingerprint), password }));
+      const encrypted = credentials.encrypt(path.dirname(store.file), passwordTarget(host, fingerprint), password);
       if (!stillCurrent()) return;
       const portablePasswords = store.withoutPasswords([host.id], store.data.portablePasswords || {});
       if (share && store.key) portablePasswords[host.id] = { password, fingerprint };
-      store.update({ ...store.data, localPasswords: { ...store.data.localPasswords, [host.id]: encrypted.toString('base64') }, portablePasswords });
+      store.update({ ...store.data, localPasswords: { ...store.data.localPasswords, [host.id]: encrypted }, portablePasswords });
       emit({ type: 'password', id, message: '已加密保存 SSH 密码。' });
     } catch {
-      if (stillCurrent()) emit({ type: 'password', id, message: 'SSH 已连接，密码保存失败，请检查 macOS 钥匙串。', failed: true });
+      if (stillCurrent()) emit({ type: 'password', id, message: 'SSH 已连接，密码保存失败，请检查应用数据目录的写入权限。', failed: true });
     } finally {
       if (store.passwordAttempts.get(host.id) === attempt) store.passwordAttempts.delete(host.id);
     }
@@ -257,10 +251,12 @@ const resources = new Map([
   ['/index.html', [path.join(rendererDir, 'index.html'), 'text/html']],
   ['/style.css', [path.join(rendererDir, 'style.css'), 'text/css']],
   ['/workspace-state.js',[path.join(rendererDir,'workspace-state.js'),'text/javascript']],
+  ['/command-library.js',[path.join(rendererDir,'command-library.js'),'text/javascript']],
   ['/server-info.js', [path.join(rendererDir, 'server-info.js'), 'text/javascript']],
   ['/renderer.js', [path.join(rendererDir, 'renderer.js'), 'text/javascript']],
   ['/dropdown.js', [path.join(rendererDir, 'dropdown.js'), 'text/javascript']],
   ['/overlays.js', [path.join(rendererDir, 'overlays.js'), 'text/javascript']],
+  ['/shortcuts.js', [path.join(rendererDir, 'shortcuts.js'), 'text/javascript']],
   ['/terminal-paths.js', [path.join(rendererDir, 'terminal-paths.js'), 'text/javascript']],
   ['/xterm.js', [path.join(dependencies, 'xterm/lib/xterm.js'), 'text/javascript']],
   ['/xterm.css', [path.join(dependencies, 'xterm/css/xterm.css'), 'text/css']],

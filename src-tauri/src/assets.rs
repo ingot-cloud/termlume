@@ -1,5 +1,4 @@
 use crate::{
-    error, keys,
     store::{checked, Data, Host, LocalPassword},
     Workspace,
 };
@@ -63,7 +62,7 @@ impl Identity {
         let mut value = json!(self);
         value.as_object_mut().unwrap().remove("password");
         value["passwordSaved"] =
-            json!(self.password.is_some() || data.local_passwords.contains_key(&self.id));
+            json!(self.password.is_some() || data.has_local_password(self.id));
         value["groups"] = json!(data
             .groups
             .iter()
@@ -124,7 +123,7 @@ impl Asset {
                 json!({"id":l.id,"name":l.name,"recordType":"layout","tabs":l.tabs,"split":l.split,"direction":l.direction,"ratio":l.ratio,"rowRatio":l.row_ratio})
             }
             Self::Snippet(s) => {
-                json!({"id":s.id,"name":s.name,"recordType":"snippet","command":s.command,"tags":s.tags})
+                json!({"id":s.id,"name":s.name,"recordType":"snippet","command":s.command,"tags":s.tags,"pinned":s.pinned,"order":s.order,"builtin":s.builtin})
             }
             Self::Group(g) => {
                 json!({"id":g.id,"name":g.name,"recordType":"group","parentId":g.parent_id,"port":g.port,"identityId":g.identity_id,"terminalTheme":g.terminal_theme})
@@ -189,7 +188,6 @@ pub fn save_identity(ws: &Workspace, mut value: Value) -> Result<Value, String> 
         data.local_passwords.remove(&identity.id);
         identity.password = None;
     }
-    let mut created = None;
     if let Some(secret) = secret.filter(|s| !s.is_empty()) {
         if identity.auth != "password" || secret.len() > 16384 {
             return Err("登录配置的密码格式无效。".into());
@@ -197,12 +195,10 @@ pub fn save_identity(ws: &Workspace, mut value: Value) -> Result<Value, String> 
         if crate::flag(&value, "sharePassword") && store.key.is_none() {
             return Err("共享密码到备份前请先启用保险库。".into());
         }
-        let token = Uuid::new_v4();
-        keys::set_password(token, &secret).map_err(error)?;
-        created = Some(token);
+        let token = data.save_secret(&secret);
         data.local_passwords.insert(
             identity.id,
-            LocalPassword::Native {
+            LocalPassword::Saved {
                 token,
                 fingerprint: None,
             },
@@ -219,12 +215,7 @@ pub fn save_identity(ws: &Workspace, mut value: Value) -> Result<Value, String> 
     data.identities.push(identity.clone());
     let result =
         json!({"identities":list(&data),"identityId":identity.id,"hosts":data.connection_hosts()});
-    if let Err(e) = store.update(data) {
-        if let Some(token) = created {
-            keys::delete_password(token);
-        }
-        return Err(e);
-    }
+    store.update(data)?;
     Ok(result)
 }
 pub fn delete_identity(ws: &Workspace, value: Value) -> Result<Value, String> {
@@ -433,6 +424,28 @@ pub struct Snippet {
     pub name: String,
     pub command: String,
     pub tags: Vec<String>,
+    pub pinned: bool,
+    pub order: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<String>,
+}
+
+pub fn default_snippets() -> Vec<Snippet> {
+    serde_json::from_str(include_str!("../../src/command-defaults.json"))
+        .expect("valid built-in commands")
+}
+
+pub fn all_snippets(data: &Data) -> Vec<Snippet> {
+    let mut snippets = data.snippets.clone();
+    for default in default_snippets() {
+        if let Some(snippet) = snippets.iter_mut().find(|snippet| snippet.id == default.id) {
+            snippet.builtin = default.builtin;
+        } else {
+            snippets.push(default);
+        }
+    }
+    snippets.sort_by_key(|snippet| snippet.order);
+    snippets
 }
 pub fn command_text(value: &str) -> Result<String, String> {
     if value.trim().is_empty()
@@ -446,9 +459,49 @@ pub fn command_text(value: &str) -> Result<String, String> {
     Ok(value.replace("\r\n", "\n"))
 }
 impl Snippet {
+    pub fn rendered(&self, values: &Value) -> Result<String, String> {
+        let pattern = regex::Regex::new(r"\{\{(path|service|lines)\}\}").unwrap();
+        let mut error = None;
+        let command = pattern
+            .replace_all(&self.command, |capture: &regex::Captures<'_>| {
+                let key = &capture[1];
+                let result = if key == "lines" {
+                    values[key]
+                        .as_u64()
+                        .filter(|n| (1..=10000).contains(n))
+                        .map(|n| n.to_string())
+                        .ok_or_else(|| "行数须在 1 至 10000 之间。".to_string())
+                } else {
+                    let value = values[key].as_str().unwrap_or("");
+                    let valid = if key == "path" {
+                        crate::ssh::remote_path(value).map(|_| ())
+                    } else {
+                        crate::ssh::command_for("journal", value, 100).map(|_| ())
+                    };
+                    valid.map(|_| format!("'{}'", value.replace('\'', "'\\''")))
+                };
+                match result {
+                    Ok(value) => value,
+                    Err(message) => {
+                        error = Some(message);
+                        String::new()
+                    }
+                }
+            })
+            .into_owned();
+        if let Some(error) = error {
+            return Err(error);
+        }
+        command_text(&command)
+    }
+
     fn normalized(mut self) -> Result<Self, String> {
         self.name = checked(&self.name, "命令名称", 120)?;
         self.command = command_text(&self.command)?;
+        self.builtin = default_snippets()
+            .into_iter()
+            .find(|default| default.id == self.id)
+            .and_then(|default| default.builtin);
         self.tags = self
             .tags
             .iter()
@@ -461,13 +514,37 @@ impl Snippet {
 pub fn snippet_request(ws: &Workspace, action: &str, value: Value) -> Result<Value, String> {
     let mut store = ws.store.lock().unwrap();
     let mut data = store.data()?.clone();
+    let current = all_snippets(&data);
     if action == "snippets:list" {
-        return Ok(json!(data.snippets));
+        return Ok(json!(current));
+    }
+    if action == "snippets:reorder" {
+        if json!(current) != value["expected"] {
+            return Err("命令库已变化，请刷新后重试。".into());
+        }
+        let ids: Vec<Uuid> = crate::parse(value["ids"].clone())?;
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        if ids.len() != current.len() || unique.len() != current.len() {
+            return Err("命令顺序无效，请刷新后重试。".into());
+        }
+        let mut ordered = Vec::new();
+        for (index, id) in ids.into_iter().enumerate() {
+            let mut snippet = current
+                .iter()
+                .find(|snippet| snippet.id == id)
+                .ok_or("命令已删除。")?
+                .clone();
+            snippet.order = (index as u32 + 1) * 10;
+            ordered.push(snippet);
+        }
+        data.snippets = ordered;
+        let result = json!(all_snippets(&data));
+        store.update(data)?;
+        return Ok(result);
     }
     let mut snippet: Snippet = crate::parse(value["snippet"].clone())?;
     if !snippet.id.is_nil() {
-        let old = data
-            .snippets
+        let old = current
             .iter()
             .find(|s| s.id == snippet.id)
             .ok_or("命令已删除。")?;
@@ -477,11 +554,23 @@ pub fn snippet_request(ws: &Workspace, action: &str, value: Value) -> Result<Val
     } else {
         snippet.id = Uuid::new_v4();
     }
-    data.snippets.retain(|s| s.id != snippet.id);
-    if action != "snippets:delete" {
-        data.snippets.push(snippet.normalized()?);
+    if action == "snippets:delete" {
+        data.snippets.retain(|s| s.id != snippet.id);
+    } else {
+        let snippet = snippet.normalized()?;
+        if let Some(index) = data.snippets.iter().position(|old| old.id == snippet.id) {
+            data.snippets[index] = snippet;
+        } else {
+            data.snippets.push(snippet);
+        }
     }
-    if data.snippets.len() > 1000 {
+    if data
+        .snippets
+        .iter()
+        .filter(|snippet| snippet.builtin.is_none())
+        .count()
+        > 1000
+    {
         return Err("命令库最多保存 1000 条。".into());
     }
     let result = json!(data.snippets);

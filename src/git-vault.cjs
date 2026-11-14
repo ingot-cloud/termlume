@@ -53,7 +53,8 @@ function run(directory, signal, args, input, auth) {
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
   Object.assign(env, {
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
-    GIT_SSH_COMMAND: '/usr/bin/ssh -o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=yes -o ConnectTimeout=12',
+    GIT_SSH_COMMAND: '/usr/bin/ssh ' + (process.platform === 'darwin' ? '-o UseKeychain=no -o AddKeysToAgent=no ' : '')
+      + '-o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=yes -o ConnectTimeout=12',
     GIT_AUTHOR_NAME: 'Termlume', GIT_COMMITTER_NAME: 'Termlume',
     GIT_AUTHOR_EMAIL: 'vault@termlume.invalid', GIT_COMMITTER_EMAIL: 'vault@termlume.invalid'
   });

@@ -1,5 +1,5 @@
 use crate::{
-    assets::{Asset, Group, Identity, Layout, Preferences, Snippet},
+    assets::{Asset, Group, Identity, Layout, Preferences, Secret, Snippet},
     error,
     forwarding::LocalForward,
     ssh, startup_unlock,
@@ -272,7 +272,7 @@ pub struct Fingerprint {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum LocalPassword {
-    Native {
+    Saved {
         token: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fingerprint: Option<String>,
@@ -355,6 +355,8 @@ pub struct Data {
     pub recent: BTreeMap<Uuid, u64>,
     pub local_passwords: BTreeMap<Uuid, LocalPassword>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub local_secrets: BTreeMap<Uuid, Secret>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub key_passphrases: BTreeMap<Uuid, KeyPassphrase>,
     pub portable_passwords: BTreeMap<Uuid, Password>,
     pub lock_settings: LockSettings,
@@ -368,6 +370,20 @@ pub struct Data {
     pub git_migration: Option<GitMigration>,
 }
 impl Data {
+    pub fn has_local_password(&self, id: Uuid) -> bool {
+        matches!(self.local_passwords.get(&id), Some(LocalPassword::Saved { token, .. }) if self.local_secrets.contains_key(token))
+    }
+    pub fn save_secret(&mut self, secret: &str) -> Uuid {
+        let token = Uuid::new_v4();
+        self.local_secrets.insert(token, Secret { secret: secret.into() });
+        token
+    }
+    fn credential_tokens(&self) -> HashSet<Uuid> {
+        self.local_passwords.values().filter_map(|saved| match saved {
+            LocalPassword::Saved { token, .. } => Some(*token),
+            LocalPassword::Legacy(_) => None,
+        }).chain(self.key_passphrases.values().map(|saved| saved.token)).collect()
+    }
     pub fn host(&self, id: Uuid) -> Result<&Host, String> {
         self.hosts
             .iter()
@@ -627,10 +643,17 @@ impl Store {
                 let envelope: Envelope = serde_json::from_value(parsed).map_err(error)?;
                 envelope.validate("local")?;
                 store.envelope = Some(envelope);
+            } else if parsed["format"] == "termlume-local-workspace" {
+                store.data = Some(vault::decode_local(&store.local_key(false)?, &bytes)?);
+            } else if parsed.get("format").is_some() {
+                return Err("工作区格式或版本无效。".into());
             } else {
                 store.data = Some(serde_json::from_value(parsed).map_err(error)?);
+                // Upgrade plaintext workspaces before allowing further operations.
+                let encoded = vault::encode_local(&store.local_key(true)?, store.data()?)?;
+                store.write(&encoded)?;
             }
-            if original != &store.file {
+            if original != &store.file && store.envelope.is_some() {
                 store.write(&bytes)?;
             }
         } else {
@@ -642,9 +665,11 @@ impl Store {
                 .and_then(|bytes| serde_json::from_slice::<startup_unlock::Credential>(&bytes).ok())
                 .filter(|credential| credential.vault_id == envelope.header.id);
             if let Some(credential) = &store.startup_unlock {
-                let unlocked = credential
-                    .account(&store.startup_unlock_path())
-                    .and_then(|account| startup_unlock::read(&account))
+                // Old OS-only credentials require manual unlock. Never query the
+                // system credential store, even for migration or cleanup.
+                let unlocked = store.local_key(false).and_then(|device_key| {
+                    credential.open(&store.startup_unlock_path(), &device_key)
+                })
                     .and_then(|key| {
                         envelope
                             .decode::<Data>(&key, "local")
@@ -660,6 +685,41 @@ impl Store {
     }
     pub fn data(&self) -> Result<&Data, String> {
         self.data.as_ref().ok_or("请先解锁保险库。".into())
+    }
+    fn local_key(&self, create: bool) -> Result<Key, String> {
+        let path = self.file.with_file_name("workspace.key");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Err("本机工作区密钥必须是普通文件。".into()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound && create => {
+                let key = zeroize::Zeroizing::new(rand::random::<[u8; 32]>());
+                let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(error)?;
+                temp.write_all(&key[..]).and_then(|()| temp.as_file().sync_all()).map_err(error)?;
+                temp.persist_noclobber(&path).map_err(error)?;
+                return Ok(key);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err("本机工作区密钥缺失，请恢复 workspace.key，不能重新生成密钥读取已有数据。".into());
+            }
+            Err(err) => return Err(error(err)),
+        }
+        let bytes = zeroize::Zeroizing::new(vault::bounded_read(&path, 32)?);
+        let mut key = Key::default();
+        if bytes.len() != key.len() {
+            return Err("本机工作区密钥格式无效。".into());
+        }
+        key.copy_from_slice(&bytes);
+        Ok(key)
+    }
+    pub fn read_secret(&mut self, token: Uuid) -> Result<zeroize::Zeroizing<String>, String> {
+        let data = self.data()?;
+        if !data.credential_tokens().contains(&token) {
+            return Err("已保存的凭据不存在。".into());
+        }
+        if let Some(secret) = data.local_secrets.get(&token) {
+            return Ok(zeroize::Zeroizing::new(secret.secret.clone()));
+        }
+        Err("旧版本机凭据已停止读取，请重新输入并保存。".into())
     }
     pub fn touch_id_path(&self) -> Option<PathBuf> {
         let id = self.envelope.as_ref()?.header.id;
@@ -684,6 +744,20 @@ impl Store {
         self.startup_unlock_error = None;
         Ok(())
     }
+    pub fn enable_startup_unlock(&mut self) -> Result<(), String> {
+        let key = self.key.as_ref().ok_or("请先启用并解锁保险库。")?;
+        let vault_id = self.envelope.as_ref().ok_or("保险库不存在。")?.header.id;
+        let previous = self.startup_unlock.clone();
+        let credential = previous.clone().filter(|c| c.vault_id == vault_id)
+            .unwrap_or_else(|| startup_unlock::Credential::new(vault_id));
+        let path = self.startup_unlock_path();
+        let protected = credential.protect(&path, &self.local_key(true)?, key)?;
+        self.set_startup_unlock(Some(protected))?;
+        Ok(())
+    }
+    pub fn clear_startup_unlock(&mut self) -> Result<(), String> {
+        self.set_startup_unlock(None)
+    }
     pub fn status(&self) -> Value {
         let sync = self.data.as_ref().and_then(|data| data.sync.as_ref());
         let migration = self
@@ -694,7 +768,7 @@ impl Store {
             "enabled": self.envelope.is_some(),
             "locked": self.data.is_none(),
             "touchIdEnabled": cfg!(target_os = "macos") && self.touch_id_path().is_some_and(|path| path.is_file()),
-            "startupUnlockSupported": cfg!(target_os = "macos"),
+            "startupUnlockSupported": true,
             "startupUnlockRequired": self.startup_unlock.is_none(),
             "startupUnlockError": self.startup_unlock_error,
             "autoLockMinutes": self.data.as_ref().map(|data| data.lock_settings.auto_lock_minutes).unwrap_or(Some(15)),
@@ -714,27 +788,6 @@ impl Store {
         }
         write_atomic(&self.file, bytes)
     }
-    fn forget_removed_passwords(&self, new: &Data) {
-        if let Some(old) = &self.data {
-            for (id, saved) in &old.key_passphrases {
-                if !new
-                    .key_passphrases
-                    .get(id)
-                    .is_some_and(|kept| kept.token == saved.token)
-                {
-                    crate::keys::delete_password(saved.token);
-                }
-            }
-            for (id, entry) in &old.local_passwords {
-                if let LocalPassword::Native { token, .. } = entry {
-                    if !matches!(new.local_passwords.get(id), Some(LocalPassword::Native { token: kept, .. }) if kept == token)
-                    {
-                        crate::keys::delete_password(*token);
-                    }
-                }
-            }
-        }
-    }
     pub fn update(&mut self, mut data: Data) -> Result<(), String> {
         self.data()?;
         let valid_keys: HashSet<_> = data
@@ -750,6 +803,8 @@ impl Store {
             })
             .collect();
         data.key_passphrases.retain(|id, _| valid_keys.contains(id));
+        let tokens = data.credential_tokens();
+        data.local_secrets.retain(|token, _| tokens.contains(token));
         if let Some(envelope) = &self.envelope {
             let encoded = vault::encode(
                 self.key.as_ref().ok_or("请先解锁保险库。")?,
@@ -760,9 +815,8 @@ impl Store {
             self.write(&serde_json::to_vec(&encoded).map_err(error)?)?;
             self.envelope = Some(encoded);
         } else {
-            self.write(&serde_json::to_vec(&data).map_err(error)?)?;
+            self.write(&vault::encode_local(&self.local_key(true)?, &data)?)?;
         }
-        self.forget_removed_passwords(&data);
         self.data = Some(data);
         self.revision += 1;
         Ok(())
@@ -777,7 +831,7 @@ impl Store {
     }
     pub fn remove_protection(&mut self) -> Result<(), String> {
         let mut data = self.data()?.clone();
-        // Workspace passwords only survive if a separate local Keychain copy exists.
+        // Keep locally saved credentials; only explicitly shared, vault-only copies are removed.
         data.portable_passwords.clear();
         for identity in &mut data.identities {
             identity.password = None;
@@ -794,7 +848,7 @@ impl Store {
                 Err(err) => return Err(error(err)),
             }
         }
-        self.write(&serde_json::to_vec(&data).map_err(error)?)?;
+        self.write(&vault::encode_local(&self.local_key(true)?, &data)?)?;
         self.data = Some(data);
         self.envelope = None;
         self.key = None;
@@ -803,10 +857,15 @@ impl Store {
         Ok(())
     }
     pub fn unlock(&mut self, key: Key, data: Data) {
+        let refresh_startup = self.startup_unlock.as_ref().is_some_and(|c| c.is_legacy())
+            || (self.startup_unlock.is_some() && self.startup_unlock_error.is_some());
         self.key = Some(key);
         self.data = Some(data);
         self.startup_unlock_error = None;
         self.epoch += 1;
+        if refresh_startup && self.enable_startup_unlock().is_err() {
+            self.startup_unlock_error = Some("自动解锁凭据更新失败，请检查工作区写入权限或重新设置应用锁。".into());
+        }
     }
     pub fn lock(&mut self) -> bool {
         if self.key.take().is_none() {

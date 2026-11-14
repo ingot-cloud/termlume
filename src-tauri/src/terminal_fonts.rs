@@ -27,6 +27,8 @@ pub fn families() -> Vec<String> {
         names.dedup();
         names
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    return crate::platform::windows::font_families();
+    #[cfg(not(any(target_os = "macos", windows)))]
     Vec::new()
 }

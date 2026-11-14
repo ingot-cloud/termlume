@@ -189,7 +189,7 @@ impl Repo {
             Transport::Https(HttpsRepo::open(remote.clone(), auth, cancel.clone()).await?)
         } else {
             if cfg!(mobile) {
-                return Err("手机端请使用 HTTPS 仓库地址和访问 Token。".into());
+                return Err("当前平台请使用 HTTPS 仓库地址和访问 Token。".into());
             }
             Transport::System(tempfile::tempdir().map_err(error)?)
         };
@@ -212,8 +212,13 @@ impl Repo {
         let Transport::System(dir) = &self.transport else {
             return Err(GitError::message("系统 Git 仅用于 SSH 连接。"));
         };
-        let mut cmd = Command::new("/usr/bin/git");
-        cmd.args(["-c", "core.hooksPath=/dev/null"])
+        let tools = crate::platform::git_tools().map_err(GitError::message)?;
+        let hooks = dir.path().join("disabled-hooks");
+        let config = dir.path().join("empty-global-config");
+        std::fs::create_dir_all(&hooks).map_err(|e| GitError::message(error(e)))?;
+        std::fs::write(&config, []).map_err(|e| GitError::message(error(e)))?;
+        let mut cmd = Command::new(&tools.git);
+        cmd.args(["-c", &format!("core.hooksPath={}", hooks.display())])
             .args(args)
             .current_dir(dir.path())
             .stdin(Stdio::piped())
@@ -225,8 +230,11 @@ impl Repo {
         {
             cmd.env_remove(key);
         }
-        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_SSH_COMMAND", "/usr/bin/ssh -o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=yes -o ConnectTimeout=12")
+        tools.configure(&mut cmd).map_err(GitError::message)?;
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW for console Git/SSH.
+        cmd.env("GIT_CONFIG_GLOBAL", &config).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", crate::platform::ssh_command(&tools.ssh))
             .env("GIT_AUTHOR_NAME", "Termlume").env("GIT_COMMITTER_NAME", "Termlume")
             .env("GIT_AUTHOR_EMAIL", "vault@termlume.invalid").env("GIT_COMMITTER_EMAIL", "vault@termlume.invalid");
         if let Some(socket) = keys::agent_socket() {

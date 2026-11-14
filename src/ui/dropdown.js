@@ -28,14 +28,16 @@
     const rect = wrapper.getBoundingClientRect();
     const viewportWidth = document.documentElement.clientWidth;
     const viewportHeight = document.documentElement.clientHeight;
-    const width = Math.min(Math.max(active.config.searchable ? 380 : 208, rect.width), viewportWidth - 16);
+    const width = Math.min(640, Math.max(active.config.searchable ? 380 : 208, rect.width), viewportWidth - 16);
     panel.style.width = `${width}px`;
     const below = viewportHeight - rect.bottom - 12;
     const titlebar = document.querySelector('.titlebar')?.getBoundingClientRect().bottom || 0;
     const above = rect.top - titlebar - 12;
-    const aboveTrigger = below < Math.min(220, panel.scrollHeight) && above > below;
+    const aboveTrigger = below < (active.config.searchable ? 220 : Math.min(220, panel.scrollHeight)) && above > below;
     panel.style.left = `${Math.max(8, Math.min(rect.left, viewportWidth - width - 8))}px`;
-    panel.style.maxHeight = `${Math.min(active.config.searchable ? 380 : 272, Math.max(36, aboveTrigger ? above : below))}px`;
+    const height = Math.min(active.config.searchable ? 380 : 272, Math.max(36, aboveTrigger ? above : below));
+    panel.style.maxHeight = `${height}px`;
+    panel.style.height = active.config.searchable ? `${height}px` : '';
     panel.style.top = `${aboveTrigger ? Math.max(titlebar + 8, rect.top - panel.offsetHeight - 5) : rect.bottom + 5}px`;
   }
 

@@ -28,7 +28,7 @@
     logs:bind({list:'logs:list',start:'logs:start',stop:'logs:stop',read:'logs:read',remove:'logs:delete',export:'logs:export'}),
     history:bind({list:'history:list',clear:'history:clear'}),
     layouts:bind({list:'layouts:list',save:'layouts:save',remove:'layouts:delete'}),
-    snippets:bind({list:'snippets:list',save:'snippets:save',remove:'snippets:delete',run:'snippets:run'}),
+    snippets:bind({list:'snippets:list',save:'snippets:save',remove:'snippets:delete',reorder:'snippets:reorder',run:'snippets:run'}),
     groups: bind({list:'groups:list',save:'groups:save',remove:'groups:delete'}),
     identities: bind({ list:'identities:list', save:'identities:save', remove:'identities:delete' }),
     keys: bind({ scan: 'keys:scan', agent: 'keys:agent', directory: 'keys:directory', generate: 'keys:generate', copy: 'keys:copy' }),
@@ -55,7 +55,7 @@
       mutations: true, directoryUploads:true,
       ...bind({ readText: 'files:read-text', saveText: 'files:save-text' }),
       ...bind({ mutationPreview:'files:mutation-preview',rename:'files:rename',remove:'files:remove', list: 'files:list', inspect: 'files:inspect', mkdir: 'files:mkdir', createFile: 'files:create-file', history: 'files:history', removeHistory: 'files:remove-history', prepare: 'files:prepare', enqueue: 'files:enqueue', discard: 'files:discard', cancel: 'files:cancel', retry: 'files:retry' }),
-      directoryDownloads: /Mac|Linux/.test(navigator.platform)
+      directoryDownloads: /Mac|Linux|Win/.test(navigator.platform)
     },
     onEvent(listener) {
       const events = new Channel();

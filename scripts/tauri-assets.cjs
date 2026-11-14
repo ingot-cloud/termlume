@@ -7,10 +7,12 @@ const output = join(root, 'dist', 'tauri-ui');
 const assets = {
   'style.css': 'src/ui/style.css',
   'workspace-state.js':'src/ui/workspace-state.js',
+  'command-library.js':'src/ui/command-library.js',
   'server-info.js': 'src/ui/server-info.js',
   'renderer.js': 'src/ui/renderer.js',
   'dropdown.js': 'src/ui/dropdown.js',
   'overlays.js': 'src/ui/overlays.js',
+  'shortcuts.js': 'src/ui/shortcuts.js',
   'terminal-paths.js': 'src/ui/terminal-paths.js',
   'bridge.js': 'src/ui/tauri-bridge.js',
   'xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js',

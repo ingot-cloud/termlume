@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "app.termlume.desktop",
   "build": {
-    "beforeDevCommand": "npm run tauri:assets",
-    "beforeBuildCommand": "npm run tauri:assets",
+    "beforeDevCommand": "node scripts/tauri-before-build.cjs",
+    "beforeBuildCommand": "node scripts/tauri-before-build.cjs",
     "frontendDist": "../dist/tauri-ui"
   },
   "app": {

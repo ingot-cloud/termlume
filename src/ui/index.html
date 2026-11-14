@@ -12,8 +12,10 @@
   <script defer src="/search.js"></script>
   <script defer src="/dropdown.js"></script>
   <script defer src="/overlays.js"></script>
+  <script defer src="/shortcuts.js"></script>
   <script defer src="/terminal-paths.js"></script>
   <script defer src="/workspace-state.js"></script>
+  <script defer src="/command-library.js"></script>
   <script defer src="/server-info.js"></script>
   <script defer src="/renderer.js"></script>
 </head>
@@ -25,14 +27,14 @@
     </button>
     <div class="tabbar">
       <nav id="tabs" aria-label="会话标签"></nav>
-      <button id="add-tab" type="button" aria-label="新建标签" title="新建标签">
+      <button data-shortcut="T" id="add-tab" type="button" aria-label="新建标签" title="新建标签">
         <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
       </button>
-      <button id="switch-tabs" type="button" aria-haspopup="dialog" aria-controls="session-switcher" aria-expanded="false" aria-label="切换会话" title="切换会话 (⌘J)" hidden>⋯</button>
+      <button id="switch-tabs" type="button" aria-haspopup="dialog" aria-controls="session-switcher" aria-expanded="false" aria-label="切换会话" data-shortcut="J" hidden>⋯</button>
     </div>
-    <button id="palette-button" class="launcher" aria-label="查找主机、会话或命令" title="查找主机、会话或命令 (⌘K)">
+    <button id="palette-button" class="launcher" aria-label="查找主机、会话或命令" data-shortcut="K">
       <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg>
-      <span>查找主机、会话或命令</span><kbd>⌘ K</kbd>
+      <span>查找主机、会话或命令</span><kbd data-shortcut="K"></kbd>
     </button>
   </header>
   <div id="workspace" data-view="hosts" data-host-layout="cards">
@@ -98,7 +100,7 @@
             <form id="quick-connect-form" class="tab-search">
               <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg>
               <input id="quick-connect-search" type="search" placeholder="搜索主机、标签，或输入 user@host" aria-label="搜索主机或标签" autocomplete="off">
-              <kbd>⌘ K</kbd>
+              <kbd data-shortcut="K"></kbd>
             </form>
             <button id="quick-add-host" type="button" class="outlined">新建主机</button>
           </div>
@@ -173,7 +175,7 @@
     <form id="session-switcher-form" class="tab-search">
       <span id="session-switcher-title">切换会话</span>
       <input id="session-switcher-search" type="search" placeholder="搜索会话、地址、分组或标签" aria-label="搜索会话、地址、分组或标签" autocomplete="off">
-      <kbd>⌘ J</kbd>
+      <kbd data-shortcut="J"></kbd>
       <button id="close-switcher" type="button" aria-label="关闭会话切换" title="关闭">×</button>
     </form>
     <div id="session-switcher-filters"></div>

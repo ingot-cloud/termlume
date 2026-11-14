@@ -20,6 +20,7 @@ mod git_auto;
 mod git_https;
 mod imports;
 mod keys;
+mod platform;
 mod server_info;
 mod session_logs;
 mod ssh;
@@ -432,7 +433,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         "layouts:list" | "layouts:save" | "layouts:delete" => {
             return assets::layout_request(ws, name, value)
         }
-        "snippets:list" | "snippets:save" | "snippets:delete" => {
+        "snippets:list" | "snippets:save" | "snippets:delete" | "snippets:reorder" => {
             return assets::snippet_request(ws, name, value)
         }
         "snippets:run" => {
@@ -440,8 +441,8 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
                 let store = ws.store.lock().unwrap();
                 let data = store.data()?;
                 let sid = id(&value["snippetId"])?;
-                let snippet = data
-                    .snippets
+                let snippets = assets::all_snippets(data);
+                let snippet = snippets
                     .iter()
                     .find(|s| s.id == sid)
                     .ok_or("命令已删除。")?;
@@ -450,7 +451,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
                 }
                 ssh::CommandRequest {
                     action: "custom".into(),
-                    argument: snippet.command.clone(),
+                    argument: snippet.rendered(&value["parameters"])?,
                     lines: 100,
                 }
             };
@@ -953,30 +954,19 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
     if key_passphrase.is_some() && (host.auth != "key" || host.key_path.is_none()) {
         return Err("请先选择本机私钥，再保存私钥口令。".into());
     }
-    let new_token = if let Some(password) = password {
+    if let Some(password) = password {
         if host.auth != "password" || password.is_empty() || password.encode_utf16().count() > 4096
         {
             return Err("SSH 密码格式无效。".into());
         }
-        let token = Uuid::new_v4();
-        keys::set_password(token, &password)
-            .map_err(|_| "无法保存 SSH 密码，请检查 macOS 钥匙串。")?;
+        let token = data.save_secret(&password);
         let fingerprint = data.fingerprint(&host).map(str::to_owned);
         data.local_passwords
-            .insert(host.id, LocalPassword::Native { token, fingerprint });
+            .insert(host.id, LocalPassword::Saved { token, fingerprint });
         data.portable_passwords.remove(&host.id);
-        Some(token)
-    } else {
-        None
-    };
-    let new_key_token = if let Some(secret) = key_passphrase {
-        let token = Uuid::new_v4();
-        if keys::set_password(token, &secret).is_err() {
-            if let Some(token) = new_token {
-                keys::delete_password(token);
-            }
-            return Err("无法保存私钥口令，请检查 macOS 钥匙串。".into());
-        }
+    }
+    if let Some(secret) = key_passphrase {
+        let token = data.save_secret(&secret);
         data.key_passphrases.insert(
             host.id,
             store::KeyPassphrase {
@@ -984,22 +974,11 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
                 key_path: host.key_path.clone().unwrap(),
             },
         );
-        Some(token)
-    } else {
-        None
-    };
+    }
     data.hosts.retain(|item| item.id != host.id);
     data.hosts.push(host);
     let result = json!(data.connection_hosts());
-    if let Err(err) = store.update(data) {
-        if let Some(token) = new_token {
-            keys::delete_password(token);
-        }
-        if let Some(token) = new_key_token {
-            keys::delete_password(token);
-        }
-        return Err(err);
-    }
+    store.update(data)?;
     Ok(result)
 }
 
@@ -1076,45 +1055,17 @@ async fn set_startup_unlock(ws: &Workspace, required: bool) -> Result<Value, Str
         .unlock_gate
         .try_lock()
         .map_err(|_| "已有解锁设置正在处理，请稍候。")?;
-    let (saved, path, key, epoch, vault_id) = {
-        let store = ws.store.lock().unwrap();
-        let key = store.key.as_ref().ok_or("请先启用并解锁保险库。")?;
+    let ws = ws.clone();
+    blocking(move || {
+        let mut store = ws.store.lock().unwrap();
+        store.key.as_ref().ok_or("请先启用并解锁保险库。")?;
         if required == store.startup_unlock.is_none() {
             return Ok(store.status());
         }
-        (
-            store.startup_unlock.clone(),
-            store.startup_unlock_path(),
-            (!required).then(|| key.clone()),
-            store.epoch,
-            store.envelope.as_ref().ok_or("保险库不存在。")?.header.id,
-        )
-    };
-    if let Some(saved) = saved {
-        let account = saved.account(&path)?;
-        blocking(move || startup_unlock::delete(&account)).await?;
-        let mut store = ws.store.lock().unwrap();
-        store.set_startup_unlock(None)?;
-        return Ok(store.status());
-    }
-    let credential = startup_unlock::Credential {
-        vault_id,
-        token: Uuid::new_v4(),
-    };
-    let account = credential.account(&path)?;
-    let saved_account = account.clone();
-    let key = key.ok_or("请先解锁保险库。")?;
-    blocking(move || startup_unlock::save(&saved_account, &key)).await?;
-    let result = {
-        let mut store = ws.store.lock().unwrap();
-        ensure_epoch(&store, epoch)
-            .and_then(|()| store.set_startup_unlock(Some(credential)))
-            .map(|()| store.status())
-    };
-    if result.is_err() {
-        let _ = blocking(move || startup_unlock::delete(&account)).await;
-    }
-    result
+        if required { store.clear_startup_unlock()?; }
+        else { store.enable_startup_unlock()?; }
+        Ok(store.status())
+    }).await
 }
 async fn enable(ws: &Workspace, value: Value) -> Result<Value, String> {
     if ws.store.lock().unwrap().envelope.is_some() {
@@ -1134,18 +1085,13 @@ async fn enable(ws: &Workspace, value: Value) -> Result<Value, String> {
 async fn disable(ws: &Workspace, value: Value) -> Result<Value, String> {
     let _sync = ws.sync_gate.try_lock().map_err(|_| "请等待同步完成。")?;
     let _unlock = ws.unlock_gate.try_lock().map_err(|_| "请等待解锁设置完成。")?;
-    let (envelope, epoch, startup) = {
+    let (envelope, epoch) = {
         let store = ws.store.lock().unwrap();
         let envelope = store.envelope.clone().ok_or("主密码保护尚未开启。")?;
         if store.data()?.git_migration.is_some() {
             return Err("请先继续或放弃待完成的 Git 迁移。".into());
         }
-        let startup = store
-            .startup_unlock
-            .as_ref()
-            .map(|credential| credential.account(&store.startup_unlock_path()))
-            .transpose()?;
-        (envelope, store.epoch, startup)
+        (envelope, store.epoch)
     };
     let secret = Zeroizing::new(string(&value["secret"])?.to_owned());
     let recovery = flag(&value, "useRecovery");
@@ -1155,14 +1101,9 @@ async fn disable(ws: &Workspace, value: Value) -> Result<Value, String> {
             .map(|_| ())
     })
     .await?;
-    if let Some(account) = startup {
-        blocking(move || startup_unlock::delete(&account)).await?;
-    }
     let mut store = ws.store.lock().unwrap();
     ensure_epoch(&store, epoch)?;
-    if store.startup_unlock.is_some() {
-        store.set_startup_unlock(None)?;
-    }
+    store.clear_startup_unlock()?;
     store.remove_protection()?;
     ws.conflict.lock().unwrap().take();
     ws.sync_attention.lock().unwrap().take();
@@ -1307,6 +1248,8 @@ pub fn run() {
             workspace_subscribe
         ])
         .setup(|app| {
+            #[cfg(any(windows, target_os = "macos"))]
+            platform::initialize_resources(app.path().resource_dir()?);
             let home = app.path().home_dir()?;
             let custom = std::env::var_os("TERMLUME_DATA_DIR")
                 .filter(|s| !s.is_empty())

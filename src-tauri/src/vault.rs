@@ -16,6 +16,38 @@ const INVALID: &str = "保险库格式或版本无效。";
 const UNLOCK_FAILED: &str = "无法解锁保险库，请核对主密码或恢复密钥。";
 pub type Key = Zeroizing<[u8; 32]>;
 
+// Local encryption does not enable the optional master-password vault. Its random
+// device key is stored separately; a protected workspace uses the vault key instead.
+const LOCAL_FORMAT: &str = "termlume-local-workspace";
+#[derive(Deserialize, Serialize)]
+struct LocalEnvelope {
+    format: String,
+    version: u32,
+    payload: Sealed,
+}
+
+pub fn encode_local(key: &Key, value: &impl Serialize) -> Result<Vec<u8>, String> {
+    let plaintext = Zeroizing::new(serde_json::to_vec(value).map_err(crate::error)?);
+    if plaintext.len() > 5 * 1024 * 1024 {
+        return Err("工作区数据超过大小上限。".into());
+    }
+    serde_json::to_vec(&LocalEnvelope {
+        format: LOCAL_FORMAT.into(),
+        version: 1,
+        payload: seal(key, &plaintext, b"termlume-local-workspace:v1")?,
+    }).map_err(crate::error)
+}
+
+pub fn decode_local<T: DeserializeOwned>(key: &Key, bytes: &[u8]) -> Result<T, String> {
+    let envelope: LocalEnvelope = serde_json::from_slice(bytes).map_err(crate::error)?;
+    if envelope.format != LOCAL_FORMAT || envelope.version != 1 {
+        return Err("本机工作区格式或版本无效。".into());
+    }
+    let plaintext = open(key, &envelope.payload, b"termlume-local-workspace:v1")
+        .map_err(|_| "无法解密本机工作区，数据或本机密钥已损坏。".to_string())?;
+    serde_json::from_slice(&plaintext).map_err(crate::error)
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Envelope {
     format: String,
@@ -100,7 +132,7 @@ pub struct Header {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct Sealed {
+pub(crate) struct Sealed {
     nonce: String,
     ciphertext: String,
 }
@@ -253,7 +285,7 @@ fn context(h: &Header, scope: &str) -> Result<Vec<u8>, String> {
     .map_err(crate::error)
 }
 
-fn seal(key: &Key, plaintext: &[u8], aad: &[u8]) -> Result<Sealed, String> {
+pub(crate) fn seal(key: &Key, plaintext: &[u8], aad: &[u8]) -> Result<Sealed, String> {
     let nonce = rand::random::<[u8; 24]>();
     let ciphertext = XChaCha20Poly1305::new((&**key).into())
         .encrypt(
@@ -270,7 +302,7 @@ fn seal(key: &Key, plaintext: &[u8], aad: &[u8]) -> Result<Sealed, String> {
     })
 }
 
-fn open(key: &Key, sealed: &Sealed, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+pub(crate) fn open(key: &Key, sealed: &Sealed, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     open_with_limit(key, sealed, aad, MAX_DOCUMENT)
 }
 

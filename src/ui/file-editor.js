@@ -131,7 +131,7 @@ export function open(parent, path, text, onChange, onSave, dark) {
       EditorView.updateListener.of(update => { if (update.docChanged) onChange(); }),
       EditorView.domEventHandlers({
         keydown(event) {
-          if (!event.isComposing && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+          if (!event.isComposing && !event.shiftKey && window.keyboardShortcuts.primary(event) && event.key.toLowerCase() === 's') {
             onSave();
             return true;
           }

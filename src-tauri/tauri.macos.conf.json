@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": {
+      "vendor/macos/": "tools/macos/",
+      "licenses/OpenSSL-LICENSE.txt": "licenses/OpenSSL-LICENSE.txt"
+    }
+  }
+}

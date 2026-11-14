@@ -2,6 +2,173 @@ use super::*;
 use tauri::ipc::InvokeResponseBody;
 use tokio::sync::mpsc;
 
+#[tokio::test]
+async fn app_credentials_persist_without_a_master_password_and_stay_out_of_snapshots() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let secret = "app-local-password-测试";
+    let host = call(&ws, "hosts:save", json!({"address":"app-password.test","username":"ops","auth":"password","localPassword":secret})).await[0].clone();
+    let host_id = id(&host["id"]).unwrap();
+    assert_eq!(call(&ws, "hosts:reveal-password", json!(host_id)).await, secret);
+    let identity = call(&ws, "identities:save", json!({"identity":{"name":"local identity","username":"ops","auth":"password"},"localPassword":"identity-local-secret"})).await;
+    assert!(identity["identityId"].is_string());
+    let key_path = home.path().join("test-key");
+    std::fs::write(&key_path, "fixture").unwrap();
+    call(&ws, "hosts:save", json!({"address":"app-key.test","username":"ops","auth":"key","keyPath":key_path,"localKeyPassphrase":"key-local-secret"})).await;
+    {
+        let store = ws.store.lock().unwrap();
+        let data = store.data().unwrap();
+        assert_eq!(data.local_secrets.len(), 3);
+        let snapshot = serde_json::to_string(&data.snapshot()).unwrap();
+        for text in [secret, "identity-local-secret", "key-local-secret", "localSecrets"] {
+            assert!(!snapshot.contains(text));
+        }
+        assert!(!store.status()["enabled"].as_bool().unwrap());
+    }
+    let raw = std::fs::read_to_string(profile.path().join("workspace.json")).unwrap();
+    for text in [secret, "identity-local-secret", "key-local-secret", "app-password.test"] {
+        assert!(!raw.contains(text));
+    }
+    assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["format"], "termlume-local-workspace");
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "hosts:reveal-password", json!(host_id)).await, secret);
+    let mut renamed = host;
+    renamed["name"] = json!("renamed");
+    call(&ws, "hosts:save", renamed.clone()).await;
+    assert_eq!(call(&ws, "hosts:reveal-password", json!(host_id)).await, secret);
+    renamed["localPassword"] = json!("replacement-local-secret");
+    call(&ws, "hosts:save", renamed.clone()).await;
+    assert_eq!(ws.store.lock().unwrap().data().unwrap().local_secrets.len(), 3);
+    renamed["address"] = json!("other.test");
+    renamed.as_object_mut().unwrap().remove("localPassword");
+    call(&ws, "hosts:save", renamed).await;
+    assert_eq!(call(&ws, "hosts:has-password", json!(host_id)).await, false);
+    assert_eq!(ws.store.lock().unwrap().data().unwrap().local_secrets.len(), 2);
+}
+
+#[tokio::test]
+async fn local_credentials_follow_vault_locking_and_survive_disabling_master_protection() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let host = call(&ws, "hosts:save", json!({"address":"vault-password.test","username":"ops","auth":"password","localPassword":"local-vault-secret"})).await[0].clone();
+    call(&ws, "vault:enable", json!({"password":"fixture master password","recovery":vault::recovery_code()})).await;
+    call(&ws, "vault:lock", Value::Null).await;
+    assert!(dispatch(&ws, "hosts:reveal-password", host["id"].clone()).await.is_err());
+    let raw = std::fs::read(profile.path().join("workspace.json")).unwrap();
+    let bytes = std::fs::read(profile.path().join("workspace.key")).unwrap();
+    let mut device_key = vault::Key::default();
+    device_key.copy_from_slice(&bytes);
+    assert!(vault::decode_local::<Data>(&device_key, &raw).is_err());
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    call(&ws, "vault:unlock", json!({"secret":"fixture master password"})).await;
+    assert_eq!(call(&ws, "hosts:reveal-password", host["id"].clone()).await, "local-vault-secret");
+    call(&ws, "vault:disable", json!({"secret":"fixture master password"})).await;
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "hosts:reveal-password", host["id"].clone()).await, "local-vault-secret");
+    let raw = std::fs::read_to_string(profile.path().join("workspace.json")).unwrap();
+    assert!(!raw.contains("local-vault-secret"));
+    assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["format"], "termlume-local-workspace");
+}
+
+#[test]
+fn local_workspace_rejects_missing_wrong_keys_and_tampering_without_overwriting_data() {
+    let profile = tempfile::tempdir().unwrap();
+    let mut store = Store::open(profile.path(), None).unwrap();
+    store.update(Data::default()).unwrap();
+    drop(store);
+    let path = profile.path().join("workspace.json");
+    let key_path = profile.path().join("workspace.key");
+    let raw = std::fs::read(&path).unwrap();
+    let key = std::fs::read(&key_path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o077, 0);
+    }
+    std::fs::remove_file(&key_path).unwrap();
+    assert!(Store::open(profile.path(), None).is_err());
+    assert!(!key_path.exists());
+    assert_eq!(std::fs::read(&path).unwrap(), raw);
+    std::fs::write(&key_path, [9; 32]).unwrap();
+    assert!(Store::open(profile.path(), None).is_err());
+    std::fs::write(&key_path, &key).unwrap();
+    let mut tampered: Value = serde_json::from_slice(&raw).unwrap();
+    let ciphertext = tampered["payload"]["ciphertext"].as_str().unwrap();
+    let replacement = if ciphertext.starts_with('A') { "B" } else { "A" };
+    tampered["payload"]["ciphertext"] = json!(format!("{replacement}{}", &ciphertext[1..]));
+    std::fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    assert!(Store::open(profile.path(), None).is_err());
+    std::fs::write(&path, raw).unwrap();
+    assert!(Store::open(profile.path(), None).is_ok());
+}
+
+#[test]
+fn plaintext_workspaces_are_upgraded_and_unknown_formats_are_rejected() {
+    let profile = tempfile::tempdir().unwrap();
+    let path = profile.path().join("workspace.json");
+    let mut data = Data::default();
+    data.hosts.push(Host { id: Uuid::new_v4(), address: "legacy-private.test".into(), ..Default::default() });
+    std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+    let store = Store::open(profile.path(), None).unwrap();
+    assert_eq!(store.data().unwrap().hosts[0].address, "legacy-private.test");
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("legacy-private.test"));
+    drop(store);
+    assert_eq!(Store::open(profile.path(), None).unwrap().data().unwrap().hosts.len(), 1);
+    std::fs::write(&path, br#"{"format":"future-unsupported-format"}"#).unwrap();
+    assert!(Store::open(profile.path(), None).is_err());
+}
+
+#[tokio::test]
+async fn failed_credential_save_preserves_the_previous_password() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let mut host = call(&ws, "hosts:save", json!({"address":"write-failure.test","username":"ops","auth":"password","localPassword":"old-local-secret"})).await[0].clone();
+    let path = profile.path().join("workspace.json");
+    let backup = profile.path().join("saved-workspace");
+    std::fs::rename(&path, &backup).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    host["localPassword"] = json!("failed-new-secret");
+    assert!(dispatch(&ws, "hosts:save", host.clone()).await.is_err());
+    assert_eq!(call(&ws, "hosts:reveal-password", host["id"].clone()).await, "old-local-secret");
+    assert_eq!(ws.store.lock().unwrap().data().unwrap().local_secrets.len(), 1);
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(&backup, &path).unwrap();
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "hosts:reveal-password", host["id"].clone()).await, "old-local-secret");
+}
+
+#[tokio::test]
+async fn os_only_credentials_require_reentry_without_changing_the_workspace() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let host = call(&ws, "hosts:save", json!({"address":"old-password.test","username":"ops","auth":"password"})).await[0].clone();
+    let host_id = id(&host["id"]).unwrap();
+    let token = Uuid::new_v4();
+    {
+        let mut store = ws.store.lock().unwrap();
+        let mut data = store.data().unwrap().clone();
+        data.local_passwords.insert(host_id, LocalPassword::Saved { token, fingerprint: None });
+        store.update(data).unwrap();
+    }
+    let path = profile.path().join("workspace.json");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(call(&ws, "hosts:has-password", json!(host_id)).await, false);
+    assert!(ws.store.lock().unwrap().read_secret(token).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(ws.store.lock().unwrap().data().unwrap().local_secrets.is_empty());
+    let mut updated = host;
+    updated["localPassword"] = json!("replacement-app-password");
+    call(&ws, "hosts:save", updated).await;
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "hosts:reveal-password", json!(host_id)).await, "replacement-app-password");
+    assert!(!ws.store.lock().unwrap().data().unwrap().local_secrets.contains_key(&token));
+}
+
 #[test]
 fn git_envelope_hides_password_material_and_reads_legacy_snapshots() {
     let password = "vault fixture password";
@@ -270,130 +437,172 @@ async fn git_pull_only_and_automatic_sync_respect_local_changes_and_conflicts() 
     assert!(resolved["state"]["syncAttention"].is_null());
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
-#[ignore = "requires the macOS login keychain"]
 async fn startup_unlock_preserves_encryption_and_is_local_to_the_workspace() {
-    struct SavedKey(String);
-    impl Drop for SavedKey {
-        fn drop(&mut self) {
-            let _ = startup_unlock::delete(&self.0);
-        }
-    }
-
     let home = tempfile::tempdir().unwrap();
     let (profile, ws) = make_workspace(home.path(), None);
     let password = "test1234";
     let recovery = vault::recovery_code();
-    let hosts = call(
-        &ws,
-        "hosts:save",
-        json!({"name":"private startup fixture","address":"private.example.test","username":"ops","port":22,"auth":"agent"}),
-    )
-    .await;
-    let state = call(
-        &ws,
-        "vault:enable",
-        json!({"password":password,"recovery":recovery}),
-    )
-    .await;
+    let hosts = call(&ws, "hosts:save", json!({"name":"private startup fixture","address":"private.example.test","username":"ops","auth":"agent"})).await;
+    let state = call(&ws, "vault:enable", json!({"password":password,"recovery":recovery})).await;
+    assert_eq!(state["startupUnlockSupported"], true);
     assert_eq!(state["startupUnlockRequired"], true);
     let original = std::fs::read(profile.path().join("workspace.json")).unwrap();
     let state = call(&ws, "vault:set-startup-unlock", json!(false)).await;
     assert_eq!(state["startupUnlockRequired"], false);
-    let (settings, account) = {
-        let store = ws.store.lock().unwrap();
-        let settings = store.startup_unlock_path();
-        let account = store
-            .startup_unlock
-            .as_ref()
-            .unwrap()
-            .account(&settings)
-            .unwrap();
-        let snapshot = git::Snapshot {
-            hosts: store.data().unwrap().snapshot(),
-            parent_commit: None,
-        };
-        let envelope = vault::encode(
-            store.key.as_ref().unwrap(),
-            &store.envelope.as_ref().unwrap().header,
-            "portable",
-            &snapshot,
-        )
-        .unwrap();
-        let encoded = serde_json::to_string(&envelope).unwrap();
-        assert!(!encoded.contains("private startup fixture"));
-        assert!(!encoded.contains("private.example.test"));
-        assert!(envelope
-            .unlock::<git::Snapshot>(password, false, "portable")
-            .is_ok());
-        assert!(envelope
-            .unlock::<git::Snapshot>(&recovery, true, "portable")
-            .is_ok());
-        (settings, account)
-    };
-    let _cleanup = SavedKey(account.clone());
-    assert_eq!(
-        std::fs::read(profile.path().join("workspace.json")).unwrap(),
-        original
-    );
+    let settings = profile.path().join("startup-unlock.json");
     let preferences = std::fs::read_to_string(&settings).unwrap();
+    assert!(serde_json::from_str::<Value>(&preferences).unwrap()["protected"]["payload"]["ciphertext"].is_string());
     assert!(!preferences.contains(password));
     assert!(!preferences.contains("private startup fixture"));
+    {
+        use base64::Engine;
+        let store = ws.store.lock().unwrap();
+        assert!(!store.startup_unlock.as_ref().unwrap().is_legacy());
+        assert!(!preferences.contains(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&**store.key.as_ref().unwrap())));
+        let snapshot = serde_json::to_string(&store.data().unwrap().snapshot()).unwrap();
+        assert!(!snapshot.contains("startupUnlock") && !snapshot.contains("protected"));
+    }
+    assert_eq!(std::fs::read(profile.path().join("workspace.json")).unwrap(), original);
     drop(ws);
-
     let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
     assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], false);
     assert_eq!(call(&ws, "hosts:list", Value::Null).await, hosts);
     *ws.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(3600);
     assert_eq!(ws.lock(true)["locked"], false);
     call(&ws, "vault:lock", Value::Null).await;
-    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
-    assert!(dispatch(&ws, "vault:set-startup-unlock", json!(true))
-        .await
-        .is_err());
-
+    assert!(dispatch(&ws, "vault:set-startup-unlock", json!(true)).await.is_err());
     let copied = tempfile::tempdir().unwrap();
-    std::fs::copy(
-        profile.path().join("workspace.json"),
-        copied.path().join("workspace.json"),
-    )
-    .unwrap();
-    std::fs::copy(&settings, copied.path().join("startup-unlock.json")).unwrap();
+    for name in ["workspace.json", "startup-unlock.json", "workspace.key"] {
+        std::fs::copy(profile.path().join(name), copied.path().join(name)).unwrap();
+    }
     let other = Workspace::new(copied.path().into(), home.path().into(), None).unwrap();
     let state = call(&other, "vault:state", Value::Null).await;
     assert_eq!(state["locked"], true);
     assert!(state["startupUnlockError"].is_string());
-
-    startup_unlock::delete(&account).unwrap();
     drop(ws);
+    let mut damaged: Value = serde_json::from_str(&preferences).unwrap();
+    damaged["protected"]["payload"]["ciphertext"] = json!("broken");
+    std::fs::write(&settings, serde_json::to_vec(&damaged).unwrap()).unwrap();
+    let before = std::fs::read(&settings).unwrap();
     let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
     let state = call(&ws, "vault:state", Value::Null).await;
     assert_eq!(state["locked"], true);
-    assert_eq!(state["startupUnlockRequired"], false);
     assert!(state["startupUnlockError"].is_string());
+    assert!(dispatch(&ws, "vault:unlock", json!({"secret":"wrong password"})).await.is_err());
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
     let state = call(&ws, "vault:unlock", json!({"secret":password})).await;
     assert!(state["startupUnlockError"].is_null());
+    assert_eq!(call(&ws, "hosts:list", Value::Null).await, hosts);
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], false);
     let state = call(&ws, "vault:set-startup-unlock", json!(true)).await;
     assert_eq!(state["startupUnlockRequired"], true);
     assert!(!settings.exists());
-
-    call(&ws, "vault:set-startup-unlock", json!(false)).await;
-    let account = {
-        let store = ws.store.lock().unwrap();
-        store
-            .startup_unlock
-            .as_ref()
-            .unwrap()
-            .account(&settings)
-            .unwrap()
-    };
-    let _cleanup = SavedKey(account.clone());
-    call(&ws, "vault:set-startup-unlock", json!(true)).await;
-    assert!(startup_unlock::read(&account).is_err());
     drop(ws);
     let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
     assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
+    call(&ws, "vault:unlock", json!({"secret":recovery,"useRecovery":true})).await;
+    call(&ws, "vault:set-startup-unlock", json!(false)).await;
+    call(&ws, "vault:disable", json!({"secret":password})).await;
+    assert!(!settings.exists());
+    assert_eq!(call(&ws, "hosts:list", Value::Null).await, hosts);
+}
+
+#[tokio::test]
+async fn missing_auto_unlock_device_key_requires_authentication_before_repair() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    call(&ws, "vault:enable", json!({"password":"fixture password","recovery":vault::recovery_code()})).await;
+    call(&ws, "vault:set-startup-unlock", json!(false)).await;
+    let path = profile.path().join("workspace.key");
+    let old = std::fs::read(&path).unwrap();
+    drop(ws);
+    std::fs::remove_file(&path).unwrap();
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert!(!path.exists());
+    let state = call(&ws, "vault:state", Value::Null).await;
+    assert_eq!(state["locked"], true);
+    assert!(state["startupUnlockError"].is_string());
+    assert!(dispatch(&ws, "vault:unlock", json!({"secret":"wrong password"})).await.is_err());
+    assert!(!path.exists());
+    let state = call(&ws, "vault:unlock", json!({"secret":"fixture password"})).await;
+    assert!(state["startupUnlockError"].is_null());
+    assert_ne!(std::fs::read(&path).unwrap(), old);
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], false);
+}
+
+#[tokio::test]
+async fn failed_auto_unlock_setting_writes_preserve_the_previous_policy() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    call(&ws, "vault:enable", json!({"password":"fixture password","recovery":vault::recovery_code()})).await;
+    let path = profile.path().join("startup-unlock.json");
+    std::fs::create_dir(&path).unwrap();
+    assert!(dispatch(&ws, "vault:set-startup-unlock", json!(false)).await.is_err());
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["startupUnlockRequired"], true);
+    std::fs::remove_dir(&path).unwrap();
+    call(&ws, "vault:set-startup-unlock", json!(false)).await;
+    let backup = profile.path().join("saved-auto-unlock");
+    std::fs::rename(&path, &backup).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(dispatch(&ws, "vault:set-startup-unlock", json!(true)).await.is_err());
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["startupUnlockRequired"], false);
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(&backup, &path).unwrap();
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], false);
+}
+
+#[tokio::test]
+async fn legacy_auto_unlock_without_keychain_can_migrate_after_master_password_unlock() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    call(&ws, "vault:enable", json!({"password":"fixture password","recovery":vault::recovery_code()})).await;
+    {
+        let mut store = ws.store.lock().unwrap();
+        let credential = startup_unlock::Credential::new(store.envelope.as_ref().unwrap().header.id);
+        store.set_startup_unlock(Some(credential)).unwrap();
+    }
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], true);
+    let state = call(&ws, "vault:unlock", json!({"secret":"fixture password"})).await;
+    assert!(state["startupUnlockError"].is_null());
+    assert!(!ws.store.lock().unwrap().startup_unlock.as_ref().unwrap().is_legacy());
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "vault:state", Value::Null).await["locked"], false);
+}
+
+#[test]
+fn failed_legacy_auto_unlock_conversion_preserves_settings_for_manual_retry() {
+    let profile = tempfile::tempdir().unwrap();
+    let mut store = Store::open(profile.path(), None).unwrap();
+    let (key, header) = vault::create("fixture password", &vault::recovery_code()).unwrap();
+    store.install(key, &header, Data::default()).unwrap();
+    store.set_startup_unlock(Some(startup_unlock::Credential::new(header.id))).unwrap();
+    let path = store.startup_unlock_path();
+    let backup = profile.path().join("saved-auto-unlock");
+    std::fs::rename(&path, &backup).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(store.enable_startup_unlock().is_err());
+    assert!(store.startup_unlock.as_ref().unwrap().is_legacy());
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(&backup, &path).unwrap();
+    drop(store);
+    let mut store = Store::open(profile.path(), None).unwrap();
+    assert!(store.data.is_none());
+    let envelope = store.envelope.as_ref().unwrap();
+    let (key, data) = envelope.unlock::<Data>("fixture password", false, "local").unwrap();
+    store.unlock(key, data);
+    assert!(!store.startup_unlock.as_ref().unwrap().is_legacy());
+    drop(store);
+    assert!(Store::open(profile.path(), None).unwrap().data.is_some());
 }
 
 async fn connect_tab(
@@ -421,7 +630,7 @@ async fn connect_tab(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated OpenSSH and macOS keychain fixtures"]
+#[ignore = "requires the isolated OpenSSH fixture"]
 async fn macos_host_key_passphrase_persists_connects_and_cleans_up() {
     let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
     let (profile, ws) = make_workspace(&fixture, None);
@@ -445,7 +654,7 @@ async fn macos_host_key_passphrase_persists_connects_and_cleans_up() {
         assert!(!rows.contains("keyPassphrases"));
         data.key_passphrases[&host_id].token
     };
-    assert_eq!(keys::get_password(token).unwrap(), secret);
+    assert_eq!(ws.store.lock().unwrap().read_secret(token).unwrap().as_str(), secret);
     assert!(
         !std::fs::read_to_string(profile.path().join("workspace.json"))
             .unwrap()
@@ -465,7 +674,7 @@ async fn macos_host_key_passphrase_persists_connects_and_cleans_up() {
 
     host["localKeyPassphrase"] = json!(secret);
     host = call(&ws, "hosts:save", host).await[0].clone();
-    assert!(keys::get_password(token).is_err());
+    assert!(ws.store.lock().unwrap().read_secret(token).is_err());
     let replaced = ws.store.lock().unwrap().data().unwrap().key_passphrases[&host_id].token;
     host["keyPath"] = json!(fixture.join("client"));
     host = call(&ws, "hosts:save", host).await[0].clone();
@@ -473,7 +682,7 @@ async fn macos_host_key_passphrase_persists_connects_and_cleans_up() {
         call(&ws, "hosts:has-key-passphrase", json!(host_id)).await,
         false
     );
-    assert!(keys::get_password(replaced).is_err());
+    assert!(ws.store.lock().unwrap().read_secret(replaced).is_err());
 
     host["localKeyPassphrase"] = json!(secret);
     host = call(&ws, "hosts:save", host).await[0].clone();
@@ -487,7 +696,7 @@ async fn macos_host_key_passphrase_persists_connects_and_cleans_up() {
     call(&ws, "hosts:save", host).await;
     let last = ws.store.lock().unwrap().data().unwrap().key_passphrases[&host_id].token;
     call(&ws, "hosts:delete", json!(host_id)).await;
-    assert!(keys::get_password(last).is_err());
+    assert!(ws.store.lock().unwrap().read_secret(last).is_err());
 }
 
 #[tokio::test]
@@ -729,7 +938,7 @@ async fn macos_transport_migration_and_sync() {
     let session = ws.connections.connected(second).unwrap();
     let source = fixture
         .join("local")
-        .join(format!("input-{}.bin", Uuid::new_v4()));
+        .join(format!("测试 中文'引号-{}.bin", Uuid::new_v4()));
     let data = vec![42; 1024 * 1024];
     std::fs::write(&source, &data).unwrap();
     let drop_request = json!({
@@ -1982,7 +2191,7 @@ async fn shared_identity_records_resolve_update_and_sync_without_local_keys() {
 }
 
 #[tokio::test]
-#[ignore = "requires localhost password SSH and macOS keychain fixtures"]
+#[ignore = "requires the localhost password SSH fixture"]
 async fn macos_shared_identity_passwords_migrate_and_verify_each_endpoint() {
     let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
     let home = tempfile::tempdir().unwrap();
@@ -2167,6 +2376,7 @@ async fn groups_preserve_empty_nodes_inheritance_and_legacy_mapping() {
 
 #[tokio::test]
 #[ignore = "requires isolated OpenSSH SFTP fixture"]
+#[cfg(unix)]
 async fn macos_remote_mutations_upload_directory_and_edit_conflicts() {
     let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
     let home = tempfile::tempdir().unwrap();
@@ -2415,6 +2625,50 @@ async fn layouts_keep_four_panes_and_both_ratios_across_restore() {
 }
 
 #[tokio::test]
+async fn editable_builtins_pins_order_and_parameters_survive_restart_and_sync() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let original = call(&ws, "snippets:list", Value::Null).await;
+    assert_eq!(original.as_array().unwrap().len(), 4);
+    assert!(ws.store.lock().unwrap().data().unwrap().snippets.is_empty());
+    let mut legacy = Data::default();
+    let mut legacy_builtin: assets::Snippet = serde_json::from_value(original[0].clone()).unwrap();
+    legacy_builtin.builtin = None;
+    legacy_builtin.command = "df -h /tmp".into();
+    legacy.snippets.push(legacy_builtin);
+    assert_eq!(assets::all_snippets(&legacy)[0].builtin.as_deref(), Some("disk"));
+    assert_eq!(assets::all_snippets(&legacy)[0].command, "df -h /tmp");
+    let disk = original[0].clone();
+    let mut edited = disk.clone();
+    edited["name"] = json!("常用磁盘"); edited["command"] = json!("df -h /tmp"); edited["pinned"] = json!(false);
+    call(&ws, "snippets:save", json!({"snippet":edited,"expected":disk})).await;
+    assert!(dispatch(&ws, "snippets:save", json!({"snippet":disk,"expected":disk})).await.is_err());
+    let before = call(&ws, "snippets:list", Value::Null).await;
+    let mut ids: Vec<Value> = before.as_array().unwrap().iter().map(|s| s["id"].clone()).collect();
+    ids.reverse();
+    call(&ws, "snippets:reorder", json!({"ids":ids,"expected":before})).await;
+    assert!(dispatch(&ws, "snippets:reorder", json!({"ids":ids,"expected":before})).await.is_err());
+    let ordered = call(&ws, "snippets:list", Value::Null).await;
+    assert_eq!(ordered[0]["id"], ids[0]);
+    let mut restored = Data::default();
+    restored.apply(store::portable_rows(ws.store.lock().unwrap().data().unwrap().snapshot()).unwrap(), None);
+    assert_eq!(json!(assets::all_snippets(&restored)), ordered);
+    let tail: assets::Snippet = serde_json::from_value(ordered.as_array().unwrap().iter().find(|s| s["builtin"] == "tail").unwrap().clone()).unwrap();
+    assert_eq!(tail.rendered(&json!({"path":"/tmp/中文 ' {{service}}.log","lines":12})).unwrap(), "tail -n 12 '/tmp/中文 '\\'' {{service}}.log'");
+    assert!(tail.rendered(&json!({"path":"relative","lines":12})).is_err());
+    assert!(tail.rendered(&json!({"path":"/tmp/log","lines":0})).is_err());
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "snippets:list", Value::Null).await, ordered);
+    let saved_disk = ordered.as_array().unwrap().iter().find(|s| s["id"] == disk["id"]).unwrap();
+    call(&ws, "snippets:delete", json!({"snippet":saved_disk,"expected":saved_disk})).await;
+    let reset = call(&ws, "snippets:list", Value::Null).await;
+    assert_eq!(reset.as_array().unwrap().iter().find(|s| s["id"] == disk["id"]).unwrap(), &disk);
+    let mut invalid_ids = ids.clone(); invalid_ids[0] = invalid_ids[1].clone();
+    assert!(dispatch(&ws, "snippets:reorder", json!({"ids":invalid_ids,"expected":reset})).await.is_err());
+}
+
+#[tokio::test]
 async fn command_library_layouts_preferences_and_empty_workspace_guards() {
     let home = tempfile::tempdir().unwrap();
     let (profile, ws) = make_workspace(home.path(), None);
@@ -2491,11 +2745,11 @@ async fn macos_commands_logs_remote_and_dynamic_forwards() {
         .trim()
         .parse()
         .unwrap();
-    let host=call(&ws,"hosts:save",json!({"address":"127.0.0.1","port":port,"username":std::env::var("USER").unwrap(),"auth":"agent","startupCommand":"printf 'STARTUP_%s\\n' 'DONE'","startupEnabled":true,"autoReconnect":true})).await[0].clone();
+    let host=call(&ws,"hosts:save",json!({"address":"127.0.0.1","port":port,"username":std::env::var("USER").unwrap(),"auth":"agent","startupCommand":"printf 'STARTUP_%s\\n' 'DONE'; printf 'CHARMAP_'; locale charmap","startupEnabled":true,"autoReconnect":true})).await[0].clone();
     let mut rx = events(&ws);
     let tab = connect_tab(&ws, &mut rx, &host, "", false, false).await;
     let mut output = String::new();
-    while !output.contains("STARTUP_DONE") {
+    while !output.contains("STARTUP_DONE") || !output.contains("CHARMAP_UTF-8") {
         let e = until(&mut rx, |e| {
             e["type"] == "output" && e["id"] == tab.to_string()
         })

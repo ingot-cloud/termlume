@@ -41,6 +41,41 @@ function call(target, method, ...args) {
   return new Promise((resolve, reject) => target[method](...args, (error, value) => error ? reject(error) : resolve(value)));
 }
 
+function utf8Locale(output) {
+  const [charmap, ...lines] = output.trim().split(/\r?\n/);
+  if (/^utf-?8$/i.test(charmap)) return;
+  const locales = lines.map(line => line.trim()).filter(locale => locale.length <= 128 && /^[\w.@-]+\.utf-?8$/i.test(locale));
+  return ['c.utf8', 'en_us.utf8'].map(preferred => locales.find(locale => locale.toLowerCase().replaceAll('-', '') === preferred))
+    .find(Boolean) || locales[0];
+}
+
+function terminalLocale(client) {
+  return new Promise(resolve => {
+    let channel, settled = false, output = Buffer.alloc(0), exit;
+    const finish = locale => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      channel?.close();
+      resolve(locale);
+    };
+    const timer = setTimeout(() => finish(), 2000);
+    client.exec('locale charmap; locale -a', (error, stream) => {
+      if (error) { finish(); return; }
+      channel = stream;
+      channel.on('error', () => finish());
+      if (settled) { channel.close(); return; }
+      channel.stderr.resume();
+      channel.on('data', data => {
+        if (output.length + data.length > 65536) { finish(); return; }
+        output = Buffer.concat([output, data]);
+      });
+      channel.once('exit', code => { exit = code; });
+      channel.once('close', () => finish(exit === 0 ? utf8Locale(output.toString('utf8')) : undefined));
+    });
+  });
+}
+
 class WorkspaceSSH {
   constructor(store, emit) {
     this.store = store;
@@ -71,7 +106,8 @@ class WorkspaceSSH {
       client.config.password = undefined;
       try {
         this.emit({ type: 'progress', id, message: '正在打开远端终端…' });
-        const channel = await call(client, 'shell', session.size);
+        const locale = await terminalLocale(client);
+        const channel = await call(client, 'shell', session.size, locale ? { env: { LC_CTYPE: locale } } : {});
         if (this.sessions.get(id) !== session) { channel.close(); return; }
         session.channel = channel;
         channel.setWindow(session.size.rows, session.size.cols, 0, 0);
@@ -376,4 +412,4 @@ class WorkspaceSSH {
   }
 }
 
-module.exports = { WorkspaceSSH, call, commandFor, fileName, remotePath };
+module.exports = { WorkspaceSSH, call, commandFor, fileName, remotePath, utf8Locale, terminalLocale };

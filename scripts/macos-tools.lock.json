@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "target": "aarch64-apple-darwin",
+  "gitVersion": "2.56.1",
+  "archive": "git-2.56.1.tar.xz",
+  "url": "https://www.kernel.org/pub/software/scm/git/git-2.56.1.tar.xz",
+  "sha256": "f0b0bf89264b9bd2e1c640363e7529643989da76281600473c50745cd34a607f",
+  "size": 8494608,
+  "checksums": "https://www.kernel.org/pub/software/scm/git/sha256sums.asc",
+  "makeArguments": [
+    "-j4",
+    "CC=/usr/bin/clang",
+    "CFLAGS=-O2 -mmacosx-version-min=11.0",
+    "LDFLAGS=-mmacosx-version-min=11.0",
+    "NO_CURL=YesPlease",
+    "NO_GETTEXT=YesPlease",
+    "NO_TCLTK=YesPlease",
+    "NO_PERL=YesPlease",
+    "NO_PYTHON=YesPlease",
+    "NO_EXPAT=YesPlease",
+    "NO_OPENSSL=YesPlease",
+    "NO_ICONV=",
+    "NO_RUST=YesPlease",
+    "USE_HOMEBREW_LIBICONV=",
+    "NEEDS_GOOD_LIBICONV=",
+    "prefix=/termlume-runtime",
+    "git"
+  ]
+}
