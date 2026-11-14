@@ -18,6 +18,8 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:build:signed": "node scripts/macos-signed.cjs",
+    "release:version": "node scripts/release-version.cjs",
+    "release:package": "node scripts/package-release.cjs",
     "tauri:test:macos": "bash scripts/test-macos.sh"
   },
   "dependencies": {

@@ -8,6 +8,8 @@ Mac Apple Silicon 包内置用于 SSH 保险库同步的 Git 2.56.1 客户端，
 
 ## 构建与来源
 
+GitHub Actions 的自动构建、Release 产物及补跑说明见 [GitHub Release 自动打包](GITHUB_RELEASES.md)。
+
 - Windows 工具归档固定在 scripts/windows-tools.lock.json，许可与来源通知随安装保留。
 - 完整 WebView2 x64 离线安装器固定在 scripts/webview2.lock.json，构建前校验长度和 SHA-256，最终校验 NSIS 内嵌文件与该归档一致。Tauri 的构建阶段仍可联网解析官方下载地址；交付安装包本身不需要下载依赖。
 - Mac Git 源码、摘要和构建选项固定在 scripts/macos-tools.lock.json；编译时关闭应用同步不使用的 HTTP、图形界面、Perl/Python、Rust 子系统和 gettext，不链接 Homebrew 库。资源包含 Git、COPYING、源码地址与清单。构建机需要编译工具，用户运行时不需要。

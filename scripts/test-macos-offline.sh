@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 app_path=${1:-/Applications/Termlume.app}
+app_path=$(cd "$app_path" && pwd)
 git_binary="$app_path/Contents/Resources/tools/macos/bin/git"
 test -x "$git_binary"
 fixture=$(mktemp -d /tmp/termlume-offline-git.XXXXXX)

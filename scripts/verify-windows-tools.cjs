@@ -62,7 +62,7 @@ function audit(directory) {
     dependencyClosureVerified: true, dependencies };
 }
 
-module.exports = { audit };
+module.exports = { audit, imports };
 if (require.main === module) {
   try {
     const report = audit(path.resolve(__dirname, '../src-tauri/vendor/windows'));

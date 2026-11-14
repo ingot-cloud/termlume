@@ -1,0 +1,195 @@
+name: Release packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的 Release 标签，例如 v0.2.0（也可补充草稿 Release 的产物）'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+jobs:
+  check:
+    name: Validate release and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Match application version to release tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: node scripts/release-version.cjs "$RELEASE_TAG"
+      - name: Record the exact tagged commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Check release accepts assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isImmutable > "$RUNNER_TEMP/release.json"
+          node -e 'const r=require(process.env.RUNNER_TEMP+"/release.json"); if(r.isImmutable) throw Error("Release 已锁定，不能追加产物。请先为草稿 Release 手动运行此工作流，构建完成后再发布。");'
+      - run: npm ci
+      - run: npm test
+      - name: UI regression
+        env:
+          TERMLUME_TEST_CHROME: /usr/bin/google-chrome
+        run: npm run test:ui
+      - name: Retain UI diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-ui-diagnostics
+          path: dist/ux-review/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: macos-arm64
+            target: aarch64-apple-darwin
+            bundles: app
+            rustflags: ''
+          - runner: windows-2025
+            platform: windows-x64
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            rustflags: '-C target-feature=+crt-static'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_TARGET: ${{ matrix.target }}
+      BUILD_BUNDLES: ${{ matrix.bundles }}
+      RELEASE_PLATFORM: ${{ matrix.platform }}
+      RELEASE_TAG: ${{ needs.check.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.check.outputs.sha }}
+      CARGO_BUILD_JOBS: '2'
+      MACOSX_DEPLOYMENT_TARGET: '10.15'
+      # Windows releases must not require a separately installed VC++ runtime.
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Set release version
+        run: node scripts/release-version.cjs "$RELEASE_TAG"
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$BUILD_TARGET"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: release-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}
+          restore-keys: release-rust-${{ runner.os }}-${{ runner.arch }}-
+      - name: Cache pinned offline dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            dist/macos-tools-cache
+            dist/windows-tools-cache
+            ~/AppData/Local/tauri
+          key: release-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*tools.lock.json', 'scripts/webview2.lock.json') }}
+      - name: Prepare assets and offline dependencies
+        run: node scripts/tauri-before-build.cjs
+      - name: Rust unit tests
+        run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml --target "$BUILD_TARGET" --lib
+      - name: Build application
+        run: |
+          node -e 'require("node:fs").rmSync("src-tauri/target/"+process.env.BUILD_TARGET+"/release/bundle",{recursive:true,force:true})'
+          npm run tauri:build -- --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" --ci -- --locked
+      - name: Sign macOS trial build
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - "src-tauri/target/$BUILD_TARGET/release/bundle/macos/Termlume.app"
+          codesign --verify --deep --strict "src-tauri/target/$BUILD_TARGET/release/bundle/macos/Termlume.app"
+      - name: Audit and package release assets
+        run: node scripts/package-release.cjs "$RELEASE_PLATFORM"
+      - name: Test bundled macOS Git without network
+        if: runner.os == 'macOS'
+        run: bash scripts/test-macos-offline.sh "src-tauri/target/$BUILD_TARGET/release/bundle/macos/Termlume.app"
+      - name: Retain verified packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  upload:
+    name: Attach packages to GitHub Release
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.check.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: release-*-*
+          merge-multiple: true
+          path: dist/release
+      - name: Verify both platforms and generate SHA256SUMS
+        run: node scripts/package-release.cjs verify "$RELEASE_TAG"
+      - name: Confirm tag has not moved
+        run: |
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+          test "$actual" = "$RELEASE_COMMIT"
+      - name: Upload assets
+        run: gh release upload "$RELEASE_TAG" dist/release/* --repo "$GITHUB_REPOSITORY" --clobber
