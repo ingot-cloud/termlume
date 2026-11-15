@@ -302,6 +302,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             blocking(move || keys::copy(&code)).await?;
         }
         "vault:enable" => return enable(ws, value).await,
+        "vault:change-password" => return change_password(ws, value).await,
         "vault:disable" => return disable(ws, value).await,
         "vault:set-touch-id" => return set_touch_id(ws, parse(value)?).await,
         "vault:set-startup-unlock" => return set_startup_unlock(ws, parse(value)?).await,
@@ -1100,6 +1101,35 @@ async fn enable(ws: &Workspace, value: Value) -> Result<Value, String> {
     store.install(key, &header, data)?;
     Ok(store.status())
 }
+async fn change_password(ws: &Workspace, value: Value) -> Result<Value, String> {
+    let _sync = ws.sync_gate.try_lock().map_err(|_| "请等待同步完成。")?;
+    let _unlock = ws.unlock_gate.try_lock().map_err(|_| "请等待解锁设置完成。")?;
+    let (envelope, epoch) = {
+        let store = ws.store.lock().unwrap();
+        let envelope = store.envelope.clone().ok_or("主密码保护尚未开启。")?;
+        store.data()?;
+        if store.data()?.git_migration.is_some() {
+            return Err("请先继续或放弃待完成的 Git 迁移。".into());
+        }
+        (envelope, store.epoch)
+    };
+    let secret = Zeroizing::new(string(&value["secret"])?.to_owned());
+    let password = Zeroizing::new(string(&value["password"])?.to_owned());
+    let recovery = flag(&value, "useRecovery");
+    let (key, header) = blocking(move || {
+        let (key, _) = envelope.unlock::<Data>(&secret, recovery, "local")?;
+        let header = vault::change_password(&key, &envelope.header, &password)?;
+        Ok((key, header))
+    }).await?;
+    let mut store = ws.store.lock().unwrap();
+    ensure_epoch(&store, epoch)?;
+    // Preserve edits made while Argon2 ran; install writes atomically before
+    // replacing the in-memory envelope, so a failed save leaves the old password.
+    let data = store.data()?.clone();
+    store.install(key, &header, data)?;
+    Ok(store.status())
+}
+
 async fn disable(ws: &Workspace, value: Value) -> Result<Value, String> {
     let _sync = ws.sync_gate.try_lock().map_err(|_| "请等待同步完成。")?;
     let _unlock = ws.unlock_gate.try_lock().map_err(|_| "请等待解锁设置完成。")?;

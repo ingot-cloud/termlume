@@ -24,7 +24,7 @@
         if (!(await appWindow.isFullscreen())) await appWindow.toggleMaximize();
       }
     },
-    vault: { ...bind({ state: 'vault:state', recoveryCode: 'vault:recovery-code', copyRecovery: 'vault:copy-recovery', enable: 'vault:enable', disable: 'vault:disable', setGitSettings: 'vault:set-git-settings', lock: 'vault:lock', unlock: 'vault:unlock', touchIdAvailable: 'vault:touch-id-available', setTouchId: 'vault:set-touch-id', setStartupUnlockRequired: 'vault:set-startup-unlock', setAutoLockMinutes: 'vault:set-auto-lock', export: 'vault:export', restoreFile: 'vault:restore-file', restoreGit: 'vault:restore-git', sync: 'vault:sync', migrateGit: 'vault:migrate-git' }), activity: notify('vault:activity') },
+    vault: { ...bind({ state: 'vault:state', recoveryCode: 'vault:recovery-code', copyRecovery: 'vault:copy-recovery', enable: 'vault:enable', changePassword: 'vault:change-password', disable: 'vault:disable', setGitSettings: 'vault:set-git-settings', lock: 'vault:lock', unlock: 'vault:unlock', touchIdAvailable: 'vault:touch-id-available', setTouchId: 'vault:set-touch-id', setStartupUnlockRequired: 'vault:set-startup-unlock', setAutoLockMinutes: 'vault:set-auto-lock', export: 'vault:export', restoreFile: 'vault:restore-file', restoreGit: 'vault:restore-git', sync: 'vault:sync', migrateGit: 'vault:migrate-git' }), activity: notify('vault:activity') },
     trust:bind({list:'trust:list',forget:'trust:forget',importPreview:'trust:import-preview',import:'trust:import'}),
     preferences:bind({get:'preferences:get',fonts:'preferences:fonts',save:'preferences:save'}),
     logs:bind({list:'logs:list',start:'logs:start',stop:'logs:stop',read:'logs:read',remove:'logs:delete',export:'logs:export'}),

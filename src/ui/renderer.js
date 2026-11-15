@@ -304,7 +304,10 @@ function promptSettings(page, title, fields, submit, onSubmit, extra, options) {
       actions.append(save);
       form.append(node('footer', 'settings-form-actions', actions));
     } else if (actions.childElementCount) {
-      actions.classList.add('settings-inline-actions');
+      // Pair list actions with their search field, including detail/back views.
+      const search = fields.find(field => field.matches?.('input[type="search"]'));
+      if (search) actions.prepend(search);
+      actions.classList.add('settings-list-toolbar');
       content.prepend(actions);
     }
     $('settings-page').setAttribute('aria-label', title);
@@ -496,6 +499,11 @@ function applyVaultState(state) {
     renderHosts();
     $('quick-connect-results').replaceChildren();
     $('unlock-error').textContent = state.startupUnlockError || '';
+    if (!wasLocked) {
+      $('unlock-mode').value = 'password';
+      $('unlock-mode').dispatchEvent(new Event('input'));
+      $('unlock-secret').value = '';
+    }
     $('unlock-secret').focus();
   } else {
     if (wasLocked) for (const tab of tabs.values()) if (tab.status === 'ready') syncTerminalSize(tab);
@@ -510,17 +518,19 @@ async function enableVault() {
   const repeated = input('', 'password');
   password.required = repeated.required = true;
   password.minLength = 8;
+  password.maxLength = repeated.maxLength = 1024;
   password.autocomplete = repeated.autocomplete = 'new-password';
+  let chosenPassword;
   try {
-    while (await prompt('设置主密码', [
+    while ((chosenPassword = await prompt('设置主密码', [
       node('p', 'step-label', '第 1 步，共 2 步'),
       node('p', 'muted', '主密码保护本机工作区、加密备份和 Git 同步快照。启用应用锁后，也可用它解锁 Termlume。请设置至少 8 个字符的独立密码。'),
       field('主密码', password), field('确认主密码', repeated)
     ], '继续', () => {
       if (password.value.length < 8) throw new Error('主密码至少需要 8 个字符。');
       if (password.value !== repeated.value) throw new Error('两次输入的主密码不同。');
-      return true;
-    })) {
+      return password.value;
+    }))) {
       const recovery = await api.vault.recoveryCode();
       const saved = input('', 'checkbox');
       saved.required = true;
@@ -533,13 +543,13 @@ async function enableVault() {
         node('div', 'recovery-box', node('code', '', recovery), node('div', 'settings-actions',
           button('复制恢复密钥', async () => { await api.vault.copyRecovery(recovery); copyStatus.textContent = '已复制'; }, 'outlined'), copyStatus)),
         node('label', 'checkbox-row', saved, '我已保存恢复密钥')
-      ], '开启主密码保护', () => api.vault.enable({ password: password.value, recovery }), [
+      ], '开启主密码保护', () => api.vault.enable({ password: chosenPassword, recovery }), [
         button('上一步', () => { back = true; dialog.close(); }, 'step-back')
       ], { focus: saved });
       if (state) { applyVaultState(state); status('主密码保护已开启。'); }
       if (!back) return;
     }
-  } finally { password.value = repeated.value = ''; }
+  } finally { chosenPassword = undefined; password.value = repeated.value = ''; }
 }
 
 function unlockMethod() {
@@ -548,6 +558,35 @@ function unlockMethod() {
     const option = node('option', '', text); option.value = value; select.append(option);
   }
   return select;
+}
+
+async function changeMasterPassword() {
+  const mode = unlockMethod();
+  const secret = input('', 'password');
+  secret.required = true; secret.autocomplete = 'current-password';
+  const password = input('', 'password');
+  const repeated = input('', 'password');
+  password.required = repeated.required = true;
+  password.minLength = 8; password.maxLength = repeated.maxLength = 1024;
+  password.autocomplete = repeated.autocomplete = 'new-password';
+  const credential = field('当前主密码', secret);
+  mode.addEventListener('change', () => {
+    credential.firstChild.textContent = mode.value === 'recovery' ? '恢复密钥' : '当前主密码';
+    secret.value = ''; secret.focus();
+  });
+  try {
+    const state = await prompt('修改主密码', [
+      node('p', 'muted', '先验证当前主密码或恢复密钥，再设置至少 8 个字符的新主密码。'),
+      field('验证方式', selectControl(mode, '验证方式')), credential,
+      field('新主密码', password), field('确认新主密码', repeated),
+      node('p', 'muted', '恢复密钥保持有效。新密码用于本机和之后导出的备份及同步快照；旧备份、旧快照及其他设备仍使用各自原来的主密码。')
+    ], '保存主密码', () => {
+      if (password.value.length < 8) throw new Error('主密码至少需要 8 个字符。');
+      if (password.value !== repeated.value) throw new Error('两次输入的主密码不同。');
+      return api.vault.changePassword({secret: secret.value, useRecovery: mode.value === 'recovery', password: password.value});
+    });
+    if (state) { applyVaultState(state); status('主密码已修改，恢复密钥仍有效。'); }
+  } finally { secret.value = password.value = repeated.value = ''; }
 }
 
 const defaultSyncBranch = 'termlume-vault';
@@ -1055,6 +1094,11 @@ function renderSecurityPage() {
       checked => checked ? enableVault() : disableVault()));
   }
   const body = node('div', 'page-body security-body', protection);
+  if (enabled && api.vault.changePassword) {
+    protection.append(node('div', 'security-setting security-action-row',
+      node('p', 'muted', '修改主密码，或使用恢复密钥重新设置。'),
+      button('修改主密码', changeMasterPassword, 'outlined')));
+  }
   if (!enabled) {
     const restore = node('section', 'security-card', node('h2', '', '恢复已有数据'),
       node('p', 'muted', '在空工作区使用原主密码或恢复密钥，从加密备份或 Git 仓库恢复。'),
@@ -1082,7 +1126,7 @@ function renderSecurityPage() {
         biometric.id = 'security-touch-id';
         appLock.append(biometric);
       }
-      appLock.append(node('div', 'settings-actions', button('立即锁定', async () => applyVaultState(await api.vault.lock()), 'outlined')));
+      appLock.append(node('div', 'security-action-row', node('p', 'muted', '暂时离开时，锁定当前工作区。'), button('立即锁定', async () => applyVaultState(await api.vault.lock()), 'outlined')));
     }
 
     const policy = { ...defaultGitSettings, ...vaultStatus.gitSettings };
@@ -1138,8 +1182,7 @@ function renderSecurityPage() {
     body.append(appLock, git);
     if (fileTransfers !== false) {
       body.append(node('section', 'security-card', node('h2', '', '加密备份'),
-        node('p', 'muted', '导出本地备份文件。恢复时需要原主密码或恢复密钥。'),
-        node('div', 'settings-actions', button('导出加密备份', async () => {
+        node('div', 'security-action-row', node('p', 'muted', '导出本地备份文件。恢复时需要原主密码或恢复密钥。'), button('导出加密备份', async () => {
           if (await api.vault.export()) status('加密备份已导出。');
         }, 'outlined'))));
     }
@@ -2120,18 +2163,30 @@ async function manageGroups(page) {
   const close = () => finishSettingsPrompt(page);
 
   if(!api.groups) return;
+  let query = '';
   while(page.active && !vaultStatus.locked) {
     groupAssets=await api.groups.list();let choice;
-    const tree = groupTree(window.hostTree.build(groupAssets, hosts), new Set(groupAssets.filter(g => !collapsedSettingsGroups.has(g.id)).map(g => g.id)), {
-      label: '分组管理',
-      detail: branch => `${branch.group.hosts?.length ?? branch.count} 台主机 · 端口 ${branch.group.port || '继承 / 22'} · ${branch.group.identityId ? '已设登录配置' : '继承上级登录配置'}`,
-      onToggle: (branch, expanded) => expanded ? collapsedSettingsGroups.delete(branch.group.id) : collapsedSettingsGroups.add(branch.group.id),
-      actions: g => node('div', 'group-tree-actions',
-        button('添加子组', () => { choice = { parent: g }; close(); }, 'outlined', `给 ${g.path} 添加子组`),
-        button('编辑', () => { choice = { group: g }; close(); }, 'outlined', `编辑分组 ${g.path}`),
-        button('删除', () => { choice = { remove: g }; close(); }, 'outlined danger', `删除分组 ${g.path}`))
-    });
-    await ask('分组管理',groupAssets.length?[tree]:[node('p','muted','可创建空分组、嵌套分组与默认 SSH 设置。')],'关闭',()=>true,[button('新建分组',()=>{choice={create:true};close();},'outlined')]);
+    const search = input(query, 'search');
+    search.placeholder = '搜索分组名称或路径';
+    search.setAttribute('aria-label', '搜索分组');
+    const list = node('div', 'settings-collection');
+    const render = () => {
+      query = search.value;
+      const source = window.hostTree.build(groupAssets, []);
+      const filtered = query.trim() ? window.hostTree.filter(source, () => false, group => matchesQuery(query, group.path)) : source;
+      const tree = groupTree(filtered, new Set(groupAssets.filter(g => query.trim() || !collapsedSettingsGroups.has(g.id)).map(g => g.id)), {
+        label: '分组管理',
+        detail: branch => `${branch.group.hosts?.length ?? branch.count} 台主机 · 端口 ${branch.group.port || '继承 / 22'} · ${branch.group.identityId ? '已设登录配置' : '继承上级登录配置'}`,
+        onToggle: (branch, expanded) => expanded ? collapsedSettingsGroups.delete(branch.group.id) : collapsedSettingsGroups.add(branch.group.id),
+        actions: g => node('div', 'group-tree-actions',
+          button('添加子组', () => { choice = { parent: g }; close(); }, 'outlined', `给 ${g.path} 添加子组`),
+          button('编辑', () => { choice = { group: g }; close(); }, 'outlined', `编辑分组 ${g.path}`),
+          button('删除', () => { choice = { remove: g }; close(); }, 'outlined danger', `删除分组 ${g.path}`))
+      });
+      list.replaceChildren(filtered.groups.length ? tree : node('p', 'muted', query.trim() ? '没有匹配的分组。' : '可创建空分组、嵌套分组与默认 SSH 设置。'));
+    };
+    search.addEventListener('input', render); render();
+    await ask('分组管理',[search,list],'关闭',()=>true,[button('新建分组',()=>{choice={create:true};close();},'primary')]);
     if(!choice) break;
     if(choice.remove) {if(await confirm('删除分组',`删除「${choice.remove.path}」？请先移走主机与子分组。`,'删除')) {const result=await api.groups.remove({group:choice.remove,expected:choice.remove});groupAssets=result.groups;hosts=result.hosts;}continue;}
     const g=choice.group;const name=input(g?.name);const parent=node('select');const port=input(g?.port||'','number');port.min=1;port.max=65535;
@@ -2291,17 +2346,27 @@ async function manageIdentities(page) {
   const ask = settingsAsk(page);
   const close = () => finishSettingsPrompt(page);
   if (!api.identities) return;
+  let query = '';
   while (page.active && !vaultStatus.locked) {
     const identities = await api.identities.list();
     let choice;
-    const rows = identities.map(identity => node('section', 'forward-rule',
+    const search = input(query, 'search');
+    search.placeholder = '搜索名称、用户名或认证方式';
+    search.setAttribute('aria-label', '搜索登录配置');
+    const list = node('div', 'forward-list');
+    const render = () => {
+      query = search.value;
+      const rows = identities.filter(identity => matchesQuery(query, identity.name, identity.username, identityAuthLabels[identity.auth], ...(identity.groups || [])))
+        .map(identity => node('section', 'forward-rule',
       node('strong', '', identity.name),
       node('p', 'muted', `${identity.username} · ${identityAuthLabels[identity.auth]} · ${identity.hosts.length} 台主机 · ${identity.groups?.length || 0} 个分组${identity.passwordSaved ? ' · 已保存密码' : ''}`),
       node('div', 'forward-actions',
         button('编辑', () => { choice = { identity }; close(); }, 'outlined'),
         button('删除', () => { choice = { remove: identity }; close(); }, 'outlined danger'))));
-    await ask('登录配置', [node('p', 'muted identity-intro', identityPurpose),
-      ...(rows.length ? rows : [node('p', 'muted', '还没有登录配置。')])], '关闭', () => true,
+      list.replaceChildren(...(rows.length ? rows : [node('p', 'muted', query.trim() ? '没有匹配的登录配置。' : '还没有登录配置。')]));
+    };
+    search.addEventListener('input', render); render();
+    await ask('登录配置', [search, node('p', 'muted identity-intro', identityPurpose), list], '关闭', () => true,
     [button('新建登录配置', () => { choice = {}; close(); }, 'primary')]);
     if (!choice) break;
     if (choice.remove) {

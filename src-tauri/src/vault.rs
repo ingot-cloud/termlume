@@ -202,6 +202,20 @@ pub fn create(password: &str, recovery: &str) -> Result<(Key, Header), String> {
     Ok((key, header))
 }
 
+// Rewrap the existing data key: recovery, biometrics and other devices keep
+// referring to the same vault. The payload must be re-encoded with this header.
+pub fn change_password(key: &Key, header: &Header, password: &str) -> Result<Header, String> {
+    if password.encode_utf16().count() < 8 {
+        return Err("主密码至少需要 8 个字符。".into());
+    }
+    let salt = rand::random::<[u8; 16]>();
+    let wrapping = password_key(password, &salt)?;
+    let mut next = header.clone();
+    next.salt = B64.encode(salt);
+    next.password = seal(&wrapping, &key[..], format!("termlume:v1:{}:password", header.id).as_bytes())?;
+    Ok(next)
+}
+
 impl Envelope {
     pub fn validate(&self, scope: &str) -> Result<(), String> {
         if self.format != FORMAT || self.version != 1 || self.scope != scope {

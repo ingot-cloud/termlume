@@ -3,6 +3,69 @@ use tauri::ipc::InvokeResponseBody;
 use tokio::sync::mpsc;
 
 #[tokio::test]
+async fn master_password_changes_preserve_data_recovery_and_automatic_unlock() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let password = "  主密码 test 🌸  ";
+    let next = " 新主密码 rose 🌷 ";
+    let recovery = vault::recovery_code();
+    let host = call(&ws, "hosts:save", json!({"address":"password-change.test","username":"ops","auth":"password","localPassword":"preserved secret"})).await[0].clone();
+    call(&ws, "vault:enable", json!({"password":password,"recovery":recovery})).await;
+    // Reproduce the complete set → immediate lock → password unlock path.
+    call(&ws, "vault:lock", Value::Null).await;
+    call(&ws, "vault:unlock", json!({"secret":password})).await;
+    call(&ws, "vault:set-startup-unlock", json!(false)).await;
+    let before = std::fs::read(profile.path().join("workspace.json")).unwrap();
+    assert!(dispatch(&ws, "vault:change-password", json!({"secret":"wrong","password":next})).await.is_err());
+    assert!(dispatch(&ws, "vault:change-password", json!({"secret":password,"password":"short"})).await.is_err());
+    assert_eq!(before, std::fs::read(profile.path().join("workspace.json")).unwrap());
+    let old = ws.store.lock().unwrap().envelope.clone().unwrap();
+    let old_key = ws.store.lock().unwrap().key.clone().unwrap();
+    call(&ws, "vault:change-password", json!({"secret":password,"password":next})).await;
+    {
+        let store = ws.store.lock().unwrap();
+        let envelope = store.envelope.as_ref().unwrap();
+        assert_eq!(envelope.header.id, old.header.id);
+        assert_eq!(store.key.as_ref().unwrap(), &old_key);
+        assert_eq!(store.status()["startupUnlockRequired"], false);
+        let bytes = serde_json::to_value(envelope).unwrap();
+        let prior = serde_json::to_value(&old).unwrap();
+        assert_eq!(bytes["header"]["recovery"], prior["header"]["recovery"]);
+        assert!(envelope.unlock::<Data>(password, false, "local").is_err());
+        assert!(envelope.unlock::<Data>(next, false, "local").is_ok());
+        assert!(envelope.unlock::<Data>(&recovery, true, "local").is_ok());
+    }
+    // Restart with automatic unlock; local credentials and host bindings survive.
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(call(&ws, "hosts:reveal-password", host["id"].clone()).await, "preserved secret");
+    call(&ws, "vault:lock", Value::Null).await;
+    assert!(dispatch(&ws, "vault:unlock", json!({"secret":password})).await.is_err());
+    call(&ws, "vault:unlock", json!({"secret":next})).await;
+    call(&ws, "vault:change-password", json!({"secret":recovery,"useRecovery":true,"password":password})).await;
+    call(&ws, "vault:lock", Value::Null).await;
+    call(&ws, "vault:unlock", json!({"secret":password})).await;
+    assert_eq!(call(&ws, "hosts:reveal-password", host["id"].clone()).await, "preserved secret");
+    // A previously exported backup still accepts its original password.
+    assert!(old.unlock::<Data>(password, false, "local").is_ok());
+}
+
+#[tokio::test]
+async fn failed_master_password_change_keeps_the_original_envelope() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    call(&ws, "vault:enable", json!({"password":"original password","recovery":vault::recovery_code()})).await;
+    let file = profile.path().join("workspace.json");
+    let saved = profile.path().join("saved-workspace");
+    std::fs::rename(&file, &saved).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    assert!(dispatch(&ws, "vault:change-password", json!({"secret":"original password","password":"replacement password"})).await.is_err());
+    assert!(ws.store.lock().unwrap().envelope.as_ref().unwrap().unlock::<Data>("original password", false, "local").is_ok());
+    std::fs::remove_dir(file).unwrap();
+    std::fs::rename(saved, profile.path().join("workspace.json")).unwrap();
+}
+
+#[tokio::test]
 async fn app_credentials_persist_without_a_master_password_and_stay_out_of_snapshots() {
     let home = tempfile::tempdir().unwrap();
     let (profile, ws) = make_workspace(home.path(), None);

@@ -510,6 +510,33 @@ async function main() {
     return;
   }
   if (!process.argv.includes('--shortcuts-only')) {
+  await run('Emulation.setDeviceMetricsOverride', {width:1140,height:740,deviceScaleFactor:1,mobile:false});
+  await run('Page.navigate', {url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+  await wait("typeof hosts!=='undefined' && hosts.length>0");
+  await js("window.setupPassword='  主密码 fixture 🌸  ';void enableVault()");
+  await wait("dialog.open && dialog.textContent.includes('确认主密码')");
+  await js("window.setupFields=[...dialog.querySelectorAll('input[type=password]')];setupFields.forEach(p=>p.value=setupPassword);dialog.querySelector('form').requestSubmit()");
+  await wait("dialog.open && dialog.textContent.includes('保存恢复密钥')");
+  // Removed password controls may be cleared by the webview or a password manager.
+  await js("setupFields.forEach(p=>p.value='');dialog.querySelector('input[type=checkbox]').checked=true;dialog.querySelector('form').requestSubmit()");
+  await wait("!dialog.open && vaultStatus.enabled");
+  assert.equal(await js("previewCalls.find(([type])=>type==='enable-vault')[1].password"),await js('setupPassword'),
+    'The recovery step must use the exact password confirmed in the first step');
+  await js("openSettings('security');[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='修改主密码').click()");
+  await wait("dialog.open && dialog.textContent.includes('确认新主密码')");
+  await js("(()=>{const fields=dialog.querySelectorAll('input[type=password]');fields[0].value=setupPassword;fields[1].value='new password 🌷';fields[2].value='mismatch';dialog.querySelector('form').requestSubmit()})()");
+  await wait("dialog.querySelector('.dialog-error').textContent.includes('两次输入')");
+  assert.equal(await js("previewCalls.filter(([type])=>type==='change-password').length"),0);
+  await js("(()=>{dialog.querySelector('select').value='recovery';dialog.querySelector('select').dispatchEvent(new Event('change'));const fields=dialog.querySelectorAll('input[type=password]');fields[0].value='fixture-recovery';fields[2].value=fields[1].value;dialog.querySelector('form').requestSubmit()})()");
+  await wait('!dialog.open');
+  assert.deepEqual(await js("previewCalls.find(([type])=>type==='change-password')[1]"),{secret:'fixture-recovery',useRecovery:true,password:'new password 🌷'});
+  await js("$('unlock-mode').value='recovery';applyVaultState({...previewProtected,locked:true});");
+  assert.equal(await js("$('unlock-mode').value"),'password','A new lock defaults to master-password authentication');
+  await js("window.unlockRequest=undefined;api.vault.unlock=async value=>{unlockRequest=value;return previewProtected};$('unlock-secret').value=setupPassword;$('unlock-form').requestSubmit()");
+  await wait('!vaultStatus.locked && !$("unlock-submit").disabled');
+  assert.deepEqual(await js('unlockRequest'),{secret:await js('setupPassword'),useRecovery:false});
+  assert.equal(await js("$('unlock-secret').value"),'');
+  console.log('PASS two-step master password retention, mismatch validation, recovery password changes and immediate unlock routing');
   await run('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'no-preference'}]});
   for (const [width, height] of [[1140, 740], [550, 490]]) {
     await run('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
@@ -592,6 +619,12 @@ async function main() {
       await settingsAlignment('security');
       await shot(`security-off-${theme}-${width}.png`);
       await js("applyVaultState(previewProtected)"); await tick(); await overflow();
+      assert(await js(`[...$('settings-page').querySelectorAll('.security-action-row')].every(row=>{const a=row.querySelector('p').getBoundingClientRect(),b=row.querySelector('button').getBoundingClientRect();return Math.abs((a.top+a.bottom-b.top-b.bottom)/2)<2 && a.right<=b.left})`),
+        'Security actions must pair their description on the left with a button on the right');
+      await js("[...$('settings-page').querySelectorAll('button')].find(b=>b.textContent==='修改主密码').click()");
+      await wait("dialog.open && dialog.textContent.includes('确认新主密码')");
+      await tick(); await overflow(); await shot(`master-password-${theme}-${width}.png`);
+      await js('dialog.close()'); await tick();
       await shot(`security-on-${theme}-${width}.png`);
       await js("api.vault.state().then(applyVaultState)");
       await js("previewUpdateState={...previewUpdateState,phase:'idle',canDownload:false,revision:previewUpdateState.revision+1};openSettings('updates')");
@@ -619,6 +652,15 @@ async function main() {
         await js(`openSettings('${section}')`);
         await wait("document.querySelector('#settings-page .settings-form')"); await tick(); await overflow();
         await settingsAlignment(section);
+        if (['groups','identities','trust'].includes(section)) {
+          assert(await js(`(()=>{const toolbar=$('settings-page').querySelector('.settings-list-toolbar');const search=toolbar?.querySelector('input[type=search]');const action=toolbar?.querySelector('button');if(!search||!action)return false;const a=search.getBoundingClientRect(),b=action.getBoundingClientRect();return Math.abs(a.y-b.y)<2 && a.right<=b.left})()`),
+            `${section} must align search on the left and its action on the right`);
+          await js("(()=>{const search=$('settings-page').querySelector('input[type=search]');search.value='no-matching-resource';search.dispatchEvent(new Event('input'))})()");
+          await tick(); await overflow();
+          if (['groups','identities'].includes(section)) assert(await js("$('settings-page').textContent.includes('没有匹配')"));
+          await js("(()=>{const search=$('settings-page').querySelector('input[type=search]');search.value='';search.dispatchEvent(new Event('input'))})()");
+          await shot(`${section}-toolbar-${theme}-${width}.png`);
+        }
         if (section === 'snippets') await shot(`command-library-${theme}-${width}.png`);
       }
       await js("openSettings('preferences')"); await wait("document.querySelector('#settings-page .settings-form')");
