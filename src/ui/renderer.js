@@ -2188,7 +2188,7 @@ async function manageGroups(page) {
     search.addEventListener('input', render); render();
     await ask('分组管理',[search,list],'关闭',()=>true,[button('新建分组',()=>{choice={create:true};close();},'primary')]);
     if(!choice) break;
-    if(choice.remove) {if(await confirm('删除分组',`删除「${choice.remove.path}」？请先移走主机与子分组。`,'删除')) {const result=await api.groups.remove({group:choice.remove,expected:choice.remove});groupAssets=result.groups;hosts=result.hosts;}continue;}
+    if (choice.remove) { await deleteHostGroup(choice.remove); continue; }
     const g=choice.group;const name=input(g?.name);const parent=node('select');const port=input(g?.port||'','number');port.min=1;port.max=65535;
     const identities=await api.identities.list();const identity=node('select');const theme=node('select');for(const[value,label]of [['','继承 / 终端偏好'],['dark','深色'],['light','浅色']]){const o=node('option','',label);o.value=value;theme.append(o);}theme.value=g?.terminalTheme||'';
     const excluded = g ? window.hostTree.descendants(groupAssets, g.id) : new Set();
@@ -2603,10 +2603,52 @@ async function editHost(host, draftTab, target) {
   } else if (host && choice === 'forget' && await confirm('忘记主机指纹', `仅在你已核对 ${endpoint(host)} 的密钥变更后继续。这也会清除该地址的本机密码记录。`, '忘记指纹')) {
     await api.hosts.forget(host.id);
     status('已清除该地址的信任记录。');
-  } else if (host && choice === 'delete' && await confirm('删除主机', `从列表删除「${host.name}」？`, '删除')) {
-    hosts = await api.hosts.remove(host.id);
-    renderHosts();
-  }
+  } else if (host && choice === 'delete') await deleteHost(host);
+}
+
+async function deleteHost(host) {
+  const sessions = [...tabs.values()].filter(tab => tab.host?.id === host.id);
+  const result = await prompt('删除主机', [
+    node('p', '', `删除「${host.name}」？${endpoint(host)}`),
+    node('p', 'muted', '这会移除主机配置及其单独保存的密码、私钥口令。私钥文件、共用登录配置和其他主机保留。'),
+    ...(sessions.length ? [node('p', 'muted', '已有会话保持打开，断线后不再自动重连。')] : [])
+  ], '删除主机', () => api.hosts.remove(host.id));
+  if (!result) return;
+  for (const tab of sessions) tab.reconnectCancelled = true;
+  hosts = result;
+  if (selectedHostId === host.id) selectedHostId = '';
+  await refreshHosts();
+  status(`已删除主机「${host.name}」。`);
+}
+
+async function deleteHostGroup(group) {
+  const path = typeof group === 'string' ? group : group.path;
+  const all = api.groups ? await api.groups.list() : [];
+  const current = all.find(g => typeof group === 'string' ? g.path === group : g.id === group.id);
+  if (api.groups && !current) throw new Error('分组已删除，请刷新。');
+  const ids = current ? window.hostTree.descendants(all, current.id) : new Set();
+  const expectedGroups = all.filter(g => ids.has(g.id));
+  const hostCount = current?.hosts?.length ?? hosts.filter(h => h.group === path).length;
+  const result = await prompt('删除分组', [
+    node('p', '', `删除分组「${current?.path || path}」${ids.size > 1 ? `及其 ${ids.size - 1} 个子分组` : ''}？`),
+    node('p', 'muted', `${hostCount} 台主机会移到未分组。主机及凭据保留，原来继承的连接设置会继续保留。`)
+  ], '删除分组', () => current
+    ? api.groups.remove({ group: current, expected: current, expectedGroups })
+    : api.hosts.removeGroup(path));
+  if (!result) return;
+  for (const id of ids) { expandedHostGroups.delete(id); collapsedSettingsGroups.delete(id); }
+  if (currentGroup === path || currentGroup.startsWith(`${path} / `)) currentGroup = '';
+  selectedGroup = '';
+  await refreshHosts();
+  status(`已删除分组「${current?.path || path}」，${hostCount} 台主机已移到未分组。`);
+}
+
+function groupActions(group) {
+  const more = button('⋯', () => showActionMenu(`${group.path} 的操作`, more,
+    [button('删除分组', () => deleteHostGroup(group), 'danger')]), 'host-edit', `分组操作 ${group.path}`);
+  more.setAttribute('aria-haspopup', 'menu');
+  more.setAttribute('aria-expanded', 'false');
+  return more;
 }
 
 function openGroup(group) {
@@ -2713,6 +2755,7 @@ function renderHostTree(matching, query, tag, draft) {
   treeSearchKey = searching ? key : '';
   const view = groupTree(tree, searching ? expandedSearchGroups : expandedHostGroups, {
     label: '主机树', hostRow: hostCard,
+    ...(api.groups ? { actions: groupActions } : {}),
     onToggle: (_branch, _open, content) => {
       if (!searching) try { localStorage.setItem('host-tree-expanded', JSON.stringify([...expandedHostGroups])); } catch { /* Keep in memory. */ }
       if (content.hidden && [...content.querySelectorAll('.host-open')].some(item => item.dataset.hostId === selectedHostId)) {
@@ -2747,7 +2790,8 @@ function groupCard(group, count) {
     }
   });
   card.addEventListener('dblclick', () => openGroup(group));
-  return node('div', 'host-row group-row', card);
+  const asset = groupAssets.find(g => g.path === group);
+  return node('div', 'host-row group-row', card, ...(api.groups && asset ? [groupActions(asset)] : []));
 }
 
 function hostCard(host) {
@@ -2809,9 +2853,11 @@ function openHostMenu(host, anchor, x, y) {
     ['在新标签连接', () => openHost(host, { force: true })],
     ['编辑主机', () => editHost(host)],
     ...(api.identities ? [['管理登录配置',()=>manageIdentities()],...(!host.identityId?[['保存为登录配置',()=>editIdentity(undefined,host)]]:[])] : []),
-    ...(api.forwards ? [['端口转发', () => manageForwards(host)]] : [])
+    ...(api.forwards ? [['端口转发', () => manageForwards(host)]] : []),
+    ...(api.hosts.csvExport ? [['导出主机 CSV', () => exportHosts({ hostId: host.id })]] : []),
+    ['删除主机', () => deleteHost(host), 'danger']
   ];
-  showActionMenu(`${host.name} 的操作`, anchor, actions.map(([label, run]) => button(label, run)), x, y);
+  showActionMenu(`${host.name} 的操作`, anchor, actions.map(([label, run, style]) => button(label, run, style)), x, y);
 }
 
 function menuButton(label, actions) {
@@ -2940,27 +2986,94 @@ function renderHosts() {
   $('host-list').replaceChildren(...sections);
 }
 
+async function exportHosts(initial = {}) {
+  const scope = node('select');
+  scope.append(new Option('全部主机与分组', 'all'));
+  for (const group of groupAssets) scope.append(new Option(`分组 · ${group.path}`, `group:${group.id}`));
+  for (const host of hosts) scope.append(new Option(`主机 · ${host.name} · ${endpoint(host)}`, `host:${host.id}`));
+  const groupId = initial.groupId || groupAssets.find(g => g.path === (selectedGroup || currentGroup))?.id;
+  const hostId = initial.hostId || (!groupId ? selectedHostId : '');
+  scope.value = hostId ? `host:${hostId}` : groupId ? `group:${groupId}` : 'all';
+  const result = await prompt('导出主机与分组 CSV', [
+    field('导出范围', selectControl(scope, '导出范围', { searchable: true, placeholder: '搜索主机或分组' })),
+    node('p', 'muted', '导出主机名称、地址、端口、SSH 用户名、认证方式、标签、备注和连接设置。分组会保留层级、空分组、默认端口及配色；按组导出包含子组和组内主机。'),
+    node('p', 'muted', '不包含密码、私钥、私钥路径、私钥口令或登录配置关联。导入后需在本机重新配置凭据。启动命令、端口转发和信任记录也不包含在内。'),
+    node('p', 'muted', '所需的上级分组和跳板机会一并导出。CSV 为明文，请妥善保管其中的主机信息。')
+  ], '选择保存位置', () => {
+    const [kind, id] = scope.value.split(':');
+    return api.hosts.csvExport(kind === 'host' ? { hostId: id } : kind === 'group' ? { groupId: id } : {});
+  });
+  if (result) status(`已导出 ${result.count} 台主机、${result.groupCount} 个分组，未包含密码或密钥。`);
+}
+
 async function importHosts(csv=false) {
   const preview = await (csv ? api.hosts.csvPreview() : api.hosts.importPreview());
   if (!preview) return;
   const duplicates = input('', 'checkbox');
-  const rows = preview.rows.map((row) => {
+  const groups = (preview.groups || []).map(group => {
+    const selected = input('', 'checkbox');
+    selected.checked = true;
+    return { group, selected, view: node('label', 'checkbox-row', selected, group.path || group.name) };
+  });
+  const rows = preview.rows.map(source => {
+    const row = { ...source, id: source.id || sessionId() };
     const selected = input('', 'checkbox');
     selected.checked = !row.issue;
     selected.disabled = Boolean(row.issue) && !row.editable;
     const username = input(row.username);
     username.placeholder = 'SSH 用户名';
-    const label = node('label', 'checkbox-row', selected, `${row.name} · ${row.address}:${row.port} · ${row.username || '待填写用户'}${row.issue ? ` · ${row.issue}` : ''}`);
-    const authentication = node('small', '', row.auth === 'key' ? `本机私钥 · ${row.keyPath}` : 'SSH Agent');
-    return { row, selected, username, view: node('div', 'import-row', label, authentication, ...(row.editable ? [field('SSH 用户名', username)] : [])) };
+    username.addEventListener('input', () => { if (row.editable) selected.checked = Boolean(username.value.trim()); });
+    const label = node('label', 'checkbox-row', selected, `${row.name || row.address} · ${row.address}:${row.port} · ${row.username || '待填写用户'}${row.issue ? ` · ${row.issue}` : ''}`);
+    const authentication = node('small', 'muted', row.auth === 'key'
+      ? row.keyPath ? `本机私钥 · ${row.keyPath}` : '私钥认证 · 导入后选择本机私钥'
+      : row.auth === 'password' ? '密码认证 · 导入后单独配置密码' : 'SSH Agent · 使用本机已加载的密钥');
+    return { row, selected, username, view: node('div', 'import-row', label,
+      ...(row.group ? [node('small', 'muted', `分组 · ${row.group}`)] : []), authentication,
+      ...(row.editable ? [field('SSH 用户名', username)] : [])) };
   });
-  const result = await prompt(csv?'预览 CSV 导入':'预览 OpenSSH 导入', [...preview.warnings.map((warning) => node('p', 'muted', warning)),
-    node('div', 'key-list', ...rows.map((row) => row.view)), node('label', 'checkbox-row', duplicates, '保留重复配置')], '导入所选主机', () => {
-    const selected = rows.filter((row) => row.selected.checked).map(({ row, username }) => ({ ...row, username: username.value }));
-    if (!selected.length) throw new Error('请选择至少一条可导入的主机。');
-    return api.hosts.import({ rows: selected, keepDuplicates: duplicates.checked });
+  const list = node('div', 'key-list',
+    ...(groups.length ? [node('h3', '', `分组（${groups.length}）`), ...groups.map(g => g.view)] : []),
+    ...(rows.length ? [node('h3', '', `主机（${rows.length}）`), ...rows.map(r => r.view)] : []));
+  const result = await prompt(csv ? '预览 CSV 导入' : '预览 OpenSSH 导入', [
+    ...preview.warnings.map(warning => node('p', 'muted', warning)),
+    ...(csv ? [node('p', 'muted', '所选主机需要的分组、上级分组和跳板机会一并导入。同路径分组复用现有分组；相同地址、端口和用户名的主机默认跳过，不覆盖原配置。')] : []),
+    node('div', 'forward-actions', button('全选', () => {
+      for (const item of [...groups, ...rows]) if (!item.selected.disabled) item.selected.checked = true;
+    }, 'outlined'), button('全不选', () => {
+      for (const item of [...groups, ...rows]) item.selected.checked = false;
+    }, 'outlined')),
+    list, node('label', 'checkbox-row', duplicates, '保留重复主机配置')
+  ], csv ? '导入所选主机与分组' : '导入所选主机', () => {
+    const selectedRows = new Map(rows.filter(r => r.selected.checked).map(r => [r.row.id, r]));
+    const selectedGroups = new Map(groups.filter(g => g.selected.checked).map(g => [g.group.id, g.group]));
+    const addGroup = id => {
+      if (!id) return;
+      const group = groups.find(g => g.group.id === id)?.group;
+      if (!group) throw new Error('CSV 中缺少所需分组。');
+      selectedGroups.set(id, group);
+      if (group.parentId) addGroup(group.parentId);
+    };
+    const addHost = item => {
+      if (item.selected.disabled) throw new Error('所需跳板机配置无效，请先修正 CSV。');
+      if (item.row.jumpHostId && !selectedRows.has(item.row.jumpHostId)) {
+        const jump = rows.find(r => r.row.id === item.row.jumpHostId);
+        if (!jump) throw new Error('CSV 中缺少所需跳板机。');
+        selectedRows.set(jump.row.id, jump);
+        addHost(jump);
+      }
+      addGroup(item.row.groupId);
+    };
+    for (const item of selectedRows.values()) addHost(item);
+    for (const group of selectedGroups.values()) addGroup(group.id);
+    const selected = [...selectedRows.values()].map(({ row, username }) => ({ ...row, username: username.value }));
+    if (!selected.length && !selectedGroups.size) throw new Error('请选择至少一台主机或一个分组。');
+    return api.hosts.import({ rows: selected, groups: [...selectedGroups.values()], keepDuplicates: duplicates.checked });
   });
-  if (result) { hosts = result.hosts; await refreshHosts(); status(`已导入 ${result.count} 台主机。`); }
+  if (result) {
+    hosts = result.hosts;
+    await refreshHosts();
+    status(`已导入 ${result.count} 台主机、${result.groupCount || 0} 个新分组。${csv ? '密码和私钥请在本机单独配置。' : ''}`);
+  }
 }
 
 function attachTerminal(tab) {
@@ -5164,9 +5277,7 @@ $('remove-group').addEventListener('click', async () => {
   const group = currentGroup;
   if (!group) return;
   try {
-    if (!await confirm('移除分组', `「${group}」内的主机会归入未分组。`, '移除分组')) return;
-    hosts = await api.hosts.removeGroup(group);
-    await refreshHosts();
+    await deleteHostGroup(group);
   } catch (error) { status(message(error)); }
 });
 for (const control of pageButtons) {
@@ -5415,4 +5526,5 @@ if (api.updates) {
   }, 8000);
 }
 if(api.preferences) matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{if(uiPreferences.theme==='system')applyPreferences();});
-if(api.hosts.csvPreview) $('import-hosts').after(button('导入 CSV',()=>importHosts(true),'outlined'));
+if (api.hosts.csvPreview) $('import-hosts').after(button('导入 CSV', () => importHosts(true), 'toolbar-button'));
+if (api.hosts.csvExport) $('import-hosts').parentElement.append(button('导出 CSV', () => exportHosts(), 'toolbar-button'));

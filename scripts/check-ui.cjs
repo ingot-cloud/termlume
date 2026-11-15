@@ -97,6 +97,78 @@ async function main() {
     const { data } = await run('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync(path.join(root, 'dist/ux-review', name), Buffer.from(data, 'base64'));
   };
+  const deletionChecks = async width => {
+    await js(`(async()=>{window.deleteOriginalHosts=structuredClone(previewHosts);window.deleteOriginalGroups=structuredClone(previewGroups);
+      previewGroups.push({id:'delete-parent',name:'删除验收'},{id:'delete-child',name:'子组',parentId:'delete-parent'});
+      previewHosts.push({id:'delete-host',name:'待删除主机',address:'delete.test',port:22,username:'ops',auth:'agent',groupId:'delete-parent',group:'删除验收'},
+        {id:'keep-host',name:'保留主机',address:'keep.test',port:22,username:'ops',auth:'agent',groupId:'delete-child',group:'删除验收 / 子组'});
+      selectTab(undefined,'hosts');await refreshHosts();$('host-layout').value='tree';$('host-layout').dispatchEvent(new Event('change'));
+      document.querySelector('[data-tree-group="delete-parent"] .tree-group-toggle').click();
+      document.querySelector('[data-host-id="delete-host"]').parentElement.querySelector('.host-edit:last-child').click()})()`);
+    assert(await js("[...hostMenu.panel.querySelectorAll('button')].some(b=>b.textContent==='删除主机' && b.classList.contains('danger'))"));
+    const before = await js("previewCalls.filter(([type])=>type==='remove-host').length");
+    await js("[...hostMenu.panel.querySelectorAll('button')].find(b=>b.textContent==='删除主机').click()");
+    await wait("dialog.open && dialog.textContent.includes('delete.test')");
+    assert.equal(await js("previewCalls.filter(([type])=>type==='remove-host').length"),before,'Opening confirmation must not delete');
+    await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='取消').click()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert(await js("previewHosts.some(h=>h.id==='delete-host')"),'Cancelling host deletion must preserve it');
+    await js("void deleteHost(hosts.find(h=>h.id==='delete-host'))");await wait('dialog.open');
+    await overflow();await shot(`host-delete-confirm-${width}.png`);
+    await js("dialog.querySelector('form').requestSubmit()");await wait('!dialog.open && !dialog.childElementCount');
+    await wait("!hosts.some(h=>h.id==='delete-host')");
+    assert.equal(await js("previewCalls.filter(([type])=>type==='remove-host').length"),before+1);
+    await js(`document.querySelector('[aria-label="分组操作 删除验收"]').click();hostMenu.panel.querySelector('button').click()`);
+    await wait("dialog.open && dialog.textContent.includes('1 个子分组')");
+    assert(await js("dialog.textContent.includes('1 台主机会移到未分组')"));
+    await overflow();await shot(`group-delete-confirm-${width}.png`);
+    await js("dialog.querySelector('form').requestSubmit()");await wait('!dialog.open && !dialog.childElementCount');
+    await wait("!groupAssets.some(g=>g.id==='delete-parent')");
+    assert(await js("previewHosts.find(h=>h.id==='keep-host').group==='' && !previewHosts.find(h=>h.id==='keep-host').groupId && !previewGroups.some(g=>g.id==='delete-child') && $('host-list').querySelector('[data-host-id=keep-host]')"),'Deleting a group must preserve child-group hosts at the ungrouped root');
+    assert.deepEqual(await js("previewCalls.filter(([type])=>type==='remove-group').at(-1)[1].expectedGroups.map(g=>g.id)"),['delete-parent','delete-child']);
+    await js(`previewGroups.push({id:'delete-settings',name:'设置删除验收'});openSettings('groups')`);
+    await wait(`$('settings-page').querySelector('[aria-label="删除分组 设置删除验收"]')`);
+    await js(`$('settings-page').querySelector('[aria-label="删除分组 设置删除验收"]').click()`);
+    await wait("dialog.open && dialog.textContent.includes('设置删除验收')");
+    await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='取消').click()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert(await js("previewGroups.some(g=>g.id==='delete-settings')"),'Cancelling group deletion must preserve the group');
+    await js(`(async()=>{previewHosts.splice(0,previewHosts.length,...deleteOriginalHosts);previewGroups.splice(0,previewGroups.length,...deleteOriginalGroups);
+      selectTab(undefined,'hosts');await refreshHosts();$('host-layout').value='cards';$('host-layout').dispatchEvent(new Event('change'))})()`);
+    console.log(`${width}px: PASS host deletion menu and confirmation/cancel, group subtree deletion with hosts retained, settings confirmation and stale-preview payload`);
+  };
+  const csvChecks = async width => {
+    await js("selectTab(undefined,'hosts');selectedHostId='';selectedGroup='';currentGroup='';void exportHosts()");
+    await wait("dialog.open && dialog.textContent.includes('导出范围')");
+    assert(await js("dialog.textContent.includes('不包含密码、私钥、私钥路径、私钥口令')"));
+    assert(await js("['all','group:prod','group:stage','host:api','host:jump'].every(value=>[...dialog.querySelector('select').options].some(o=>o.value===value))"));
+    await js("dialog.querySelector('select').value='group:prod';dialog.querySelector('form').requestSubmit()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert.deepEqual(await js("previewCalls.filter(([type])=>type==='csv-export').at(-1)[1]"),{groupId:'prod'});
+    await js(`api.hosts.csvPreview=async()=>({warnings:['密码和私钥需单独配置。'],groups:[
+      {id:'csv-parent',name:'父组',path:'父组'}, {id:'csv-child',name:'空组',path:'父组 / 空组',parentId:'csv-parent'}],rows:[
+      {id:'csv-host',name:'密码主机',address:'host.test',port:22,username:'ops',auth:'password',groupId:'csv-child',group:'父组 / 空组',jumpHostId:'csv-jump'},
+      {id:'csv-jump',name:'跳板机',address:'jump.test',port:2222,username:'jump',auth:'key'}]});void importHosts(true)`);
+    await wait("dialog.open && dialog.textContent.includes('预览 CSV 导入')");
+    assert(await js("dialog.textContent.includes('密码认证 · 导入后单独配置密码') && dialog.textContent.includes('私钥认证 · 导入后选择本机私钥')"));
+    await overflow();await shot(`csv-import-${width}.png`);
+    await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='全不选').click();dialog.querySelector('form').requestSubmit()");
+    await wait("dialog.querySelector('[role=alert]').textContent.includes('请选择至少')");
+    await js("dialog.querySelectorAll('.import-row input[type=checkbox]')[0].checked=true;dialog.querySelector('form').requestSubmit()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert.deepEqual(await js("previewCalls.filter(([type])=>type==='csv-import').at(-1)[1].rows.map(r=>r.id)"),['csv-host','csv-jump']);
+    assert.deepEqual(await js("previewCalls.filter(([type])=>type==='csv-import').at(-1)[1].groups.map(g=>g.id).sort()"),['csv-child','csv-parent']);
+    await js("void importHosts(true)");await wait('dialog.open');
+    await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='全不选').click();dialog.querySelector('.key-list > label input').checked=true;dialog.querySelector('form').requestSubmit()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert.equal(await js("previewCalls.filter(([type])=>type==='csv-import').at(-1)[1].rows.length"),0);
+    await js("api.hosts.csvPreview=async()=>null");
+    await js("api.hosts.importPreview=async()=>({warnings:[],rows:[{name:'one',address:'one.test',port:22,username:'ops',auth:'agent'},{name:'two',address:'two.test',port:22,username:'ops',auth:'agent'}]});void importHosts()");
+    await wait('dialog.open');
+    await js("dialog.querySelector('form').requestSubmit()");await wait('!dialog.open && !dialog.childElementCount');
+    assert.equal(await js("previewCalls.filter(([type])=>type==='csv-import').at(-1)[1].rows.length"),2);
+    console.log(`${width}px: PASS CSV export scope, credential hints, dependent groups/jump hosts, empty selection and group-only imports`);
+  };
   const hostTreeChecks = async width => {
     await js(`(async()=>{window.treeOriginalHosts=structuredClone(previewHosts);window.treeOriginalGroups=structuredClone(previewGroups);
       previewGroups.push({id:'child',name:'应用',parentId:'prod'},{id:'leaf',name:'数据库节点',parentId:'child'});
@@ -500,6 +572,15 @@ async function main() {
     assert(await js(`document.querySelector(${JSON.stringify(pane)}).contains(document.activeElement)`),
       'Keyboard focus must stay inside the active overlay');
   };
+  if (process.argv.includes('--deletion-only')) {
+    for (const [width, height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await deletionChecks(width);
+    }
+    return;
+  }
   if (process.argv.includes('--tree-only')) {
     for (const [width, height] of [[1140,740],[550,490]]) {
       await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
@@ -547,6 +628,8 @@ async function main() {
     console.log(`${width}×${height}: ${report.split('（')[0]}`);
     await js("document.getElementById('smoke-results').hidden=true");
     await hostTreeChecks(width);
+    await csvChecks(width);
+    await deletionChecks(width);
     for (const theme of ['dark', 'light']) {
       await js(`uiPreferences.theme='${theme}';applyPreferences();selectTab(undefined,'hosts')`); await tick();
       const contrast = await js(`(() => {
@@ -568,7 +651,7 @@ async function main() {
       assert(contrast.every(pair=>Number.isFinite(pair.ratio)&&pair.ratio>=4.5),
         `${theme} theme text, states and button colors must retain 4.5:1 contrast: ${JSON.stringify(contrast.filter(pair=>!Number.isFinite(pair.ratio)||pair.ratio<4.5))}`);
       await overflow();
-      for (const selector of ['.host-quick-edit','.host-edit:last-child']) {
+      for (const selector of ['.host-quick-edit','.host-open ~ .host-edit:last-child']) {
         await run('Input.dispatchMouseEvent', {type:'mouseMoved',x:0,y:0});
         await js('document.activeElement.blur()');
         await new Promise(resolve=>setTimeout(resolve,140));
@@ -580,7 +663,7 @@ async function main() {
         assert.notDeepEqual(after,before, `${selector} must highlight on hover`);
         await shot(`host-${selector.includes('quick')?'edit':'more'}-hover-${theme}-${width}.png`);
       }
-      await js("document.querySelector('.host-edit:last-child').click()"); await tick(); await overflow();
+      await js("document.querySelector('.host-open ~ .host-edit:last-child').click()"); await tick(); await overflow();
       await shot(`hosts-menu-${theme}-${width}.png`);
       await js("closeHostMenu();document.querySelector('.host-quick-edit').click()");
       await wait("document.querySelector('dialog[open] .host-form-section')");

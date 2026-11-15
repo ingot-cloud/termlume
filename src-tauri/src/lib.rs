@@ -408,6 +408,20 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
                 imports::csv_preview(&text)
             };
         }
+        #[cfg(desktop)]
+        "hosts:csv-export" => {
+            let export = imports::csv_export(ws.store.lock().unwrap().data()?, &value)?;
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .set_title("导出主机与分组 CSV")
+                .add_filter("CSV", &["csv"])
+                .set_file_name("termlume-hosts.csv")
+                .save_file()
+                .await
+            else { return Ok(Value::Null); };
+            ws.store.lock().unwrap().data()?;
+            tokio::fs::write(file.path(), export.text).await.map_err(error)?;
+            return Ok(json!({"count":export.hosts,"groupCount":export.groups}));
+        }
         "preferences:get" => return assets::preferences_request(ws, Value::Null),
         "preferences:fonts" => return blocking(|| Ok(json!(terminal_fonts::families()))).await,
         "preferences:save" => return assets::preferences_request(ws, value),
@@ -784,6 +798,7 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
         }
         "hosts:delete" => {
             let id = id(&value)?;
+            data.host(id)?;
             if data.hosts.iter().any(|h| h.jump_host_id == Some(id)) {
                 return Err("该主机仍被用作跳板机，请先修改相关主机的连接路径。".into());
             }
@@ -792,7 +807,7 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
             data.key_passphrases.remove(&id);
             data.portable_passwords.remove(&id);
             data.recent.remove(&id);
-            json!(data.hosts)
+            json!(data.connection_hosts())
         }
         "hosts:forget" => {
             let host = data.connection_host(id(&value)?)?;
@@ -818,55 +833,16 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
         }
         "hosts:remove-group" => {
             let name = checked(string(&value)?, "分组", 1000)?;
+            assets::migrate_groups(&mut data);
             let group = data
                 .groups
                 .iter()
                 .find(|g| assets::group_path(&data, g.id).ok().as_deref() == Some(&name))
-                .map(|g| g.id);
-            if group.is_some_and(|id| data.groups.iter().any(|g| g.parent_id == Some(id))) {
-                return Err("请先移动子分组，再移除此分组。".into());
-            }
-            let resolved = data.connection_hosts();
-            for host in &mut data.hosts {
-                if let Some(effective) =
-                    resolved.iter().find(|h| h.id == host.id && h.group == name)
-                {
-                    host.group.clear();
-                    host.group_id = None;
-                    host.port = effective.port;
-                    host.identity_id = effective.identity_id;
-                    host.username = effective.username.clone();
-                    host.auth = effective.auth.clone();
-                    host.key_path = effective.key_path.clone();
-                    host.inherit_identity = false;
-                    host.inherit_port = false;
-                    host.terminal_theme = effective.terminal_theme.clone();
-                    host.inherit_theme = false;
-                }
-            }
-            data.groups.retain(|g| Some(g.id) != group);
+                .map(|g| g.id).ok_or("分组已删除，请刷新。")?;
+            assets::remove_group(&mut data, group)?;
             json!(data.connection_hosts())
         }
-        "hosts:import" => {
-            let mut rows: Vec<Host> = parse(value["rows"].clone())?;
-            if rows.len() > 1000 {
-                return Err("导入数量过多。".into());
-            }
-            let previous = data.hosts.len();
-            for mut host in rows.drain(..) {
-                host.id = Uuid::new_v4();
-                let host = host.normalized(false)?;
-                if flag(&value, "keepDuplicates")
-                    || !data
-                        .hosts
-                        .iter()
-                        .any(|h| h.same_endpoint(&host) && h.username == host.username)
-                {
-                    data.hosts.push(host);
-                }
-            }
-            json!({"hosts":data.hosts,"count":data.hosts.len()-previous})
-        }
+        "hosts:import" => imports::import_records(&mut data, &value)?,
         _ => return Err("工作台请求未定义。".into()),
     };
     store.update(data)?;

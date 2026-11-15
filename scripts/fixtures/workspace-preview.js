@@ -128,6 +128,14 @@ window.termlume = {
       return { state: { ...vaultStatus, lastFetched: 1794272500000 } };
     }},
   hosts:{list:async()=>previewHosts,recent:async()=>({api:3,stage:2,jump:1}),touch:async()=>{},hasPassword:async()=>false,hasKeyPassphrase:async id=>previewKeySecrets.has(id),revealPassword:async()=>'',pickKey:async()=>'/preview/key',csvPreview:async()=>null,
+    csvExport:async value=>{previewCalls.push(['csv-export',value]);return {count:1,groupCount:1};},
+    import:async value=>{previewCalls.push(['csv-import',value]);return {hosts:previewHosts,count:value.rows.length,groupCount:value.groups?.length||0};},
+    remove:async id=>{
+      if(previewHosts.some(host=>host.jumpHostId===id))throw new Error('该主机仍被用作跳板机，请先修改相关主机的连接路径。');
+      previewCalls.push(['remove-host',id]);
+      previewHosts.splice(previewHosts.findIndex(host=>host.id===id),1);
+      return previewHosts;
+    },
     save:async value=>{previewCalls.push(['save-host',value]);const {localKeyPassphrase,clearKeyPassphrase,...fields}=value;const host={...fields,id:value.id||'new-host'};if(localKeyPassphrase)previewKeySecrets.set(host.id,localKeyPassphrase);const i=previewHosts.findIndex(h=>h.id===host.id);if(i>=0)previewHosts.splice(i,1);previewHosts.push(host);return previewHosts;}},
   groups:{list:async()=>structuredClone(previewGroupList()),save:async request=>{
     previewCalls.push(['save-group',request]);
@@ -141,9 +149,14 @@ window.termlume = {
       if(id) {host.groupId=id;host.group=paths.get(id);}
     }
     return {groups:structuredClone(previewGroupList()),hosts:previewHosts};
-  },remove:async ({group})=>{
-    if(previewGroups.some(g=>g.parentId===group.id)||previewGroupList().find(g=>g.id===group.id)?.hosts.length)throw new Error('请先移走主机与子分组。');
-    previewGroups.splice(previewGroups.findIndex(g=>g.id===group.id),1);
+  },remove:async request=>{
+    previewCalls.push(['remove-group',request]);
+    const ids=window.hostTree.descendants(previewGroups,request.group.id);
+    const paths=previewGroupList().filter(g=>ids.has(g.id)).map(g=>g.path);
+    for(const host of previewHosts)if(ids.has(host.groupId)||paths.includes(host.group)) {
+      host.group='';delete host.groupId;host.inheritPort=host.inheritIdentity=host.inheritTheme=false;
+    }
+    for(let i=previewGroups.length-1;i>=0;i--)if(ids.has(previewGroups[i].id))previewGroups.splice(i,1);
     return {groups:structuredClone(previewGroupList()),hosts:previewHosts};
   }},
   identities:{list:async()=>previewIdentities,save:async request=>{

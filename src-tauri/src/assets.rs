@@ -257,7 +257,7 @@ pub struct Group {
     pub identity_id: Option<Uuid>,
 }
 impl Group {
-    fn normalized(mut self) -> Result<Self, String> {
+    pub(crate) fn normalized(mut self) -> Result<Self, String> {
         self.name = checked(&self.name, "分组名称", 120)?;
         if self
             .terminal_theme
@@ -373,6 +373,53 @@ pub fn validate_groups(data: &Data) -> Result<(), String> {
     }
     Ok(())
 }
+
+pub fn group_descendants(data: &Data, id: Uuid) -> Result<std::collections::HashSet<Uuid>, String> {
+    validate_groups(data)?;
+    if !data.groups.iter().any(|g| g.id == id) {
+        return Err("分组已删除，请刷新。".into());
+    }
+    let mut ids = std::collections::HashSet::from([id]);
+    loop {
+        let before = ids.len();
+        for group in &data.groups {
+            if group.parent_id.is_some_and(|parent| ids.contains(&parent)) {
+                ids.insert(group.id);
+            }
+        }
+        if ids.len() == before {
+            return Ok(ids);
+        }
+    }
+}
+
+/// Remove only group containers; flatten their hosts while keeping effective connections.
+pub fn remove_group(data: &mut Data, id: Uuid) -> Result<(), String> {
+    let ids = group_descendants(data, id)?;
+    let resolved: Vec<_> = data
+        .hosts
+        .iter()
+        .filter(|host| host.group_id.is_some_and(|id| ids.contains(&id)))
+        .map(|host| {
+            data.connection_host(host.id)
+                .unwrap_or_else(|_| host.clone())
+        })
+        .collect();
+    for mut effective in resolved {
+        effective.group.clear();
+        effective.group_id = None;
+        effective.inherit_port = false;
+        effective.inherit_identity = false;
+        effective.inherit_theme = false;
+        effective.identity_version = None;
+        if let Some(host) = data.hosts.iter_mut().find(|host| host.id == effective.id) {
+            *host = effective;
+        }
+    }
+    data.groups.retain(|group| !ids.contains(&group.id));
+    Ok(())
+}
+
 pub fn group_request(ws: &Workspace, action: &str, value: Value) -> Result<Value, String> {
     let mut store = ws.store.lock().unwrap();
     let mut data = store.data()?.clone();
@@ -400,12 +447,14 @@ pub fn group_request(ws: &Workspace, action: &str, value: Value) -> Result<Value
         group.id = Uuid::new_v4();
     }
     if action == "groups:delete" {
-        if data.groups.iter().any(|g| g.parent_id == Some(group.id))
-            || data.hosts.iter().any(|h| h.group_id == Some(group.id))
-        {
-            return Err("请先移走子分组和主机，再删除分组。".into());
+        let ids = group_descendants(&data, group.id)?;
+        let current: Vec<_> = groups(&data).as_array().unwrap().iter()
+            .filter(|g| crate::id(&g["id"]).is_ok_and(|id| ids.contains(&id)))
+            .cloned().collect();
+        if json!(current) != value["expectedGroups"] {
+            return Err("分组、子分组或主机已变化，请取消后重新删除。".into());
         }
-        data.groups.retain(|g| g.id != group.id);
+        remove_group(&mut data, group.id)?;
     } else {
         group = group.normalized()?;
         data.groups.retain(|g| g.id != group.id);

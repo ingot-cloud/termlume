@@ -3074,3 +3074,213 @@ fn initial_window_fits_the_available_work_area() {
     assert_eq!(initial_window_size(Some((1024.0, 720.0))), (976.0, 672.0));
     assert_eq!(initial_window_size(Some((600.0, 540.0))), (552.0, 492.0));
 }
+
+#[tokio::test]
+async fn csv_import_is_additive_atomic_and_preserves_existing_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let saved = call(&ws, "hosts:save", json!({"address":"csv-existing.test","username":"ops","auth":"password","localPassword":"existing-secret"})).await[0].clone();
+    let preview = imports::csv_preview("address,username,auth\ncsv-existing.test,ops,password\nnew-key.test,ops,key\n").unwrap();
+    let result = call(&ws, "hosts:import", preview).await;
+    assert_eq!(result["count"], 1);
+    assert_eq!(call(&ws, "hosts:reveal-password", saved["id"].clone()).await, "existing-secret");
+    let file = profile.path().join("workspace.json");
+    let before = std::fs::read(&file).unwrap();
+    let group = Uuid::new_v4();
+    assert!(dispatch(&ws,"hosts:import",json!({"groups":[{"id":group,"name":"must not be saved"}],"rows":[{"id":Uuid::new_v4(),"address":"invalid-import.test","username":"ops","jumpHostId":Uuid::new_v4()}]})).await.is_err());
+    assert_eq!(std::fs::read(file).unwrap(), before);
+    assert_eq!(call(&ws,"hosts:list",Value::Null).await.as_array().unwrap().len(),2);
+}
+
+#[tokio::test]
+async fn deleting_group_subtrees_ungroups_hosts_and_preserves_connections_and_credentials() {
+    for legacy in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let (profile, ws) = make_workspace(home.path(), None);
+        let identity = call(&ws,"identities:save",json!({"identity":{"name":"shared","username":"ops","auth":"password"},"localPassword":"shared-secret"})).await["identityId"].clone();
+        let root = call(&ws,"groups:save",json!({"group":{"name":"delete-root","port":2222,"identityId":identity,"terminalTheme":"light"}})).await["groups"][0].clone();
+        let child = call(
+            &ws,
+            "groups:save",
+            json!({"group":{"name":"child","parentId":root["id"]}}),
+        )
+        .await["groups"][1]
+            .clone();
+        call(&ws, "groups:save", json!({"group":{"name":"unrelated"}})).await;
+        let direct = call(&ws,"hosts:save",json!({"address":"direct.test","username":"own","auth":"password","groupId":root["id"],"inheritPort":true,"inheritTheme":true,"localPassword":"direct-secret"})).await[0].clone();
+        let inherited = call(&ws,"hosts:save",json!({"address":"inherited.test","groupId":child["id"],"inheritPort":true,"inheritIdentity":true,"inheritTheme":true})).await[1].clone();
+        let key = call(&ws,"hosts:save",json!({"address":"key.test","username":"key-user","auth":"key","keyPath":"/tmp/group-delete-key","localKeyPassphrase":"key-secret","groupId":child["id"],"port":2200})).await[2].clone();
+        let outside = call(
+            &ws,
+            "hosts:save",
+            json!({"address":"outside.test","username":"outside","auth":"agent"}),
+        )
+        .await[3]
+            .clone();
+        let (passwords, passphrases, secrets) = {
+            let store = ws.store.lock().unwrap();
+            let data = store.data().unwrap();
+            (
+                data.local_passwords.clone(),
+                data.key_passphrases.clone(),
+                serde_json::to_value(&data.local_secrets).unwrap(),
+            )
+        };
+        let all = call(&ws, "groups:list", Value::Null).await;
+        let root = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == root["id"])
+            .unwrap()
+            .clone();
+        if legacy {
+            call(&ws, "hosts:remove-group", json!("delete-root")).await;
+        } else {
+            let expected: Vec<_> = all
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|g| g["id"] == root["id"] || g["id"] == child["id"])
+                .cloned()
+                .collect();
+            call(
+                &ws,
+                "groups:delete",
+                json!({"group":root,"expected":root,"expectedGroups":expected}),
+            )
+            .await;
+        }
+        let remaining = call(&ws, "groups:list", Value::Null).await;
+        assert_eq!(remaining.as_array().unwrap().len(), 1);
+        assert_eq!(remaining[0]["name"], "unrelated");
+        let after = call(&ws, "hosts:list", Value::Null).await;
+        assert_eq!(after.as_array().unwrap().len(), 4);
+        for before in [&direct, &inherited, &key] {
+            let mut expected: Host = serde_json::from_value(before.clone()).unwrap();
+            expected.group.clear();
+            expected.group_id = None;
+            expected.inherit_port = false;
+            expected.inherit_identity = false;
+            expected.inherit_theme = false;
+            let actual: Host = serde_json::from_value(
+                after
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|h| h["id"] == before["id"])
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(after[3], outside);
+        assert_eq!(
+            call(&ws, "hosts:reveal-password", direct["id"].clone()).await,
+            "direct-secret"
+        );
+        assert_eq!(
+            call(&ws, "hosts:reveal-password", inherited["id"].clone()).await,
+            "shared-secret"
+        );
+        assert_eq!(
+            call(&ws, "hosts:has-key-passphrase", key["id"].clone()).await,
+            true
+        );
+        {
+            let store = ws.store.lock().unwrap();
+            let data = store.data().unwrap();
+            assert!(data.local_passwords == passwords);
+            assert!(data.key_passphrases == passphrases);
+            assert_eq!(serde_json::to_value(&data.local_secrets).unwrap(), secrets);
+        }
+        drop(ws);
+        let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+        assert_eq!(
+            call(&ws, "hosts:reveal-password", inherited["id"].clone()).await,
+            "shared-secret"
+        );
+        assert_eq!(call(&ws, "hosts:list", Value::Null).await, after);
+    }
+}
+
+#[tokio::test]
+async fn group_deletion_requires_an_unchanged_complete_subtree_preview() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let root =
+        call(&ws, "groups:save", json!({"group":{"name":"root"}})).await["groups"][0].clone();
+    let expected = call(&ws, "groups:list", Value::Null).await;
+    call(
+        &ws,
+        "groups:save",
+        json!({"group":{"name":"new child","parentId":root["id"]}}),
+    )
+    .await;
+    let file = profile.path().join("workspace.json");
+    let before = std::fs::read(&file).unwrap();
+    let error = dispatch(
+        &ws,
+        "groups:delete",
+        json!({"group":root,"expected":root,"expectedGroups":expected}),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("已变化"));
+    assert_eq!(std::fs::read(file).unwrap(), before);
+    assert_eq!(
+        call(&ws, "groups:list", Value::Null)
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn deleting_hosts_cleans_only_their_credentials_and_keeps_shared_logins() {
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(), None);
+    let identity=call(&ws,"identities:save",json!({"identity":{"name":"shared","username":"ops","auth":"password"},"localPassword":"shared-secret"})).await["identityId"].clone();
+    let target=call(&ws,"hosts:save",json!({"address":"delete.test","username":"own","auth":"password","localPassword":"own-secret"})).await[0].clone();
+    let shared = call(
+        &ws,
+        "hosts:save",
+        json!({"address":"shared.test","identityId":identity}),
+    )
+    .await[1]
+        .clone();
+    let key=call(&ws,"hosts:save",json!({"address":"key.test","username":"ops","auth":"key","keyPath":"/tmp/host-delete-key","localKeyPassphrase":"key-secret"})).await[2].clone();
+    call(&ws, "hosts:touch", target["id"].clone()).await;
+    let target_id = Uuid::parse_str(target["id"].as_str().unwrap()).unwrap();
+    let key_id = Uuid::parse_str(key["id"].as_str().unwrap()).unwrap();
+    let tokens = {
+        let store = ws.store.lock().unwrap();
+        let data = store.data().unwrap();
+        let password = match data.local_passwords[&target_id] {
+            LocalPassword::Saved { token, .. } => token,
+            _ => panic!("saved credential expected"),
+        };
+        [password, data.key_passphrases[&key_id].token]
+    };
+    call(&ws, "hosts:delete", target["id"].clone()).await;
+    call(&ws, "hosts:delete", key["id"].clone()).await;
+    assert_eq!(
+        call(&ws, "hosts:list", Value::Null).await,
+        json!([shared.clone()])
+    );
+    assert_eq!(
+        call(&ws, "hosts:reveal-password", shared["id"].clone()).await,
+        "shared-secret"
+    );
+    let mut store = ws.store.lock().unwrap();
+    let data = store.data().unwrap();
+    assert!(!data.recent.contains_key(&target_id));
+    assert!(!data.local_passwords.contains_key(&target_id));
+    assert!(!data.key_passphrases.contains_key(&key_id));
+    assert!(tokens
+        .iter()
+        .all(|token| store.read_secret(*token).is_err()));
+}

@@ -351,7 +351,7 @@
     assert(dialog.querySelector('.credential-row').closest('.credential-pane').hidden && dialog.querySelector('.host-key-selection').parentElement.hidden,
       '切换 Agent 认证不显示密码或私钥输入');
     dialog.close(); await createHostForm;
-    const more=$('host-list').querySelector('.host-edit:last-child'); more.click(); await tick();
+    const more=$('host-list').querySelector('.host-open ~ .host-edit:last-child'); more.click(); await tick();
     assert(hostMenu.panel.querySelectorAll('button').length >= 5 && [...hostMenu.panel.querySelectorAll('button')].every(b=>b.scrollWidth<=b.clientWidth+1 && b.scrollHeight<=b.clientHeight+1), '主机更多菜单文字完整容纳在按钮内');
     assert([...hostMenu.panel.querySelectorAll('button'), $('import-hosts'), ...$('import-hosts').parentElement.querySelectorAll('button')].every(b=>!/(?:…|\.{3})$/.test(b.textContent.trim())), '导入及主机操作菜单使用完整文字，不带省略号后缀');
     closeHostMenu(); selectTab(production);
