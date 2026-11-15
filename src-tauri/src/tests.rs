@@ -3109,7 +3109,7 @@ async fn deleting_group_subtrees_ungroups_hosts_and_preserves_connections_and_cr
         call(&ws, "groups:save", json!({"group":{"name":"unrelated"}})).await;
         let direct = call(&ws,"hosts:save",json!({"address":"direct.test","username":"own","auth":"password","groupId":root["id"],"inheritPort":true,"inheritTheme":true,"localPassword":"direct-secret"})).await[0].clone();
         let inherited = call(&ws,"hosts:save",json!({"address":"inherited.test","groupId":child["id"],"inheritPort":true,"inheritIdentity":true,"inheritTheme":true})).await[1].clone();
-        let key = call(&ws,"hosts:save",json!({"address":"key.test","username":"key-user","auth":"key","keyPath":"/tmp/group-delete-key","localKeyPassphrase":"key-secret","groupId":child["id"],"port":2200})).await[2].clone();
+        let key = call(&ws,"hosts:save",json!({"address":"key.test","username":"key-user","auth":"key","keyPath":home.path().join("group-delete-key"),"localKeyPassphrase":"key-secret","groupId":child["id"],"port":2200})).await[2].clone();
         let outside = call(
             &ws,
             "hosts:save",
@@ -3252,7 +3252,7 @@ async fn deleting_hosts_cleans_only_their_credentials_and_keeps_shared_logins() 
     )
     .await[1]
         .clone();
-    let key=call(&ws,"hosts:save",json!({"address":"key.test","username":"ops","auth":"key","keyPath":"/tmp/host-delete-key","localKeyPassphrase":"key-secret"})).await[2].clone();
+    let key=call(&ws,"hosts:save",json!({"address":"key.test","username":"ops","auth":"key","keyPath":home.path().join("host-delete-key"),"localKeyPassphrase":"key-secret"})).await[2].clone();
     call(&ws, "hosts:touch", target["id"].clone()).await;
     let target_id = Uuid::parse_str(target["id"].as_str().unwrap()).unwrap();
     let key_id = Uuid::parse_str(key["id"].as_str().unwrap()).unwrap();
