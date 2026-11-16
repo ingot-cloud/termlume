@@ -34,14 +34,15 @@ fn document_version(plaintext: &[u8]) -> u32 {
     #[serde(default, rename_all = "camelCase")]
     struct Position { sort_order: Option<u32> }
     #[derive(Deserialize)]
-    struct Asset { value: Position }
+    struct Asset { kind: String, value: Position }
     #[derive(Default, Deserialize)]
     #[serde(default, rename_all = "camelCase")]
     struct Row { sort_order: Option<u32>, asset: Option<Asset> }
     #[derive(Default, Deserialize)]
-    #[serde(default)]
-    struct Document { hosts: Vec<Row>, groups: Vec<Position> }
+    #[serde(default, rename_all = "camelCase")]
+    struct Document { hosts: Vec<Row>, groups: Vec<Position>, sync_preferences: bool }
     let value = serde_json::from_slice::<Document>(plaintext).unwrap_or_default();
+    if value.sync_preferences || value.hosts.iter().any(|h| h.asset.as_ref().is_some_and(|a| a.kind == "preferences")) { return 3; }
     let ordered = value.groups.iter().any(|g| g.sort_order.is_some()) || value.hosts.iter().any(|h| {
         h.sort_order.is_some() || h.asset.as_ref().is_some_and(|a| a.value.sort_order.is_some())
     });
@@ -63,7 +64,7 @@ pub fn encode_local(key: &Key, value: &impl Serialize) -> Result<Vec<u8>, String
 
 pub fn decode_local<T: DeserializeOwned>(key: &Key, bytes: &[u8]) -> Result<T, String> {
     let envelope: LocalEnvelope = serde_json::from_slice(bytes).map_err(crate::error)?;
-    if envelope.format != LOCAL_FORMAT || !matches!(envelope.version, 1 | 2) {
+    if envelope.format != LOCAL_FORMAT || !matches!(envelope.version, 1 | 2 | 3) {
         return Err("本机工作区格式或版本无效。".into());
     }
     let plaintext = open(key, &envelope.payload, format!("termlume-local-workspace:v{}", envelope.version).as_bytes())
@@ -241,7 +242,7 @@ pub fn change_password(key: &Key, header: &Header, password: &str) -> Result<Hea
 
 impl Envelope {
     pub fn validate(&self, scope: &str) -> Result<(), String> {
-        if self.format != FORMAT || !matches!(self.version, 1 | 2) || self.scope != scope {
+        if self.format != FORMAT || !matches!(self.version, 1 | 2 | 3) || self.scope != scope {
             return Err(INVALID.into());
         }
         Ok(())

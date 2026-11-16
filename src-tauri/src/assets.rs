@@ -87,6 +87,7 @@ pub enum Asset {
     Group(Group),
     Snippet(Snippet),
     Layout(Layout),
+    Preferences(crate::shared_preferences::SharedPreferences),
 }
 impl Asset {
     pub fn id(&self) -> Uuid {
@@ -95,6 +96,7 @@ impl Asset {
             Self::Group(g) => g.id,
             Self::Snippet(s) => s.id,
             Self::Layout(l) => l.id,
+            Self::Preferences(p) => p.id,
         }
     }
     pub fn portable(&self) -> Self {
@@ -102,6 +104,7 @@ impl Asset {
             Self::Group(g) => Self::Group(g.clone()),
             Self::Snippet(s) => Self::Snippet(s.clone()),
             Self::Layout(l) => Self::Layout(l.clone()),
+            Self::Preferences(p) => Self::Preferences(p.clone()),
             Self::Identity(i) => {
                 let mut i = i.clone();
                 i.key_path = None;
@@ -115,10 +118,17 @@ impl Asset {
             Self::Group(g) => Ok(Self::Group(g.normalized()?)),
             Self::Snippet(s) => Ok(Self::Snippet(s.normalized()?)),
             Self::Layout(l) => Ok(Self::Layout(l.normalized()?)),
+            Self::Preferences(p) => Ok(Self::Preferences(p.normalized()?)),
         }
     }
     pub fn summary(&self) -> Value {
         match self {
+            Self::Preferences(p) => {
+                let mut value = json!(p);
+                value["recordType"] = json!("preferences");
+                value["name"] = json!("界面与主机偏好");
+                value
+            }
             Self::Layout(l) => {
                 json!({"id":l.id,"name":l.name,"recordType":"layout","tabs":l.tabs,"split":l.split,"direction":l.direction,"ratio":l.ratio,"rowRatio":l.row_ratio})
             }
@@ -769,6 +779,8 @@ pub fn layout_request(ws: &Workspace, action: &str, value: Value) -> Result<Valu
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Preferences {
+    pub host_layout: Option<String>,
+    pub navigation_collapsed: Option<bool>,
     pub host_sort: String,
     pub group_sort: String,
     pub theme: String,
@@ -780,6 +792,8 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            host_layout: None,
+            navigation_collapsed: None,
             host_sort: "recent".into(),
             group_sort: "name-asc".into(),
             theme: "dark".into(),
@@ -790,13 +804,10 @@ impl Default for Preferences {
         }
     }
 }
-pub fn preferences_request(ws: &Workspace, value: Value) -> Result<Value, String> {
-    let mut store = ws.store.lock().unwrap();
-    let mut data = store.data()?.clone();
-    if value.is_null() {
-        return Ok(json!(data.preferences));
+pub fn validate_preferences(preferences: &Preferences) -> Result<(), String> {
+    if preferences.host_layout.as_deref().is_some_and(|layout| !matches!(layout, "cards" | "rows" | "tree")) {
+        return Err("主机视图无效。".into());
     }
-    let preferences: Preferences = crate::parse(value)?;
     if !matches!(preferences.host_sort.as_str(), "recent" | "name-asc" | "name-desc" | "manual")
         || !matches!(preferences.group_sort.as_str(), "name-asc" | "name-desc" | "manual")
     {
@@ -809,8 +820,35 @@ pub fn preferences_request(ws: &Workspace, value: Value) -> Result<Value, String
         return Err("主题或字号无效（字号 9–32）。".into());
     }
     checked(&preferences.font_family, "字体", 240)?;
+    Ok(())
+}
+
+pub fn preferences_request(ws: &Workspace, value: Value) -> Result<Value, String> {
+    let mut store = ws.store.lock().unwrap();
+    let mut data = store.data()?.clone();
+    if value.is_null() { return Ok(json!(data.preferences)); }
+    let preferences: Preferences = crate::parse(value)?;
+    validate_preferences(&preferences)?;
     // A stale appearance form cannot reset sorting, which has its own atomic editor.
-    data.preferences = Preferences { host_sort: data.preferences.host_sort.clone(), group_sort: data.preferences.group_sort.clone(), ..preferences };
+    data.preferences = Preferences { host_sort: data.preferences.host_sort.clone(), group_sort: data.preferences.group_sort.clone(),
+        host_layout: data.preferences.host_layout.clone(), navigation_collapsed: data.preferences.navigation_collapsed, ..preferences };
+    data.sync_preferences = true;
+    let result = json!(data.preferences);
+    store.update(data)?;
+    Ok(result)
+}
+
+pub fn view_preferences_request(ws: &Workspace, value: Value) -> Result<Value, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct View { host_layout: String, navigation_collapsed: Option<bool> }
+    let view: View = crate::parse(value)?;
+    let mut store = ws.store.lock().unwrap();
+    let mut data = store.data()?.clone();
+    data.preferences.host_layout = Some(view.host_layout);
+    data.preferences.navigation_collapsed = view.navigation_collapsed;
+    validate_preferences(&data.preferences)?;
+    data.sync_preferences = true;
     let result = json!(data.preferences);
     store.update(data)?;
     Ok(result)

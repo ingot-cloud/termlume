@@ -20,6 +20,7 @@ mod git_auto;
 mod git_https;
 mod imports;
 mod host_order;
+mod shared_preferences;
 mod keys;
 mod platform;
 mod server_info;
@@ -424,6 +425,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             return Ok(json!({"count":export.hosts,"groupCount":export.groups}));
         }
         "preferences:get" => return assets::preferences_request(ws, Value::Null),
+        "preferences:view" => return assets::view_preferences_request(ws, value),
         "hosts:reorder" => return host_order::request(ws, value),
         "preferences:fonts" => return blocking(|| Ok(json!(terminal_fonts::families()))).await,
         "preferences:save" => return assets::preferences_request(ws, value),

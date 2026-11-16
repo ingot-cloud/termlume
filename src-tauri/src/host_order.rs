@@ -141,6 +141,7 @@ pub fn request(ws: &Workspace, value: Value) -> Result<Value, String> {
     } else {
         data.preferences.host_sort = mode.into();
     }
+    data.sync_preferences = true;
     let result = json!({"hosts":data.connection_hosts(),"groups":crate::assets::groups(&data),"preferences":data.preferences});
     store.update(data)?;
     Ok(result)

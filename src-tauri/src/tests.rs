@@ -2816,7 +2816,8 @@ async fn command_library_layouts_preferences_and_empty_workspace_guards() {
     restored.apply(store::portable_rows(rows).unwrap(), None);
     assert_eq!(json!(restored.snippets)[0], snippet);
     assert_eq!(json!(restored.layouts)[0], layout);
-    assert_eq!(restored.preferences.font_size, 14);
+    assert_eq!(restored.preferences.font_size, 18);
+    assert!(!restored.preferences.record_commands);
     assert!(ws.store.lock().unwrap().ensure_empty().is_err());
     drop(ws);
     let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
@@ -3301,7 +3302,7 @@ async fn host_order_is_atomic_scoped_persistent_and_keeps_credentials() {
     assert_eq!(call(&ws,"hosts:reveal-password",first_id.clone()).await,"order-test-secret");
     let file = profile.path().join("workspace.json");
     let saved = std::fs::read(&file).unwrap();
-    assert_eq!(serde_json::from_slice::<Value>(&saved).unwrap()["version"],2);
+    assert_eq!(serde_json::from_slice::<Value>(&saved).unwrap()["version"],3);
     assert!(dispatch(&ws,"hosts:reorder",request).await.is_err(),"Stale ordering must not overwrite newer positions");
     let expected = host_order::state(ws.store.lock().unwrap().data().unwrap(), "host");
     for ids in [json!([first_id]), json!([first_id,first_id]), json!([first_id,Uuid::new_v4()])] {
@@ -3346,12 +3347,12 @@ async fn host_order_groups_and_backups_reject_old_format_rewrites() {
     let mut restored = Data::default();
     restored.apply(store::portable_rows(data.snapshot()).unwrap(),None);
     assert_eq!(host_order::state(&restored,"group"),host_order::state(&data,"group"));
-    assert_eq!(restored.preferences.group_sort,"name-asc","Display preference is local");
+    assert_eq!(restored.preferences.group_sort,"manual","Display preference follows the shared settings");
     let (key, header) = vault::create("ordering password", &vault::recovery_code()).unwrap();
     for (scope,value) in [("local",json!(data)),("portable",json!({"hosts":data.snapshot()}))] {
         let envelope = vault::encode(&key,&header,scope,&value).unwrap();
         let mut serialized = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(serialized["version"],2);
+        assert_eq!(serialized["version"],3);
         assert_eq!(envelope.decode::<Value>(&key,scope).unwrap(),value);
         serialized["version"] = json!(1);
         let tampered: vault::Envelope = serde_json::from_value(serialized).unwrap();
@@ -3360,7 +3361,7 @@ async fn host_order_groups_and_backups_reject_old_format_rewrites() {
     let legacy = vault::encode(&key,&header,"local",&Data::default()).unwrap();
     assert_eq!(serde_json::to_value(legacy).unwrap()["version"],1);
     let mut local: Value = serde_json::from_slice(&vault::encode_local(&key,&data).unwrap()).unwrap();
-    assert_eq!(local["version"],2);
+    assert_eq!(local["version"],3);
     local["version"] = json!(1);
     assert!(vault::decode_local::<Data>(&key,&serde_json::to_vec(&local).unwrap()).is_err());
 }
@@ -3402,4 +3403,97 @@ async fn host_order_import_and_group_removal_append_without_losing_positions() {
     hosts.sort_by_key(|h|h.sort_order);
     assert_eq!(hosts.iter().map(|h|h.name.as_str()).collect::<Vec<_>>(),vec!["root","B","A","imported"]);
     assert!(hosts.iter().all(|h|h.group_id.is_none()));
+}
+
+#[tokio::test]
+async fn shared_preferences_round_trip_excludes_device_settings_and_activity() {
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(),None);
+    let mut p=call(&ws,"preferences:get",Value::Null).await;
+    p["theme"]=json!("light");p["terminalTheme"]=json!("light");p["fontFamily"]=json!("Example Font, monospace");p["fontSize"]=json!(19);p["recordCommands"]=json!(true);
+    call(&ws,"preferences:save",p).await;
+    call(&ws,"preferences:view",json!({"hostLayout":"tree","navigationCollapsed":true})).await;
+    let expected=host_order::state(ws.store.lock().unwrap().data().unwrap(),"host");
+    call(&ws,"hosts:reorder",json!({"kind":"host","mode":"name-desc","expectedMode":"recent","expected":expected,"scopes":[]})).await;
+    let mut source=ws.store.lock().unwrap().data().unwrap().clone();
+    source.transfer_history.push(json!({"name":"private-transfer-marker"}));
+    source.command_history.push(json!({"command":"private-history-marker"}));
+    source.git_settings.on_unlock=true;
+    let rows=source.snapshot();
+    let serialized=serde_json::to_string(&rows).unwrap();
+    for excluded in ["recordCommands","private-transfer-marker","private-history-marker","gitSettings","localSecrets","lockSettings"] { assert!(!serialized.contains(excluded),"{excluded}"); }
+    let mut target=Data::default();
+    target.preferences.record_commands=true;
+    target.transfer_history.push(json!({"name":"target-transfer"}));
+    target.command_history.push(json!({"command":"target-history"}));
+    target.lock_settings.auto_lock_minutes=Some(7);
+    target.apply(store::portable_rows(rows).unwrap(),None);
+    assert_eq!(target.preferences.theme,"light");assert_eq!(target.preferences.font_size,19);
+    assert_eq!(target.preferences.font_family,"Example Font, monospace");
+    assert_eq!(target.preferences.host_layout.as_deref(),Some("tree"));assert_eq!(target.preferences.navigation_collapsed,Some(true));
+    assert_eq!(target.preferences.host_sort,"name-desc");assert!(target.preferences.record_commands);
+    assert!(!target.git_settings.on_unlock);assert_eq!(target.lock_settings.auto_lock_minutes,Some(7));
+    assert_eq!(target.transfer_history[0]["name"],"target-transfer");assert_eq!(target.command_history[0]["command"],"target-history");
+    let (key,header)=vault::create("shared settings password",&vault::recovery_code()).unwrap();
+    let envelope=vault::encode(&key,&header,"portable",&json!({"hosts":source.snapshot()})).unwrap();
+    let mut value=serde_json::to_value(&envelope).unwrap();assert_eq!(value["version"],3);
+    assert!(envelope.decode::<git::Snapshot>(&key,"portable").is_ok());
+    value["version"]=json!(2);
+    assert!(serde_json::from_value::<vault::Envelope>(value).unwrap().decode::<git::Snapshot>(&key,"portable").is_err());
+    let local=vault::encode_local(&key,&source).unwrap();assert_eq!(serde_json::from_slice::<Value>(&local).unwrap()["version"],3);
+    assert_eq!(vault::decode_local::<Data>(&key,&local).unwrap().preferences.font_size,19);
+}
+
+#[tokio::test]
+async fn shared_preferences_are_validated_and_do_not_block_empty_workspace_restore() {
+    let home=tempfile::tempdir().unwrap();let (profile,ws)=make_workspace(home.path(),None);
+    call(&ws,"preferences:view",json!({"hostLayout":"rows","navigationCollapsed":null})).await;
+    assert!(ws.store.lock().unwrap().ensure_empty().is_ok());
+    let file=profile.path().join("workspace.json");let before=std::fs::read(&file).unwrap();
+    for invalid in [json!({"hostLayout":"invalid"}),json!({"hostLayout":"cards","navigationCollapsed":"false"}),json!({"hostLayout":"cards","token":"not allowed"})] {
+        assert!(dispatch(&ws,"preferences:view",invalid).await.is_err());assert_eq!(std::fs::read(&file).unwrap(),before);
+    }
+    let data=ws.store.lock().unwrap().data().unwrap().clone();
+    let shared=data.snapshot().into_iter().find(|r|r.id()==shared_preferences::ID).unwrap();
+    for (field,bad) in [("version",json!(99)),("fontSize",json!(100)),("hostLayout",json!("invalid")),("id",json!(Uuid::new_v4()))] {
+        let mut value=json!(shared);value["asset"]["value"][field]=bad;
+        let row:store::Row=serde_json::from_value(value).unwrap();assert!(store::portable_rows(vec![row]).is_err());
+    }
+    let mut target=data;target.preferences.theme="light".into();
+    target.apply(vec![],None);assert_eq!(target.preferences.theme,"light","Legacy snapshots leave current preferences intact");
+    drop(ws);let ws=Workspace::new(profile.path().into(),home.path().into(),None).unwrap();
+    assert_eq!(call(&ws,"preferences:get",Value::Null).await["hostLayout"],"rows");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires isolated HTTPS Git fixture"]
+async fn shared_preferences_sync_between_workspaces_and_resolve_conflicts() {
+    let fixture=PathBuf::from(std::env::var_os("TERMLUME_TEST_FIXTURE").unwrap());
+    let port=std::fs::read_to_string(fixture.join("https-port")).unwrap();
+    let remote=format!("https://127.0.0.1:{port}/repo.git");let branch="vault/shared-preferences";
+    let auth=json!({"username":"fixture","token":"test-repository-token"});let password="shared preferences password";
+    let (_a,ws)=make_workspace(&fixture,None);let (_b,other)=make_workspace(&fixture,None);
+    let mut p=call(&ws,"preferences:get",Value::Null).await;p["fontSize"]=json!(18);p["recordCommands"]=json!(true);
+    call(&ws,"preferences:save",p).await;call(&ws,"preferences:view",json!({"hostLayout":"rows","navigationCollapsed":false})).await;
+    call(&ws,"vault:enable",json!({"password":password,"recovery":vault::recovery_code()})).await;
+    call(&ws,"vault:sync",json!({"address":remote,"branch":branch,"auth":auth})).await;
+    // A fresh app has already migrated its local view; that must still allow restore.
+    call(&other,"preferences:view",json!({"hostLayout":"cards","navigationCollapsed":null})).await;
+    call(&other,"vault:restore-git",json!({"address":remote,"branch":branch,"auth":auth,"secret":password})).await;
+    let imported=call(&other,"preferences:get",Value::Null).await;
+    assert_eq!(imported["fontSize"],18);assert_eq!(imported["hostLayout"],"rows");assert_eq!(imported["recordCommands"],false);
+    call(&other,"preferences:view",json!({"hostLayout":"tree","navigationCollapsed":true})).await;
+    call(&other,"vault:sync",json!({})).await;call(&ws,"vault:sync",json!({"pullOnly":true})).await;
+    assert_eq!(call(&ws,"preferences:get",Value::Null).await["hostLayout"],"tree");
+    assert_eq!(call(&ws,"preferences:get",Value::Null).await["recordCommands"],true);
+    let mut local=call(&ws,"preferences:get",Value::Null).await;local["theme"]=json!("light");call(&ws,"preferences:save",local).await;
+    let mut remote_p=call(&other,"preferences:get",Value::Null).await;remote_p["fontSize"]=json!(21);call(&other,"preferences:save",remote_p).await;
+    call(&other,"vault:sync",json!({})).await;
+    let conflict=call(&ws,"vault:sync",json!({})).await;
+    assert_eq!(conflict["conflicts"].as_array().unwrap().len(),1);
+    assert_eq!(conflict["conflicts"][0]["local"]["recordType"],"preferences");
+    let choices=json!({shared_preferences::ID.to_string():"remote"});
+    call(&ws,"vault:sync",json!({"ticket":conflict["ticket"],"choices":choices})).await;
+    let final_p=call(&ws,"preferences:get",Value::Null).await;assert_eq!(final_p["fontSize"],21);assert_eq!(final_p["recordCommands"],true);
 }

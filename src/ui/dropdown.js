@@ -28,7 +28,10 @@
     const rect = wrapper.getBoundingClientRect();
     const viewportWidth = document.documentElement.clientWidth;
     const viewportHeight = document.documentElement.clientHeight;
-    const width = Math.min(640, Math.max(active.config.searchable ? 380 : 208, rect.width), viewportWidth - 16);
+    const width = active.config.searchable
+      ? Math.min(640, Math.max(380, rect.width), viewportWidth - 16)
+      : Math.min(rect.width, viewportWidth - 16);
+    panel.classList.toggle('dropdown-compact', !active.config.searchable && width < 208);
     panel.style.width = `${width}px`;
     const below = viewportHeight - rect.bottom - 12;
     const titlebar = document.querySelector('.titlebar')?.getBoundingClientRect().bottom || 0;

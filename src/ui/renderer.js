@@ -3,6 +3,7 @@
 const api = window.termlume;
 const terminalPaths = window.terminalPaths;
 const keyboard = window.keyboardShortcuts;
+document.documentElement.dataset.platform = keyboard.isMac ? 'macos' : 'other';
 keyboard.hints(document);
 const { selectControl, editableControl, close: closeDropdown } = window.dropdowns;
 const $ = (id) => document.getElementById(id);
@@ -50,6 +51,8 @@ let quickConnectFilters;
 let sessionFilters;
 const defaultTerminalFont = 'SFMono-Regular, Menlo, monospace';
 let uiPreferences={theme:"dark",terminalTheme:"dark",fontFamily:defaultTerminalFont,fontSize:14,recordCommands:false};
+let viewPreferencesMigration;
+let viewPreferencesSave = Promise.resolve();
 const recordingSessions=new Set();
 const {retryDelay,automaticCredential,filterCommands,pathBreadcrumbs}=window.workspaceState;
 const layoutState = window.workspaceState;
@@ -442,7 +445,13 @@ async function refreshHosts() {
   const [result, timestamps, preferences] = await Promise.all([api.hosts.list(), api.hosts.recent(), api.preferences?.get()]);
   if (vaultStatus.locked) return;
   hosts = result;
-  if (preferences) uiPreferences = preferences;
+  if (preferences) {
+    const next = await migrateViewPreferences(preferences);
+    if (vaultStatus.locked) return;
+    const fonts = next.fontFamily !== uiPreferences.fontFamily || next.fontSize !== uiPreferences.fontSize;
+    uiPreferences = next;
+    applyPreferences(fonts);
+  }
   hostsLoaded = true;
   for (const [id, time] of Object.entries(timestamps)) recent.set(id, time);
   renderHosts();
@@ -471,7 +480,7 @@ function applyVaultState(state) {
   }
   vaultStatus = state;
   if (!state.enabled) touchIdAvailable = false;
-  if(!state.locked&&api.preferences) void api.preferences.get().then(p=>{if(!vaultStatus.locked&&JSON.stringify(p)!==JSON.stringify(uiPreferences)){const fonts=p.fontFamily!==uiPreferences.fontFamily||p.fontSize!==uiPreferences.fontSize;uiPreferences=p;applyPreferences(fonts);}}).catch(()=>{});
+  if(!state.locked&&api.preferences) void api.preferences.get().then(migrateViewPreferences).then(p=>{if(!vaultStatus.locked&&JSON.stringify(p)!==JSON.stringify(uiPreferences)){const fonts=p.fontFamily!==uiPreferences.fontFamily||p.fontSize!==uiPreferences.fontSize;uiPreferences=p;applyPreferences(fonts);renderHosts();}}).catch(()=>{});
   updateTouchIdUnlock();
   const transfersSupported = state.fileTransfers !== false;
   document.querySelector('[data-page="transfers"]').hidden = $('queue-button').hidden = !transfersSupported;
@@ -1135,6 +1144,7 @@ function renderSecurityPage() {
 
     const policy = { ...defaultGitSettings, ...vaultStatus.gitSettings };
     const git = node('section', 'security-card', node('h2', '', 'Git 同步'));
+    git.append(node('p', 'muted', '同步主机与连接设置、分组、登录配置、快捷命令、保存的会话布局，以及主题、字体字号、主机视图和排序偏好。传输记录、会话日志和命令历史不参与同步；私钥、私钥口令、仓库授权和应用锁等设备配置保留在本机。共享偏好需要同一保险库的设备使用支持此格式的新版本。'));
     const runGitAction = action => async () => {
       const controls = [...git.querySelectorAll('.vault-sync:not(:disabled)')];
       controls.forEach(control => { control.disabled = true; });
@@ -1504,6 +1514,41 @@ function applyPreferences(fonts = false) {
   document.documentElement.dataset.theme=uiPreferences.theme==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):uiPreferences.theme;
   document.documentElement.dataset.terminalTheme=uiPreferences.terminalTheme;
   for(const tab of tabs.values())if(tab.terminal){if(fonts){tab.terminal.options.fontFamily=uiPreferences.fontFamily;tab.terminal.options.fontSize=uiPreferences.fontSize;}applyTerminalPreferences(tab);tab.fit.fit();}
+  if (['cards','rows','tree'].includes(uiPreferences.hostLayout)) {
+    if (hostLayout.value !== uiPreferences.hostLayout) {
+      hostLayout.value = uiPreferences.hostLayout;
+      hostLayout.dispatchEvent(new Event('input'));
+      workspace.dataset.hostLayout = hostLayout.value;
+      if (hostLayout.value === 'tree') currentGroup = selectedGroup = '';
+    }
+    navigationPreference = uiPreferences.navigationCollapsed ?? undefined;
+    updateNavigation();
+    try {
+      localStorage.setItem('host-layout', hostLayout.value);
+      if (navigationPreference == null) localStorage.removeItem('nav-collapsed');
+      else localStorage.setItem('nav-collapsed', String(navigationPreference));
+    } catch { /* In-memory preferences still work. */ }
+  }
+}
+
+async function migrateViewPreferences(preferences) {
+  if (vaultStatus.locked || preferences.hostLayout != null || !api.preferences?.saveView) return preferences;
+  if (!viewPreferencesMigration) {
+    viewPreferencesMigration = api.preferences.saveView({hostLayout:hostLayout.value,navigationCollapsed:navigationPreference ?? null})
+      .finally(() => { viewPreferencesMigration = undefined; });
+  }
+  return viewPreferencesMigration;
+}
+
+function saveViewPreferences() {
+  if (!api.preferences?.saveView || vaultStatus.locked) return;
+  const value = {hostLayout:hostLayout.value,navigationCollapsed:navigationPreference ?? null};
+  // Keep view changes ordered without overwriting a concurrent theme/font edit.
+  viewPreferencesSave = viewPreferencesSave.catch(() => {}).then(() => api.preferences.saveView(value)).then(p => {
+    if (!vaultStatus.locked && value.hostLayout === hostLayout.value && value.navigationCollapsed === (navigationPreference ?? null)) {
+      uiPreferences = {...uiPreferences,hostLayout:p.hostLayout,navigationCollapsed:p.navigationCollapsed};
+    }
+  }).catch(error => status(message(error)));
 }
 async function editPreferences(page) {
   if (!page) return openSettings('preferences');
@@ -1539,7 +1584,7 @@ async function editPreferences(page) {
     field('终端字体', selectControl(family, '终端字体')),
     field('默认字号（9–32）', size),
     node('label', 'checkbox-row', history, '保存通过独立通道执行的命令历史'),
-    node('p', 'muted', '偏好与历史仅保存在此设备；不采集任意终端键入和密码提示中的输入。')
+    node('p', 'muted', '主题、字体字号及主机视图和排序偏好会加入加密备份与 Git 同步。命令历史和记录开关仅留在本机；不采集任意终端键入和密码提示中的输入。')
   ], '保存偏好', async () => {
     uiPreferences = await api.preferences.save({
       theme: theme.value, terminalTheme: terminal.value, fontFamily: family.value,
@@ -5578,6 +5623,7 @@ hostLayout.addEventListener('change', () => {
   try { localStorage.setItem('host-layout', hostLayout.value); } catch { /* Use the in-memory choice. */ }
   if (hostLayout.value === 'tree') currentGroup = selectedGroup = '';
   renderHosts();
+  saveViewPreferences();
 });
 const toggleNav = $('toggle-nav');
 let navigationPreference;
@@ -5598,6 +5644,7 @@ toggleNav.addEventListener('click', () => {
   navigationPreference = workspace.dataset.navCollapsed !== 'true';
   updateNavigation();
   try { localStorage.setItem('nav-collapsed', String(navigationPreference)); } catch { /* Use the in-memory choice. */ }
+  saveViewPreferences();
 });
 function openGlobalSearch() {
   void openPalette().catch((error) => status(message(error)));

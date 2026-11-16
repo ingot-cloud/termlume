@@ -88,7 +88,8 @@ code, kbd { font-family: SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .titlebar, .footer, .section-head, #toolbar, #toolbar-actions, #tabs, #context, #session-actions, .file-tools {
   display: flex; align-items: center; gap: 7px;
 }
-.titlebar { position: relative; z-index: 40; height: var(--titlebar-height); flex: none; gap: 8px; padding: 0 10px 0 80px; background: var(--chrome); border-bottom: 1px solid var(--border); user-select: none; -webkit-app-region: drag; }
+.titlebar { position: relative; z-index: 40; height: var(--titlebar-height); flex: none; gap: 8px; padding: 0 10px; background: var(--chrome); border-bottom: 1px solid var(--border); user-select: none; -webkit-app-region: drag; }
+[data-platform="macos"] .titlebar { padding-left: 80px; }
 .titlebar :is(button, #tabs) { -webkit-app-region: no-drag; }
 .brand, .launcher { flex: none; display: inline-flex; align-items: center; gap: 7px; min-height: 30px; background: var(--raise); border-radius: var(--radius-item); white-space: nowrap; }
 .brand[data-active="true"] { background: var(--selected); }
@@ -468,6 +469,8 @@ details.host-form-section[open] > :not(summary) { margin-top: 8px; }
 .dropdown-toggle { display: grid; place-items: center; padding: 0 7px; }
 .dropdown-panel { position: fixed; z-index: 20; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; background: var(--raise); border: 1px solid var(--border); border-radius: var(--radius-menu); padding: var(--space-1); box-shadow: var(--popup-shadow); color: var(--text); }
 .dropdown-option { display: flex; align-items: center; min-height: 31px; gap: 8px; padding: 5px 8px; border-radius: 5px; cursor: pointer; }
+.dropdown-option .dropdown-text { overflow-wrap: anywhere; }
+.dropdown-compact .dropdown-option { gap: 4px; padding-inline: 4px; }
 .dropdown-option[aria-selected="true"] { background: var(--bar); }
 .dropdown-option[data-highlighted="true"] { background: var(--selected); box-shadow: inset 2px 0 var(--accent); }
 .dropdown-option[aria-disabled="true"] { opacity: .48; cursor: default; }

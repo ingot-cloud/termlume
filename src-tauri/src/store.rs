@@ -352,6 +352,7 @@ pub struct Data {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub layouts: Vec<Layout>,
     pub preferences: Preferences,
+    pub sync_preferences: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub command_history: Vec<Value>,
     pub fingerprints: Vec<Fingerprint>,
@@ -483,6 +484,9 @@ impl Data {
         rows.extend(self.layouts.iter().map(|l| Row::Asset {
             asset: Asset::Layout(l.clone()),
         }));
+        if self.sync_preferences {
+            rows.push(Row::Asset { asset: Asset::Preferences(crate::shared_preferences::SharedPreferences::from_local(&self.preferences)) });
+        }
         rows.sort_by_key(Row::id);
         rows
     }
@@ -494,6 +498,10 @@ impl Data {
         let mut layouts = Vec::new();
         for row in rows {
             match row {
+                Row::Asset { asset: Asset::Preferences(p) } => {
+                    p.apply(&mut self.preferences);
+                    self.sync_preferences = true;
+                }
                 Row::Host(h) => hosts.push(h),
                 Row::Asset {
                     asset: Asset::Layout(l),
@@ -879,7 +887,7 @@ impl Store {
         true
     }
     pub fn ensure_empty(&self) -> Result<(), String> {
-        if self.envelope.is_some() || !self.data()?.snapshot().is_empty() {
+        if self.envelope.is_some() || self.data()?.snapshot().iter().any(|row| !matches!(row, Row::Asset { asset: Asset::Preferences(_) })) {
             return Err("恢复需要空工作区。".into());
         }
         Ok(())

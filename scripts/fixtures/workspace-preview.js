@@ -209,7 +209,7 @@ window.termlume = {
     if (index >= 0) previewLayouts.splice(index, 1);
     return [...previewLayouts];
   }},
-  preferences:{get:async()=>previewPreferences,fonts:async()=>['JetBrains Mono','Menlo','Monaco'],save:async value=>(previewPreferences=value)},
+  preferences:{saveView:async value=>{previewPreferences={...previewPreferences,...value};return structuredClone(previewPreferences);},get:async()=>previewPreferences,fonts:async()=>['JetBrains Mono','Menlo','Monaco'],save:async value=>(previewPreferences=value)},
   logs:{list:async()=>[]},history:{list:async()=>[]},
   trust:{list:async()=>[]},
   forwards:{list:async()=>({rules:[],running:[]})},

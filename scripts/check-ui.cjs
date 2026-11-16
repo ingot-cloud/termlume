@@ -629,6 +629,32 @@ async function main() {
       currentGroup='';$('host-layout').value='cards';$('host-layout').dispatchEvent(new Event('change'));await refreshHosts()`);
     console.log(`${width}px: PASS natural sorting, independent group order, three-view drag, keyboard movement, filters, persistence and failed-save recovery`);
   };
+  const sharedUiChecks = async width => {
+    await js(`(async()=>{await viewPreferencesSave;window.settingsOriginal=structuredClone(previewPreferences);selectTab(undefined,'hosts');openSettings('preferences')})()`);
+    await wait("Boolean($('settings-page').querySelector('[aria-label=\"应用主题\"]'))");
+    await js("$('settings-page').querySelector('[aria-label=\"应用主题\"]').click()");
+    const wide = await js("(()=>{const t=$('settings-page').querySelector('[aria-label=\"应用主题\"]'),p=document.querySelector('.dropdown-panel[role=listbox]');return{trigger:t.getBoundingClientRect().toJSON(),panel:p.getBoundingClientRect().toJSON()}})()");
+    assert(Math.abs(wide.trigger.width-wide.panel.width)<=1 && Math.abs(wide.trigger.left-wide.panel.left)<=1,'Wide menus must match their trigger');
+    await shot(`dropdown-width-${width}.png`);
+    await js("closeDropdown();selectTab(undefined,'hosts');$('host-layout').closest('.dropdown').querySelector('button').click()");
+    const narrow=await js("(()=>{const t=$('host-layout').closest('.dropdown').querySelector('button'),p=document.querySelector('.dropdown-panel[role=listbox]');return[t.getBoundingClientRect().width,p.getBoundingClientRect().width]})()");
+    assert(Math.abs(narrow[0]-narrow[1])<=1,'Compact menus must match their trigger too');
+    assert(await js("[...document.querySelectorAll('.dropdown-panel[role=listbox] .dropdown-text > span')].every(s=>s.getClientRects().length===1)"),'Short options must stay on one line in compact menus');
+    await js(`(async()=>{closeDropdown();await viewPreferencesSave;previewPreferences={...previewPreferences,theme:'light',fontSize:18,hostLayout:'tree',navigationCollapsed:true};await refreshHosts()})()`);
+    assert.deepEqual(await js("[document.documentElement.dataset.theme,$('host-layout').value,workspace.dataset.hostLayout,workspace.dataset.navCollapsed]"),['light','tree','tree','true']);
+    await js("(async()=>{previewPreferences=settingsOriginal;await refreshHosts()})()");
+    await overflow();
+    console.log(`${width}px: PASS dropdown width and live application of shared appearance/view preferences`);
+  };
+  if (process.argv.includes('--shared-ui-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await sharedUiChecks(width);
+    }
+    return;
+  }
   if (process.argv.includes('--host-order-only')) {
     for (const [width,height] of [[1140,740],[550,490]]) {
       await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
@@ -693,6 +719,7 @@ async function main() {
     assert.match(report, /^✓/, report);
     console.log(`${width}×${height}: ${report.split('（')[0]}`);
     await js("document.getElementById('smoke-results').hidden=true");
+    await sharedUiChecks(width);
     await hostOrderChecks(width);
     await hostTreeChecks(width);
     await csvChecks(width);
@@ -996,6 +1023,8 @@ async function main() {
     };
     assert.equal(await js("document.querySelector('#palette-button kbd').textContent"), `${prefix}K`);
     assert((await js("document.getElementById('add-tab').title")).includes(`${prefix}T`));
+    const brandLeft = await js("$('library-button').getBoundingClientRect().left");
+    assert(Math.abs(brandLeft-(platform==='MacIntel'?80:10))<=1,'Only macOS reserves space for traffic-light controls');
     await overflow();
     await key('t', 'KeyT', 84);
     assert.equal(await js('active.kind'), 'new');
