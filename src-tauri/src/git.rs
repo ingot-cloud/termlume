@@ -1097,3 +1097,31 @@ pub async fn migrate(ws: &Workspace, input: MigrationRequest) -> Result<Value, S
     ws.sync_cancel.lock().unwrap().take();
     result
 }
+
+#[cfg(test)]
+mod ordering_merge_tests {
+    use super::*;
+
+    #[test]
+    fn manual_positions_merge_and_order_conflicts_expose_positions() {
+        let group = |id, name: &str, order| serde_json::from_value::<Row>(json!({"asset":{"kind":"group","value":{
+            "id":id,"name":name,"sortOrder":order
+        }}})).unwrap();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let base = vec![group(a,"A",0),group(b,"B",1)];
+        let ours = vec![group(a,"A",1),group(b,"B",0)];
+        let (merged, conflicts) = merge(&base,&ours,&base,&BTreeMap::new());
+        assert!(conflicts.is_empty());
+        assert!(merged == ours);
+        let theirs = vec![group(a,"renamed",0),group(b,"B",1)];
+        let (_, conflicts) = merge(&base,&ours,&theirs,&BTreeMap::new());
+        assert_eq!(conflicts.len(),1);
+        assert_eq!(conflicts[0]["local"]["sortOrder"],1);
+        assert_eq!(conflicts[0]["remote"]["sortOrder"],0);
+        let choices = BTreeMap::from([(a,"local".into())]);
+        let (merged, conflicts) = merge(&base,&ours,&theirs,&choices);
+        assert!(conflicts.is_empty());
+        assert!(merged == ours);
+    }
+}

@@ -127,7 +127,14 @@ window.termlume = {
       previewCalls.push(['git-sync', request]);
       return { state: { ...vaultStatus, lastFetched: 1794272500000 } };
     }},
-  hosts:{list:async()=>previewHosts,recent:async()=>({api:3,stage:2,jump:1}),touch:async()=>{},hasPassword:async()=>false,hasKeyPassphrase:async id=>previewKeySecrets.has(id),revealPassword:async()=>'',pickKey:async()=>'/preview/key',csvPreview:async()=>null,
+  hosts:{reorder:async request=>{
+    previewCalls.push(['host-reorder',request]);
+    if(window.previewOrderFailure) throw new Error('模拟保存失败');
+    const rows=request.kind==='group'?previewGroups:previewHosts;
+    for(const scope of request.scopes)scope.ids.forEach((id,index)=>{rows.find(row=>row.id===id).sortOrder=index;});
+    previewPreferences={...previewPreferences,[request.kind==='group'?'groupSort':'hostSort']:request.mode};
+    return {hosts:structuredClone(previewHosts),groups:previewGroupList(),preferences:previewPreferences};
+  },list:async()=>previewHosts,recent:async()=>({api:3,stage:2,jump:1}),touch:async()=>{},hasPassword:async()=>false,hasKeyPassphrase:async id=>previewKeySecrets.has(id),revealPassword:async()=>'',pickKey:async()=>'/preview/key',csvPreview:async()=>null,
     csvExport:async value=>{previewCalls.push(['csv-export',value]);return {count:1,groupCount:1};},
     import:async value=>{previewCalls.push(['csv-import',value]);return {hosts:previewHosts,count:value.rows.length,groupCount:value.groups?.length||0};},
     remove:async id=>{

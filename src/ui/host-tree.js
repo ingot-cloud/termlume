@@ -3,7 +3,18 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.hostTree = api;
 })(typeof window !== 'undefined' ? window : globalThis, () => {
-  function build(groups, hosts = []) {
+  const names = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
+  function compare(mode = 'name-asc', recent = new Map()) {
+    return (a, b) => {
+      const name = names.compare(a.name || '', b.name || '');
+      const stable = name || String(a.id).localeCompare(String(b.id));
+      if (mode === 'manual') return (a.sortOrder ?? Number.MAX_SAFE_INTEGER) - (b.sortOrder ?? Number.MAX_SAFE_INTEGER) || stable;
+      if (mode === 'recent') return (recent.get(b.id) || 0) - (recent.get(a.id) || 0) || stable;
+      return (mode === 'name-desc' ? -name : name) || String(a.id).localeCompare(String(b.id));
+    };
+  }
+  function build(groups, hosts = [], options = {}) {
+    const groupCompare = compare(options.groupSort);
     const branches = groups.map(group => ({ group, groups: [], hosts: [], count: 0 }));
     const byId = new Map(branches.map(branch => [branch.group.id, branch]));
     const byPath = new Map(branches.map(branch => [branch.group.path, branch]));
@@ -29,7 +40,8 @@
       (parent || tree).hosts.push(host);
     }
     const count = branch => {
-      branch.groups.sort((a, b) => a.group.name.localeCompare(b.group.name, 'zh-CN'));
+      branch.groups.sort((a, b) => groupCompare(a.group, b.group));
+      if (options.hostSort) branch.hosts.sort(compare(options.hostSort, options.recent));
       branch.count = branch.hosts.length + branch.groups.reduce((sum, child) => sum + count(child), 0);
       return branch.count;
     };
@@ -54,5 +66,13 @@
     }
     return ids;
   }
-  return { build, filter, descendants };
+  function flatten(tree) {
+    return [...tree.groups.flatMap(flatten), ...tree.hosts];
+  }
+  function scopes(tree, kind) {
+    return [{ parentId: tree.group?.id || null, ids: kind === 'group' ? tree.groups.map(b => b.group.id) : tree.hosts.map(h => h.id) },
+      ...tree.groups.flatMap(branch => scopes(branch, kind))];
+  }
+  function flattenGroups(tree) { return tree.groups.flatMap(branch => [branch.group, ...flattenGroups(branch)]); }
+  return { build, filter, descendants, compare, flatten, flattenGroups, scopes };
 });

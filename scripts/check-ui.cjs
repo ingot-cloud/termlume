@@ -572,6 +572,72 @@ async function main() {
     assert(await js(`document.querySelector(${JSON.stringify(pane)}).contains(document.activeElement)`),
       'Keyboard focus must stay inside the active overlay');
   };
+  const hostOrderChecks = async width => {
+    const orderJS = code => js(`(async()=>{${code}})()`);
+    const connectionsBefore = await js("previewCalls.filter(([t])=>t==='connect').length");
+    await orderJS(`window.orderOriginal=structuredClone({hosts:previewHosts,groups:previewGroups,preferences:previewPreferences});
+      previewGroups.splice(0,previewGroups.length,{id:'oa',name:'A'},{id:'ob',name:'B'},{id:'oc',name:'Child',parentId:'oa'});
+      previewHosts.splice(0,previewHosts.length,...[10,2,1].map(n=>({id:'oh'+n,name:'node'+n,address:'node'+n+'.test',username:'ops',port:22,auth:'agent',groupId:'oa',group:'A',tags:['qa']})));
+      previewPreferences={...previewPreferences,hostSort:'recent',groupSort:'name-asc'};
+      selectTab(undefined,'hosts');currentGroup='A';await refreshHosts();
+      $('host-sort').click();[...hostMenu.panel.querySelectorAll('[role=menuitemradio]')].find((b,i)=>i>2&&b.textContent==='名称升序').click()`);
+    await wait("!hostSortBusy && uiPreferences.hostSort==='name-asc'");
+    const visible = () => js("[...$('host-list').querySelectorAll('.host-open')].map(b=>b.dataset.hostId)");
+    assert.deepEqual(await visible(),['oh1','oh2','oh10']);
+    await orderJS("$('host-sort').click();[...hostMenu.panel.querySelectorAll('[role=menuitemradio]')].at(-1).click()");
+    await wait("!hostSortBusy && uiPreferences.hostSort==='manual'");
+    for (const layout of ['cards','rows','tree']) {
+      await orderJS(`$('host-layout').value='${layout}';$('host-layout').dispatchEvent(new Event('change'));currentGroup='A';expandedHostGroups.add('oa');renderHosts()`);
+      const start = await js("(() => {const h=document.querySelector('[data-order-id=oh10] .host-order-handle');h.scrollIntoView({block:'nearest'});const r=h.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2}})()");
+      await run('Input.dispatchMouseEvent',{type:'mouseMoved',...start});
+      await run('Input.dispatchMouseEvent',{type:'mousePressed',...start,button:'left',buttons:1,clickCount:1});
+      await run('Input.dispatchMouseEvent',{type:'mouseMoved',x:start.x+8,y:start.y+8,buttons:1});
+      const end = await js(`(() => {const target=document.querySelector('[data-order-id=oh1]');target.scrollIntoView({block:'nearest'});const r=target.getBoundingClientRect();return{x:r.x+(${JSON.stringify(layout)}==='cards'?3:r.width/2),y:r.y+Math.min(12,r.height/3)}})()`);
+      await run('Input.dispatchMouseEvent',{type:'mouseMoved',...end,buttons:1});
+      if (!await js('!hostOrderMarker.hidden')) {
+        await shot(`host-sort-drag-failure-${width}-${layout}.png`);
+        throw new Error(JSON.stringify({width,layout,start,end,state:await js(`({drag:hostDrag?{started:hostDrag.started,ids:hostDrag.ids,x:hostDrag.x,y:hostDrag.y}:null,hit:document.elementFromPoint(${end.x},${end.y})?.outerHTML.slice(0,400),library:$('host-library').getBoundingClientRect().toJSON()})`)}));
+      }
+      await run('Input.dispatchMouseEvent',{type:'mouseReleased',...end,button:'left',clickCount:1});
+      await wait('!hostSortBusy && !hostDrag');
+      assert.deepEqual(await visible(),['oh10','oh1','oh2']);
+      assert.equal(await js("previewCalls.filter(([t])=>t==='connect').length"),connectionsBefore,'Reordering must not connect');
+      await orderJS("await moveHostOrder('host',hosts.find(h=>h.id==='oh10'),2)");
+      assert.deepEqual(await visible(),['oh1','oh2','oh10']);
+      await overflow();
+    }
+    await orderJS("$('host-search').value='node';renderHosts()");
+    assert(await js("[...$('host-list').querySelectorAll('.host-order-handle')].filter(h=>h.closest('[data-order-kind=host]')).every(h=>h.disabled)"));
+    await orderJS("$('host-search').value='';$('tag-filter').value='qa';renderHosts()");
+    assert(await js("[...$('host-list').querySelectorAll('.host-order-handle')].every(h=>h.disabled)"));
+    await orderJS("$('tag-filter').value='';renderHosts();window.previewOrderFailure=true;await moveHostOrder('host',hosts.find(h=>h.id==='oh10'),0);window.previewOrderFailure=false");
+    assert.deepEqual(await visible(),['oh1','oh2','oh10'],'Failed save must keep previous positions');
+    await orderJS("await saveHostOrder('host','name-desc');await saveHostOrder('host','manual')");
+    assert.deepEqual(await visible(),['oh1','oh2','oh10'],'Returning to manual restores the saved order');
+    await orderJS("await saveHostOrder('group','manual',window.hostTree.scopes(orderedHostTree(),'group'));await moveHostOrder('group',groupAssets.find(g=>g.id==='ob'),0)");
+    await tick();await js("$('host-sort').click()");
+    assert(await js("Boolean(hostMenu?.panel.querySelector('[role=menuitemradio]'))"));
+    await overflow();await shot(`host-sort-${width}.png`);
+    await orderJS("closeHostMenu();renderHosts()");
+    assert.deepEqual(await js("orderedHostTree().groups.map(b=>b.group.id)"),['ob','oa']);
+    assert.equal(await js("groupAssets.find(g=>g.id==='oc').parentId"),'oa');
+    // Exercise keyboard movement on the real handle without changing tree navigation.
+    await orderJS("const h=document.querySelector('[data-order-id=oh10] .host-order-handle');h.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',altKey:true,bubbles:true}))");
+    await wait('!hostSortBusy');
+    assert.deepEqual(await visible(),['oh1','oh10','oh2']);
+    await orderJS(`previewHosts.splice(0,previewHosts.length,...orderOriginal.hosts);previewGroups.splice(0,previewGroups.length,...orderOriginal.groups);previewPreferences=orderOriginal.preferences;
+      currentGroup='';$('host-layout').value='cards';$('host-layout').dispatchEvent(new Event('change'));await refreshHosts()`);
+    console.log(`${width}px: PASS natural sorting, independent group order, three-view drag, keyboard movement, filters, persistence and failed-save recovery`);
+  };
+  if (process.argv.includes('--host-order-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await hostOrderChecks(width);
+    }
+    return;
+  }
   if (process.argv.includes('--deletion-only')) {
     for (const [width, height] of [[1140,740],[550,490]]) {
       await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
@@ -627,6 +693,7 @@ async function main() {
     assert.match(report, /^✓/, report);
     console.log(`${width}×${height}: ${report.split('（')[0]}`);
     await js("document.getElementById('smoke-results').hidden=true");
+    await hostOrderChecks(width);
     await hostTreeChecks(width);
     await csvChecks(width);
     await deletionChecks(width);

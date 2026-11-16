@@ -126,7 +126,7 @@ impl Asset {
                 json!({"id":s.id,"name":s.name,"recordType":"snippet","command":s.command,"tags":s.tags,"pinned":s.pinned,"order":s.order,"builtin":s.builtin})
             }
             Self::Group(g) => {
-                json!({"id":g.id,"name":g.name,"recordType":"group","parentId":g.parent_id,"port":g.port,"identityId":g.identity_id,"terminalTheme":g.terminal_theme})
+                json!({"id":g.id,"name":g.name,"recordType":"group","parentId":g.parent_id,"port":g.port,"identityId":g.identity_id,"terminalTheme":g.terminal_theme,"sortOrder":g.sort_order})
             }
             Self::Identity(i) => {
                 json!({"id":i.id,"name":i.name,"username":i.username,"auth":i.auth,"recordType":"identity","passwordSaved":i.password.is_some()})
@@ -245,6 +245,8 @@ pub fn delete_identity(ws: &Workspace, value: Value) -> Result<Value, String> {
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Group {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_theme: Option<String>,
     pub id: Uuid,
@@ -396,7 +398,7 @@ pub fn group_descendants(data: &Data, id: Uuid) -> Result<std::collections::Hash
 /// Remove only group containers; flatten their hosts while keeping effective connections.
 pub fn remove_group(data: &mut Data, id: Uuid) -> Result<(), String> {
     let ids = group_descendants(data, id)?;
-    let resolved: Vec<_> = data
+    let mut resolved: Vec<_> = data
         .hosts
         .iter()
         .filter(|host| host.group_id.is_some_and(|id| ids.contains(&id)))
@@ -405,6 +407,7 @@ pub fn remove_group(data: &mut Data, id: Uuid) -> Result<(), String> {
                 .unwrap_or_else(|_| host.clone())
         })
         .collect();
+    resolved.sort_by_key(|host| (host.group_id, host.sort_order.unwrap_or(u32::MAX), host.id));
     for mut effective in resolved {
         effective.group.clear();
         effective.group_id = None;
@@ -412,6 +415,7 @@ pub fn remove_group(data: &mut Data, id: Uuid) -> Result<(), String> {
         effective.inherit_identity = false;
         effective.inherit_theme = false;
         effective.identity_version = None;
+        effective.sort_order = crate::host_order::next(data, "host", None);
         if let Some(host) = data.hosts.iter_mut().find(|host| host.id == effective.id) {
             *host = effective;
         }
@@ -457,6 +461,9 @@ pub fn group_request(ws: &Workspace, action: &str, value: Value) -> Result<Value
         remove_group(&mut data, group.id)?;
     } else {
         group = group.normalized()?;
+        group.sort_order = if let Some(old) = data.groups.iter().find(|g| g.id == group.id && g.parent_id == group.parent_id) {
+            old.sort_order
+        } else { crate::host_order::next(&data, "group", group.parent_id) };
         data.groups.retain(|g| g.id != group.id);
         data.groups.push(group);
         validate_groups(&data)?;
@@ -762,6 +769,8 @@ pub fn layout_request(ws: &Workspace, action: &str, value: Value) -> Result<Valu
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Preferences {
+    pub host_sort: String,
+    pub group_sort: String,
     pub theme: String,
     pub terminal_theme: String,
     pub font_family: String,
@@ -771,6 +780,8 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            host_sort: "recent".into(),
+            group_sort: "name-asc".into(),
             theme: "dark".into(),
             terminal_theme: "dark".into(),
             font_family: "SFMono-Regular, Menlo, monospace".into(),
@@ -786,6 +797,11 @@ pub fn preferences_request(ws: &Workspace, value: Value) -> Result<Value, String
         return Ok(json!(data.preferences));
     }
     let preferences: Preferences = crate::parse(value)?;
+    if !matches!(preferences.host_sort.as_str(), "recent" | "name-asc" | "name-desc" | "manual")
+        || !matches!(preferences.group_sort.as_str(), "name-asc" | "name-desc" | "manual")
+    {
+        return Err("主机或分组排序方式无效。".into());
+    }
     if !matches!(preferences.theme.as_str(), "dark" | "light" | "system")
         || !matches!(preferences.terminal_theme.as_str(), "dark" | "light")
         || !(9..=32).contains(&preferences.font_size)
@@ -793,7 +809,8 @@ pub fn preferences_request(ws: &Workspace, value: Value) -> Result<Value, String
         return Err("主题或字号无效（字号 9–32）。".into());
     }
     checked(&preferences.font_family, "字体", 240)?;
-    data.preferences = preferences;
+    // A stale appearance form cannot reset sorting, which has its own atomic editor.
+    data.preferences = Preferences { host_sort: data.preferences.host_sort.clone(), group_sort: data.preferences.group_sort.clone(), ..preferences };
     let result = json!(data.preferences);
     store.update(data)?;
     Ok(result)

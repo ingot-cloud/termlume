@@ -21,6 +21,8 @@ use zeroize::Zeroize;
 #[serde(rename_all = "camelCase", default)]
 pub struct Host {
     pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<u32>,
     pub name: String,
     pub address: String,
     pub port: u16,
@@ -63,6 +65,7 @@ impl Default for Host {
     fn default() -> Self {
         Self {
             id: Uuid::nil(),
+            sort_order: None,
             name: String::new(),
             address: String::new(),
             port: 22,

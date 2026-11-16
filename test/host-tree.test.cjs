@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { build, filter, descendants } = require('../src/ui/host-tree.js');
+const { compare, scopes, flatten } = require('../src/ui/host-tree.js');
 const groups = [
   {id:'root', name:'生产', path:'生产'},
   {id:'child', name:'应用', path:'生产 / 应用', parentId:'root'},
@@ -48,4 +49,25 @@ test('invalid cycles cannot recurse forever or hide hosts, and descendant exclus
   assert.equal(build(cyclic, [{id:'host', groupId:'c'}]).count, 1);
   assert.deepEqual([...descendants(groups, 'root')], ['root','child','leaf']);
   assert.deepEqual([...descendants(cyclic, 'a')], ['a','b','c']);
+});
+
+test('name sorting uses natural numbers, Chinese collation and stable ties in both directions', () => {
+  const rows = [{id:'b',name:'server10'}, {id:'c',name:'Server2'}, {id:'a',name:'server2'}, {id:'z',name:'生产'}];
+  assert.deepEqual([...rows].sort(compare('name-asc')).map(h=>h.id), ['z','a','c','b']);
+  assert.deepEqual([...rows].sort(compare('name-desc')).map(h=>h.id), ['b','a','c','z']);
+  assert.deepEqual([...rows].sort(compare('recent',new Map([['b',5]]))).map(h=>h.id), ['b','z','a','c']);
+});
+
+test('manual positions are scoped to siblings and survive filtering without mutating records', () => {
+  const gs = [{id:'b',name:'B',sortOrder:0}, {id:'a',name:'A',sortOrder:1}, {id:'c',name:'C',parentId:'a',sortOrder:0}];
+  const hs = [{id:'h1',name:'host1',groupId:'a',sortOrder:1}, {id:'h2',name:'host2',groupId:'a',sortOrder:0},
+    {id:'root',name:'root',sortOrder:0}, {id:'h3',name:'host3',groupId:'c',sortOrder:0}, {id:'new',name:'new',groupId:'a'}];
+  const snapshot = structuredClone({gs,hs});
+  const tree = build(gs,hs,{groupSort:'manual',hostSort:'manual'});
+  assert.deepEqual(tree.groups.map(g=>g.group.id), ['b','a']);
+  assert.deepEqual(flatten(tree).map(h=>h.id), ['h3','h2','h1','new','root']);
+  assert.deepEqual(scopes(tree,'host').find(s=>s.parentId==='a').ids,['h2','h1','new']);
+  assert.deepEqual(scopes(tree,'group').find(s=>s.parentId===null).ids,['b','a']);
+  assert.deepEqual(flatten(filter(tree,h=>['h1','h2','root'].includes(h.id))).map(h=>h.id),['h2','h1','root']);
+  assert.deepEqual({gs,hs},snapshot);
 });

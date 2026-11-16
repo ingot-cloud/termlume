@@ -26,24 +26,47 @@ struct LocalEnvelope {
     payload: Sealed,
 }
 
+// Version 2 binds manual ordering to the encrypted format. Older clients reject it
+// rather than silently dropping unknown ordering fields when rewriting a snapshot.
+fn document_version(plaintext: &[u8]) -> u32 {
+    // Deserialize only metadata: never duplicate credential strings into an unprotected Value.
+    #[derive(Default, Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    struct Position { sort_order: Option<u32> }
+    #[derive(Deserialize)]
+    struct Asset { value: Position }
+    #[derive(Default, Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    struct Row { sort_order: Option<u32>, asset: Option<Asset> }
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Document { hosts: Vec<Row>, groups: Vec<Position> }
+    let value = serde_json::from_slice::<Document>(plaintext).unwrap_or_default();
+    let ordered = value.groups.iter().any(|g| g.sort_order.is_some()) || value.hosts.iter().any(|h| {
+        h.sort_order.is_some() || h.asset.as_ref().is_some_and(|a| a.value.sort_order.is_some())
+    });
+    if ordered { 2 } else { 1 }
+}
+
 pub fn encode_local(key: &Key, value: &impl Serialize) -> Result<Vec<u8>, String> {
     let plaintext = Zeroizing::new(serde_json::to_vec(value).map_err(crate::error)?);
     if plaintext.len() > 5 * 1024 * 1024 {
         return Err("工作区数据超过大小上限。".into());
     }
+    let version = document_version(&plaintext);
     serde_json::to_vec(&LocalEnvelope {
         format: LOCAL_FORMAT.into(),
-        version: 1,
-        payload: seal(key, &plaintext, b"termlume-local-workspace:v1")?,
+        version,
+        payload: seal(key, &plaintext, format!("termlume-local-workspace:v{}", version).as_bytes())?,
     }).map_err(crate::error)
 }
 
 pub fn decode_local<T: DeserializeOwned>(key: &Key, bytes: &[u8]) -> Result<T, String> {
     let envelope: LocalEnvelope = serde_json::from_slice(bytes).map_err(crate::error)?;
-    if envelope.format != LOCAL_FORMAT || envelope.version != 1 {
+    if envelope.format != LOCAL_FORMAT || !matches!(envelope.version, 1 | 2) {
         return Err("本机工作区格式或版本无效。".into());
     }
-    let plaintext = open(key, &envelope.payload, b"termlume-local-workspace:v1")
+    let plaintext = open(key, &envelope.payload, format!("termlume-local-workspace:v{}", envelope.version).as_bytes())
         .map_err(|_| "无法解密本机工作区，数据或本机密钥已损坏。".to_string())?;
     serde_json::from_slice(&plaintext).map_err(crate::error)
 }
@@ -218,7 +241,7 @@ pub fn change_password(key: &Key, header: &Header, password: &str) -> Result<Hea
 
 impl Envelope {
     pub fn validate(&self, scope: &str) -> Result<(), String> {
-        if self.format != FORMAT || self.version != 1 || self.scope != scope {
+        if self.format != FORMAT || !matches!(self.version, 1 | 2) || self.scope != scope {
             return Err(INVALID.into());
         }
         Ok(())
@@ -260,7 +283,7 @@ impl Envelope {
 
     pub fn decode<T: DeserializeOwned>(&self, key: &Key, scope: &str) -> Result<T, String> {
         self.validate(scope)?;
-        let plaintext = open(key, &self.payload, &context(&self.header, scope)?)?;
+        let plaintext = open(key, &self.payload, &context(&self.header, scope, self.version)?)?;
         serde_json::from_slice(&plaintext).map_err(crate::error)
     }
 }
@@ -275,19 +298,20 @@ pub fn encode(
     if plaintext.len() > 5 * 1024 * 1024 {
         return Err("保险库数据超过大小上限。".into());
     }
+    let version = document_version(&plaintext);
     Ok(Envelope {
         format: FORMAT.into(),
-        version: 1,
+        version,
         scope: scope.into(),
         header: header.clone(),
-        payload: seal(key, &plaintext, &context(header, scope)?)?,
+        payload: seal(key, &plaintext, &context(header, scope, version)?)?,
     })
 }
 
-fn context(h: &Header, scope: &str) -> Result<Vec<u8>, String> {
+fn context(h: &Header, scope: &str, version: u32) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&(
         FORMAT,
-        1,
+        version,
         scope,
         h.id,
         &h.salt,

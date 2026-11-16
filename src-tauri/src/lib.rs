@@ -19,6 +19,7 @@ mod git;
 mod git_auto;
 mod git_https;
 mod imports;
+mod host_order;
 mod keys;
 mod platform;
 mod server_info;
@@ -423,6 +424,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             return Ok(json!({"count":export.hosts,"groupCount":export.groups}));
         }
         "preferences:get" => return assets::preferences_request(ws, Value::Null),
+        "hosts:reorder" => return host_order::request(ws, value),
         "preferences:fonts" => return blocking(|| Ok(json!(terminal_fonts::families()))).await,
         "preferences:save" => return assets::preferences_request(ws, value),
         "history:list" => return Ok(json!(ws.store.lock().unwrap().data()?.command_history)),
@@ -893,10 +895,14 @@ fn save_host(ws: &Workspace, mut request: Value) -> Result<Value, String> {
         assets::migrate_groups(&mut temporary);
         host.group_id = temporary.hosts.last().unwrap().group_id;
         data.groups = temporary.groups;
+        host_order::append_unordered(&mut data);
     }
     if let Some(id) = host.group_id {
         host.group = assets::group_path(&data, id)?;
     }
+    host.sort_order = if let Some(old) = previous.as_ref().filter(|old| old.group_id == host.group_id) {
+        old.sort_order
+    } else { host_order::next(&data, "host", host.group_id) };
     if host.inherit_identity || host.inherit_port {
         let mut probe = data.clone();
         probe.hosts.retain(|h| h.id != host.id);

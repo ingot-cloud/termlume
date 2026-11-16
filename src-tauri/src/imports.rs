@@ -464,6 +464,7 @@ pub fn import_records(data: &mut Data, value: &Value) -> Result<Value, String> {
             data.groups.push(Group {
                 id,
                 parent_id,
+                sort_order: crate::host_order::next(data, "group", parent_id),
                 identity_id: None,
                 ..group.clone()
             });
@@ -530,6 +531,7 @@ pub fn import_records(data: &mut Data, value: &Value) -> Result<Value, String> {
     }
     data.hosts.extend(pending);
     assets::migrate_groups(data);
+    crate::host_order::append_unordered(data);
     assets::validate_groups(data)?;
     let resolved = data.connection_hosts();
     for host in data.hosts.iter().skip(previous_hosts) {

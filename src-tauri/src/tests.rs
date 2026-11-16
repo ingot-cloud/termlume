@@ -3284,3 +3284,122 @@ async fn deleting_hosts_cleans_only_their_credentials_and_keeps_shared_logins() 
         .iter()
         .all(|token| store.read_secret(*token).is_err()));
 }
+
+#[tokio::test]
+async fn host_order_is_atomic_scoped_persistent_and_keeps_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let first = call(&ws, "hosts:save", json!({"name":"host2","address":"two.test","username":"ops","auth":"password","localPassword":"order-test-secret"})).await[0].clone();
+    call(&ws, "hosts:save", json!({"name":"host10","address":"ten.test","username":"ops","auth":"agent"})).await;
+    let before = call(&ws,"hosts:list",Value::Null).await;
+    let first_id = first["id"].clone();
+    let second_id = before[1]["id"].clone();
+    let expected = host_order::state(ws.store.lock().unwrap().data().unwrap(), "host");
+    let request = json!({"kind":"host","mode":"manual","expectedMode":"recent","expected":expected,"scopes":[{"parentId":null,"ids":[second_id,first_id]}]});
+    let result = call(&ws, "hosts:reorder", request.clone()).await;
+    assert_eq!(result["preferences"]["hostSort"], "manual");
+    assert_eq!(call(&ws,"hosts:reveal-password",first_id.clone()).await,"order-test-secret");
+    let file = profile.path().join("workspace.json");
+    let saved = std::fs::read(&file).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&saved).unwrap()["version"],2);
+    assert!(dispatch(&ws,"hosts:reorder",request).await.is_err(),"Stale ordering must not overwrite newer positions");
+    let expected = host_order::state(ws.store.lock().unwrap().data().unwrap(), "host");
+    for ids in [json!([first_id]), json!([first_id,first_id]), json!([first_id,Uuid::new_v4()])] {
+        assert!(dispatch(&ws,"hosts:reorder",json!({"kind":"host","mode":"manual","expectedMode":"manual","expected":expected,"scopes":[{"parentId":null,"ids":ids}]})).await.is_err());
+        assert_eq!(std::fs::read(&file).unwrap(),saved);
+    }
+    // General editing ignores stale/client-supplied positions and keeps the stored one.
+    let mut renamed = first;
+    renamed["name"] = json!("renamed"); renamed["sortOrder"] = json!(0);
+    call(&ws,"hosts:save",renamed).await;
+    assert_eq!(ws.store.lock().unwrap().data().unwrap().host(id(&first_id).unwrap()).unwrap().sort_order,Some(1));
+    call(&ws,"hosts:save",json!({"name":"new","address":"new.test","username":"ops","auth":"agent"})).await;
+    assert_eq!(call(&ws,"hosts:list",Value::Null).await[2]["sortOrder"],2);
+    let expected = host_order::state(ws.store.lock().unwrap().data().unwrap(), "host");
+    call(&ws,"hosts:reorder",json!({"kind":"host","mode":"name-desc","expectedMode":"manual","expected":expected,"scopes":[]})).await;
+    assert_eq!(ws.store.lock().unwrap().data().unwrap().host(id(&first_id).unwrap()).unwrap().sort_order,Some(1));
+    let preferences = call(&ws,"preferences:get",Value::Null).await;
+    let mut stale = preferences; stale["hostSort"] = json!("recent");
+    assert_eq!(call(&ws,"preferences:save",stale).await["hostSort"],"name-desc");
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(),home.path().into(),None).unwrap();
+    assert_eq!(call(&ws,"preferences:get",Value::Null).await["hostSort"],"name-desc");
+    assert_eq!(call(&ws,"hosts:reveal-password",first_id).await,"order-test-secret");
+}
+
+#[tokio::test]
+async fn host_order_groups_and_backups_reject_old_format_rewrites() {
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(), None);
+    let result = call(&ws,"groups:save",json!({"group":{"name":"A"}})).await;
+    let a = result["groups"][0]["id"].clone();
+    let result = call(&ws,"groups:save",json!({"group":{"name":"B"}})).await;
+    let b = result["groups"][1]["id"].clone();
+    let result = call(&ws,"groups:save",json!({"group":{"name":"child","parentId":a}})).await;
+    let child = result["groups"][2]["id"].clone();
+    let expected = host_order::state(ws.store.lock().unwrap().data().unwrap(),"group");
+    assert!(dispatch(&ws,"hosts:reorder",json!({"kind":"group","mode":"manual","expectedMode":"name-asc","expected":expected,"scopes":[{"parentId":null,"ids":[a,child,b]}]})).await.is_err());
+    call(&ws,"hosts:reorder",json!({"kind":"group","mode":"manual","expectedMode":"name-asc","expected":expected,"scopes":[{"parentId":null,"ids":[b,a]},{"parentId":a,"ids":[child]}]})).await;
+    call(&ws,"groups:save",json!({"group":{"name":"C"}})).await;
+    let data = ws.store.lock().unwrap().data().unwrap().clone();
+    assert_eq!(data.groups.last().unwrap().sort_order,Some(2));
+    let mut restored = Data::default();
+    restored.apply(store::portable_rows(data.snapshot()).unwrap(),None);
+    assert_eq!(host_order::state(&restored,"group"),host_order::state(&data,"group"));
+    assert_eq!(restored.preferences.group_sort,"name-asc","Display preference is local");
+    let (key, header) = vault::create("ordering password", &vault::recovery_code()).unwrap();
+    for (scope,value) in [("local",json!(data)),("portable",json!({"hosts":data.snapshot()}))] {
+        let envelope = vault::encode(&key,&header,scope,&value).unwrap();
+        let mut serialized = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(serialized["version"],2);
+        assert_eq!(envelope.decode::<Value>(&key,scope).unwrap(),value);
+        serialized["version"] = json!(1);
+        let tampered: vault::Envelope = serde_json::from_value(serialized).unwrap();
+        assert!(tampered.decode::<Value>(&key,scope).is_err(),"Version is authenticated");
+    }
+    let legacy = vault::encode(&key,&header,"local",&Data::default()).unwrap();
+    assert_eq!(serde_json::to_value(legacy).unwrap()["version"],1);
+    let mut local: Value = serde_json::from_slice(&vault::encode_local(&key,&data).unwrap()).unwrap();
+    assert_eq!(local["version"],2);
+    local["version"] = json!(1);
+    assert!(vault::decode_local::<Data>(&key,&serde_json::to_vec(&local).unwrap()).is_err());
+}
+
+#[tokio::test]
+async fn host_order_failed_write_does_not_change_memory() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(),None);
+    call(&ws,"hosts:save",json!({"address":"atomic.test","username":"ops","auth":"agent"})).await;
+    let expected = host_order::state(ws.store.lock().unwrap().data().unwrap(),"host");
+    let file = profile.path().join("workspace.json");
+    let saved = profile.path().join("saved-workspace");
+    std::fs::rename(&file,&saved).unwrap(); std::fs::create_dir(&file).unwrap();
+    assert!(dispatch(&ws,"hosts:reorder",json!({"kind":"host","mode":"name-asc","expectedMode":"recent","expected":expected,"scopes":[]})).await.is_err());
+    assert_eq!(ws.store.lock().unwrap().data().unwrap().preferences.host_sort,"recent");
+    std::fs::remove_dir(&file).unwrap(); std::fs::rename(saved,file).unwrap();
+}
+
+#[tokio::test]
+async fn host_order_import_and_group_removal_append_without_losing_positions() {
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(),None);
+    let result = call(&ws,"groups:save",json!({"group":{"name":"ordered"}})).await;
+    let group_id = result["groups"][0]["id"].clone();
+    call(&ws,"hosts:save",json!({"name":"A","address":"a.test","username":"ops","auth":"agent","groupId":group_id})).await;
+    call(&ws,"hosts:save",json!({"name":"B","address":"b.test","username":"ops","auth":"agent","groupId":group_id})).await;
+    let hosts = call(&ws,"hosts:list",Value::Null).await;
+    let a = hosts[0]["id"].clone(); let b = hosts[1]["id"].clone();
+    let expected = host_order::state(ws.store.lock().unwrap().data().unwrap(),"host");
+    call(&ws,"hosts:reorder",json!({"kind":"host","mode":"manual","expectedMode":"recent","expected":expected,"scopes":[{"parentId":group_id,"ids":[b,a]}]})).await;
+    call(&ws,"hosts:save",json!({"name":"root","address":"root.test","username":"ops","auth":"agent"})).await;
+    let imported_group = Uuid::new_v4();
+    call(&ws,"hosts:import",json!({"groups":[{"id":imported_group,"name":"ordered","sortOrder":0}],"rows":[{"name":"imported","address":"imported.test","username":"ops","auth":"agent","groupId":imported_group}]})).await;
+    let result = call(&ws,"hosts:list",Value::Null).await;
+    assert_eq!(result.as_array().unwrap().iter().find(|h|h["name"]=="imported").unwrap()["sortOrder"],2);
+    let groups = call(&ws,"groups:list",Value::Null).await;
+    call(&ws,"groups:delete",json!({"group":groups[0],"expected":groups[0],"expectedGroups":groups})).await;
+    let mut hosts = ws.store.lock().unwrap().data().unwrap().hosts.clone();
+    hosts.sort_by_key(|h|h.sort_order);
+    assert_eq!(hosts.iter().map(|h|h.name.as_str()).collect::<Vec<_>>(),vec!["root","B","A","imported"]);
+    assert!(hosts.iter().all(|h|h.group_id.is_none()));
+}

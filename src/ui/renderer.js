@@ -31,6 +31,9 @@ let currentGroup = '';
 let selectedGroup = '';
 let selectedHostId = '';
 let hostMenu;
+let hostSortBusy = false;
+let hostDrag, hostDragFrame;
+let suppressHostOrderClickUntil = 0;
 let active;
 let splitLayout;
 const splitGroups = new Map();
@@ -436,9 +439,10 @@ async function confirm(title, text, submit) {
 
 async function refreshHosts() {
   if(api.groups) groupAssets=await api.groups.list();
-  const [result, timestamps] = await Promise.all([api.hosts.list(), api.hosts.recent()]);
+  const [result, timestamps, preferences] = await Promise.all([api.hosts.list(), api.hosts.recent(), api.preferences?.get()]);
   if (vaultStatus.locked) return;
   hosts = result;
+  if (preferences) uiPreferences = preferences;
   hostsLoaded = true;
   for (const [id, time] of Object.entries(timestamps)) recent.set(id, time);
   renderHosts();
@@ -721,7 +725,7 @@ function conflictDescription(host) {
     const {id,name,recordType,passwordSaved,...details}=host;
     return `${name} · ${recordType}${passwordSaved?' · 含已保存密码':''}\n${JSON.stringify(details,null,2)}`;
   }
-  return `${host.name} · ${endpoint(host)} · ${host.auth}${host.group ? ` · ${host.group}` : ''}${host.passwordSaved ? ' · 含已保存密码' : ''}`;
+  return `${host.name} · ${endpoint(host)} · ${host.auth}${host.group ? ` · ${host.group}` : ''}${host.passwordSaved ? ' · 含已保存密码' : ''}${host.sortOrder != null ? ` · 手动位置 ${host.sortOrder + 1}` : ''}`;
 }
 
 async function syncVault(mode) {
@@ -2645,7 +2649,7 @@ async function deleteHostGroup(group) {
 
 function groupActions(group) {
   const more = button('⋯', () => showActionMenu(`${group.path} 的操作`, more,
-    [button('删除分组', () => deleteHostGroup(group), 'danger')]), 'host-edit', `分组操作 ${group.path}`);
+    [...hostOrderActions('group', group), button('删除分组', () => deleteHostGroup(group), 'danger')]), 'host-edit', `分组操作 ${group.path}`);
   more.setAttribute('aria-haspopup', 'menu');
   more.setAttribute('aria-expanded', 'false');
   return more;
@@ -2702,6 +2706,7 @@ function groupTree(tree, expanded, options) {
       }
       const row = node('div', 'host-row group-row tree-group-row', toggle);
       row.style.marginInlineStart = `${Math.min(depth, 8) * 16}px`;
+      if (options.hostRow) decorateHostOrder(row, 'group', g);
       if (options.actions) row.append(options.actions(g));
       const item = node('li', 'tree-item', row, content);
       item.dataset.treeGroup = g.id;
@@ -2740,7 +2745,7 @@ function groupTree(tree, expanded, options) {
 }
 
 function renderHostTree(matching, query, tag, draft) {
-  let tree = window.hostTree.build(groupAssets, [...hosts].sort(recentFirst));
+  let tree = orderedHostTree();
   const key = JSON.stringify([query, tag]);
   const searching = Boolean(query || tag);
   if (searching) {
@@ -2791,7 +2796,9 @@ function groupCard(group, count) {
   });
   card.addEventListener('dblclick', () => openGroup(group));
   const asset = groupAssets.find(g => g.path === group);
-  return node('div', 'host-row group-row', card, ...(api.groups && asset ? [groupActions(asset)] : []));
+  const row = node('div', 'host-row group-row', card, ...(api.groups && asset ? [groupActions(asset)] : []));
+  if (asset) decorateHostOrder(row, 'group', asset);
+  return row;
 }
 
 function hostCard(host) {
@@ -2814,6 +2821,7 @@ function hostCard(host) {
   more.setAttribute('aria-haspopup', 'menu');
   more.setAttribute('aria-expanded', 'false');
   const row = node('div', 'host-row', open, edit, more);
+  decorateHostOrder(row, 'host', host);
   row.addEventListener('contextmenu', (event) => {
     event.preventDefault();
     openHostMenu(host, more, event.clientX || undefined, event.clientY || undefined);
@@ -2857,7 +2865,7 @@ function openHostMenu(host, anchor, x, y) {
     ...(api.hosts.csvExport ? [['导出主机 CSV', () => exportHosts({ hostId: host.id })]] : []),
     ['删除主机', () => deleteHost(host), 'danger']
   ];
-  showActionMenu(`${host.name} 的操作`, anchor, actions.map(([label, run, style]) => button(label, run, style)), x, y);
+  showActionMenu(`${host.name} 的操作`, anchor, [...actions.map(([label, run, style]) => button(label, run, style)), ...hostOrderActions('host', host)], x, y);
 }
 
 function menuButton(label, actions) {
@@ -2876,8 +2884,10 @@ function showActionMenu(label, anchor, actions, x, y) {
   panel.setAttribute('role', 'menu');
   panel.setAttribute('aria-label', label);
   for (const action of actions) {
-    action.setAttribute('role', 'menuitem');
-    action.addEventListener('click', () => closeHostMenu(true), { capture: true, once: true });
+    if (action.tagName === 'BUTTON') {
+      if (!action.hasAttribute('role')) action.setAttribute('role', 'menuitem');
+      action.addEventListener('click', () => closeHostMenu(true), { capture: true, once: true });
+    }
     panel.append(action);
   }
   document.body.append(panel);
@@ -2913,12 +2923,215 @@ function hostMatches(host, query, target) {
     matchesQuery(query, host.name, endpoint(host), host.group, host.tags, host.note);
 }
 
+function orderedHostTree(overrides = {}) {
+  return window.hostTree.build(groupAssets, hosts, { groupSort: uiPreferences.groupSort || 'name-asc', hostSort: uiPreferences.hostSort || 'recent', recent, ...overrides });
+}
+
+function hostOrderState(kind) {
+  return (kind === 'group' ? groupAssets : hosts).map(item => ({ id: item.id,
+    parentId: kind === 'group' ? item.parentId || null : item.groupId || groupAssets.find(g => g.path === item.group)?.id || null,
+    sortOrder: item.sortOrder ?? null })).sort((a,b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+function hostOrderFiltered() { return Boolean($('host-search').value.trim() || $('tag-filter').value); }
+function hostSortMode(kind) { return kind === 'group' ? uiPreferences.groupSort || 'name-asc' : uiPreferences.hostSort || 'recent'; }
+
+async function saveHostOrder(kind, mode, scopes = [], expected = hostOrderState(kind), expectedMode = hostSortMode(kind)) {
+  if (hostSortBusy || vaultStatus.locked) return;
+  hostSortBusy = true;
+  $('host-sort').disabled = true;
+  const scroll = $('host-library').scrollTop;
+  const focusedId = document.activeElement?.closest('[data-order-id]')?.dataset.orderId;
+  try {
+    const result = await api.hosts.reorder({ kind, mode, scopes, expected, expectedMode });
+    if (vaultStatus.locked) return;
+    hosts = result.hosts; groupAssets = result.groups; uiPreferences = result.preferences;
+    status('已保存排序。');
+  } catch (error) {
+    await refreshHosts().catch(() => {});
+    status(message(error));
+  } finally {
+    hostSortBusy = false;
+    renderHosts();
+    $('host-library').scrollTop = scroll;
+    if (focusedId) [...$('host-list').querySelectorAll('.host-order-handle')].find(handle => handle.parentElement.dataset.orderId === focusedId)?.focus({preventScroll:true});
+  }
+}
+
+function showHostSortMenu(anchor) {
+  const actions = [];
+  for (const [kind, label] of [['group', '分组排序'], ['host', '主机排序']]) {
+    actions.push(node('div', 'sort-menu-label', label));
+    for (const [mode, text] of [...(kind === 'host' ? [['recent','最近连接']] : []), ['name-asc','名称升序'], ['name-desc','名称降序'], ['manual','自定义']]) {
+      const choice = button(text, () => {
+        if (mode === hostSortMode(kind)) return;
+        let scopes = [];
+        if (mode === 'manual') {
+          const entries = kind === 'group' ? groupAssets : hosts;
+          const sourceMode = entries.some(item => item.sortOrder != null) ? 'manual' : hostSortMode(kind);
+          scopes = window.hostTree.scopes(orderedHostTree({ [kind === 'group' ? 'groupSort' : 'hostSort']: sourceMode }), kind);
+        }
+        return saveHostOrder(kind, mode, scopes);
+      });
+      choice.setAttribute('role', 'menuitemradio');
+      choice.setAttribute('aria-checked', String(mode === hostSortMode(kind)));
+      choice.disabled = hostSortBusy;
+      actions.push(choice);
+    }
+  }
+  actions.push(node('p', 'sort-menu-help muted', hostOrderFiltered() ? '清除搜索和标签筛选后可调整顺序。' : '自定义模式下，拖动手柄或使用操作菜单调整同级顺序。'));
+  actions.push(node('p', 'sort-menu-help muted', '手动顺序随备份和 Git 同步；同一保险库的设备需使用支持排序的版本。'));
+  showActionMenu('主机与分组排序', anchor, actions);
+}
+
+function hostOrderScope(kind, item) {
+  const parentId = kind === 'group' ? item.parentId || null : item.groupId || groupAssets.find(g => g.path === item.group)?.id || null;
+  return window.hostTree.scopes(orderedHostTree(), kind).find(scope => scope.parentId === parentId);
+}
+
+function moveHostOrder(kind, item, position) {
+  const scope = hostOrderScope(kind, item);
+  if (!scope || hostOrderFiltered() || hostSortMode(kind) !== 'manual') return;
+  const ids = scope.ids.filter(id => id !== item.id);
+  ids.splice(Math.max(0, Math.min(ids.length, position)), 0, item.id);
+  if (ids.every((id,index) => id === scope.ids[index])) return Promise.resolve();
+  return saveHostOrder(kind, 'manual', [{ ...scope, ids }]).then(() => {
+    [...$('host-list').querySelectorAll('.host-order-handle')].find(handle => handle.parentElement.dataset.orderId === item.id)?.focus({ preventScroll:true });
+  });
+}
+
+function hostOrderActions(kind, item) {
+  if (!api.hosts.reorder || hostSortMode(kind) !== 'manual' || hostOrderFiltered()) return [];
+  const scope = hostOrderScope(kind, item);
+  if (!scope || scope.ids.length < 2) return [];
+  const index = scope.ids.indexOf(item.id), last = scope.ids.length - 1;
+  return [['上移',index-1,index===0], ['下移',index+1,index===last], ['移到最前',0,index===0], ['移到最后',last,index===last]].map(([label, position, disabled]) => {
+    const action = button(label, () => moveHostOrder(kind, item, position));
+    action.disabled = disabled || hostSortBusy;
+    return action;
+  });
+}
+
+function decorateHostOrder(row, kind, item) {
+  row.dataset.orderKind = kind; row.dataset.orderId = item.id;
+  row.dataset.orderParent = (kind === 'group' ? item.parentId : item.groupId || groupAssets.find(g => g.path === item.group)?.id) || '';
+  if (!api.hosts.reorder || hostSortMode(kind) !== 'manual') return;
+  const handle = button('⠿', () => {
+    const actions = hostOrderActions(kind, item);
+    if (actions.length) showActionMenu(`调整${item.name}的顺序`, handle, actions);
+  }, 'host-order-handle', `调整${kind === 'group' ? '分组' : '主机'}顺序 ${item.name}`);
+  handle.title = hostOrderFiltered() ? '清除搜索和标签筛选后可调整顺序' : '拖动调整同级顺序；Alt + ↑ / ↓ 移动';
+  handle.disabled = hostSortBusy || hostOrderFiltered();
+  handle.setAttribute('aria-haspopup', 'menu'); handle.setAttribute('aria-expanded','false');
+  handle.addEventListener('keydown', event => {
+    if (!event.altKey || !['ArrowUp','ArrowDown'].includes(event.key)) return;
+    event.preventDefault(); event.stopPropagation();
+    const scope = hostOrderScope(kind, item);
+    void moveHostOrder(kind, item, scope.ids.indexOf(item.id) + (event.key === 'ArrowUp' ? -1 : 1));
+  });
+  handle.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || handle.disabled || dialog.open || vaultStatus.locked) return;
+    cancelHostDrag(); closeHostMenu();
+    const scope = hostOrderScope(kind, item);
+    if (!scope || scope.ids.length < 2) return;
+    hostDrag = { kind, item, scope, source:row, handle, pointerId:event.pointerId, x:event.clientX, y:event.clientY,
+      startX:event.clientX, startY:event.clientY, expected:hostOrderState(kind), expectedMode:hostSortMode(kind) };
+    handle.setPointerCapture(event.pointerId);
+  });
+  handle.addEventListener('lostpointercapture', () => { if (hostDrag?.handle === handle) cancelHostDrag(); });
+  row.prepend(handle);
+}
+
+const hostOrderMarker = node('div','host-order-marker');
+const hostOrderGhost = node('div','host-order-ghost');
+hostOrderMarker.hidden = hostOrderGhost.hidden = true;
+document.body.append(hostOrderMarker, hostOrderGhost);
+
+function cancelHostDrag() {
+  if (!hostDrag) return;
+  const drag = hostDrag; hostDrag = undefined;
+  if (drag.started) suppressHostOrderClickUntil = performance.now() + 250;
+  cancelAnimationFrame(hostDragFrame); hostDragFrame = undefined;
+  drag.source.classList.remove('host-order-source');
+  if (drag.handle.hasPointerCapture(drag.pointerId)) drag.handle.releasePointerCapture(drag.pointerId);
+  document.body.classList.remove('host-order-drag-active');
+  hostOrderMarker.hidden = hostOrderGhost.hidden = true;
+}
+
+function updateHostDrag() {
+  const drag = hostDrag;
+  if (!drag?.started) return;
+  if (vaultStatus.locked || dialog.open || !$('hosts').getClientRects().length) { cancelHostDrag(); return; }
+  const hit = document.elementFromPoint(drag.x, drag.y)?.closest('.host-row');
+  drag.ids = undefined;
+  hostOrderMarker.hidden = true;
+  hostOrderGhost.textContent = drag.item.name;
+  hostOrderGhost.hidden = false;
+  hostOrderGhost.style.left = `${Math.min(drag.x + 12, innerWidth - hostOrderGhost.offsetWidth - 8)}px`;
+  hostOrderGhost.style.top = `${Math.min(drag.y + 12, innerHeight - 36)}px`;
+  if (!hit || hit.dataset.orderKind !== drag.kind || hit.dataset.orderParent !== drag.source.dataset.orderParent || hit === drag.source) return;
+  const rect = hit.getBoundingClientRect(), cards = workspace.dataset.hostLayout === 'cards';
+  const before = cards ? drag.x < rect.left + rect.width / 2 : drag.y < rect.top + rect.height / 2;
+  const ids = drag.scope.ids.filter(id => id !== drag.item.id);
+  const index = ids.indexOf(hit.dataset.orderId);
+  if (index < 0) return;
+  ids.splice(index + (before ? 0 : 1), 0, drag.item.id); drag.ids = ids;
+  Object.assign(hostOrderMarker.style, cards
+    ? {left:`${(before ? rect.left : rect.right)-2}px`,top:`${rect.top}px`,width:'3px',height:`${rect.height}px`}
+    : {left:`${rect.left}px`,top:`${(before ? rect.top : rect.bottom)-2}px`,width:`${rect.width}px`,height:'3px'});
+  hostOrderMarker.hidden = false;
+}
+
+function scrollHostDrag() {
+  if (!hostDrag?.started) return;
+  const library = $('host-library'), rect = library.getBoundingClientRect();
+  if (hostDrag.x >= rect.left && hostDrag.x <= rect.right) {
+    const delta = hostDrag.y < rect.top + 36 ? -10 : hostDrag.y > rect.bottom - 36 ? 10 : 0;
+    if (delta) { library.scrollTop += delta; updateHostDrag(); }
+  }
+  hostDragFrame = requestAnimationFrame(scrollHostDrag);
+}
+window.addEventListener('pointermove', event => {
+  const drag = hostDrag;
+  if (!drag || event.pointerId !== drag.pointerId) return;
+  drag.x = event.clientX; drag.y = event.clientY;
+  if (!drag.started && Math.hypot(drag.x-drag.startX, drag.y-drag.startY) >= 6) {
+    drag.started = true; drag.source.classList.add('host-order-source');
+    document.body.classList.add('host-order-drag-active');
+    scrollHostDrag();
+  }
+  updateHostDrag();
+});
+function finishHostDrag(event) {
+  const drag = hostDrag;
+  if (!drag || event.pointerId != null && event.pointerId !== drag.pointerId) return;
+  if (drag.started) { event.preventDefault(); event.stopPropagation(); }
+  cancelHostDrag();
+  if (drag.started && drag.ids && drag.ids.some((id,index) => id !== drag.scope.ids[index])) {
+    void saveHostOrder(drag.kind, 'manual', [{...drag.scope,ids:drag.ids}], drag.expected, drag.expectedMode);
+  }
+}
+window.addEventListener('pointerup', finishHostDrag, true);
+// WKWebView can deliver mouseup without pointerup when the pointer crosses native surfaces.
+window.addEventListener('mouseup', event => { if (hostDrag?.started) finishHostDrag(event); }, true);
+document.addEventListener('click', event => {
+  if (performance.now() < suppressHostOrderClickUntil && event.target.closest('.host-order-handle')) { event.preventDefault(); event.stopPropagation(); }
+}, true);
+window.addEventListener('pointercancel', cancelHostDrag);
+window.addEventListener('blur', cancelHostDrag);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && hostDrag) { event.preventDefault(); event.stopPropagation(); cancelHostDrag(); }
+}, true);
+
 function recentFirst(a, b) {
   return (recent.get(b.id) || 0) - (recent.get(a.id) || 0) || a.name.localeCompare(b.name, 'zh-CN');
 }
 
 function renderHosts() {
+  cancelHostDrag();
   closeHostMenu();
+  $('host-sort').hidden = !api.hosts.reorder;
+  $('host-sort').disabled = hostSortBusy;
   const treeLayout = workspace.dataset.hostLayout === 'tree';
   const groups = new Map(groupAssets.map(g=>[g.path,0]));
   for (const host of hosts) {
@@ -2950,7 +3163,11 @@ function renderHosts() {
   const matching = scope.filter((host) => (!tag || host.tags?.includes(tag)) && hostMatches(host, query, target));
   const visibleHosts = treeLayout || currentGroup || searching ? matching : matching.filter((host) => !host.group);
   if (!visibleHosts.some((host) => host.id === selectedHostId)) selectedHostId = '';
-  visibleHosts.sort(recentFirst);
+  const ordered = orderedHostTree();
+  const groupPositions = new Map(window.hostTree.flattenGroups(ordered).map((g,index) => [g.id,index]));
+  const positions = new Map(window.hostTree.flatten(ordered).map((h, index) => [h.id, index]));
+  const hostSort = uiPreferences.hostSort || 'recent';
+  visibleHosts.sort(hostSort === 'manual' ? (a,b) => positions.get(a.id) - positions.get(b.id) : window.hostTree.compare(hostSort, recent));
   const matchingGroups = new Set(matching.map((host) => host.group));
   const visibleGroups = [...groups]
     .filter(([group]) => {
@@ -2959,7 +3176,10 @@ function renderHosts() {
       if (currentGroup && parent !== currentGroup) return false;
       return searching ? matchingGroups.has(group) || group.toLowerCase().includes(query) : parent === currentGroup;
     })
-    .sort(([a], [b]) => a.localeCompare(b, 'zh-CN'));
+    .sort(([a], [b]) => {
+      const first = groupAssets.find(g=>g.path===a) || {id:a,name:a}, second = groupAssets.find(g=>g.path===b) || {id:b,name:b};
+      return uiPreferences.groupSort === 'manual' ? groupPositions.get(first.id) - groupPositions.get(second.id) : window.hostTree.compare(uiPreferences.groupSort)(first,second);
+    });
   if (!visibleGroups.some(([group]) => group === selectedGroup)) selectedGroup = '';
   $('host-breadcrumb').hidden = treeLayout || !currentGroup;
   $('current-group').textContent = $('current-group').title = currentGroup;
@@ -5345,6 +5565,7 @@ for (const type of ['pointerdown', 'keydown', 'wheel']) {
   }, { passive: true });
 }
 $('add-host').addEventListener('click', () => editHost().catch((error) => status(message(error))));
+$('host-sort').addEventListener('click', () => showHostSortMenu($('host-sort')));
 const hostLayout = $('host-layout');
 try { const saved = localStorage.getItem('host-layout'); if (['cards', 'rows', 'tree'].includes(saved)) hostLayout.value = saved; } catch { /* Card view is the default. */ }
 workspace.dataset.hostLayout = hostLayout.value;
