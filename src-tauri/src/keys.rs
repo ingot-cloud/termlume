@@ -1,7 +1,7 @@
 use regex::Regex;
 use russh::keys::{
     agent::client::AgentClient,
-    ssh_key::{private::Ed25519Keypair, LineEnding},
+    ssh_key::{private::{EcdsaKeypair, Ed25519Keypair, RsaKeypair}, EcdsaCurve, LineEnding},
     HashAlg, PrivateKey, PublicKey,
 };
 use serde_json::{json, Value};
@@ -66,6 +66,27 @@ pub async fn agent_keys() -> Value {
         }
     }
     json!({"available": false, "keys": []})
+}
+
+pub fn read_private_key(path: &Path, passphrase: &str) -> Result<PrivateKey, String> {
+    let bytes = Zeroizing::new(bounded_read(path, 256 * 1024)?);
+    let text = std::str::from_utf8(&bytes).map_err(error)?;
+    russh::keys::decode_secret_key(text, (!passphrase.is_empty()).then_some(passphrase))
+        .map_err(|_| "无法读取或解锁私钥，请检查文件与口令。".into())
+}
+
+pub async fn add_to_agent(key: &PrivateKey) -> Result<Value, String> {
+    #[cfg(any(unix, windows))]
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut agent = agent().await?;
+            agent.add_identity(key, &[]).await
+                .map_err(|_| "SSH Agent 拒绝加载密钥，请检查 Agent 状态或解锁后重试。".to_owned())?;
+            Ok(json!({"fingerprint": key.public_key().fingerprint(HashAlg::Sha256).to_string()}))
+        }).await.map_err(|_| "SSH Agent 加载密钥超时。".to_owned())?
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err("当前平台不支持 SSH Agent。".into())
 }
 
 fn info(key: &PublicKey, name: &str, path: &str, private: bool, encrypted: bool) -> Value {
@@ -147,17 +168,70 @@ pub fn scan(directory: &Path) -> Result<Value, String> {
     Ok(json!({"directory": directory, "keys": keys}))
 }
 
-pub fn generate(directory: &Path, name: &str, passphrase: &str) -> Result<Value, String> {
+fn validate_name(name: &str) -> Result<(), String> {
     static NAME: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^[\p{L}\p{N}_][\p{L}\p{N}_. -]{0,79}$").unwrap());
     if !NAME.is_match(name) || name.ends_with(".pub") {
         return Err("请输入有效的密钥文件名。".into());
     }
+    Ok(())
+}
+
+pub fn create(directory: &Path, name: &str, private_text: &str, public_text: &str, passphrase: &str) -> Result<Value, String> {
+    validate_name(name)?;
+    if private_text.len() > 256 * 1024 || private_text.contains('\0') || public_text.len() > 32768 || passphrase.len() > 4096 {
+        return Err("密钥内容或口令格式无效。".into());
+    }
+    let private_text = Zeroizing::new(private_text.trim().replace("\r\n", "\n"));
+    let key = russh::keys::decode_secret_key(&private_text, (!passphrase.is_empty()).then_some(passphrase))
+        .map_err(|_| "无法读取私钥，请检查内容；加密私钥需要填写正确口令。".to_owned())?;
+    if !public_text.trim().is_empty() {
+        let public = PublicKey::from_openssh(public_text.trim()).map_err(|_| "公钥格式无效，请填写 OpenSSH 公钥。".to_owned())?;
+        if public.fingerprint(HashAlg::Sha256) != key.public_key().fingerprint(HashAlg::Sha256) {
+            return Err("公钥与私钥不匹配。".into());
+        }
+    }
+    let encrypted = PrivateKey::from_openssh(&*private_text).is_ok_and(|raw| raw.is_encrypted())
+        || private_text.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----") || private_text.contains("Proc-Type: 4,ENCRYPTED");
+    let file = directory.join(name);
+    let public_path = directory.join(format!("{name}.pub"));
+    let pem = Zeroizing::new(format!("{}\n", &*private_text));
+    let public = format!("{}\n", key.public_key().to_openssh().map_err(error)?);
+    let write_error = |err: std::io::Error| if err.kind() == std::io::ErrorKind::AlreadyExists {
+        "已有同名私钥或公钥，请换一个名称。".to_owned()
+    } else { error(err) };
+    write_exclusive(&file, pem.as_bytes(), 0o600).map_err(write_error)?;
+    if let Err(err) = write_exclusive(&public_path, public.as_bytes(), 0o644) {
+        let _ = std::fs::remove_file(&file);
+        return Err(write_error(err));
+    }
+    Ok(info(key.public_key(), name, &file.to_string_lossy(), true, encrypted))
+}
+
+pub fn generate(directory: &Path, name: &str, passphrase: &str, algorithm: &str, bits: Option<u64>) -> Result<Value, String> {
+    validate_name(name)?;
     if passphrase.len() > 1024 || passphrase.contains(['\0', '\r', '\n']) {
         return Err("私钥口令格式无效。".into());
     }
-    let seed = Zeroizing::new(rand::random::<[u8; 32]>());
-    let key = PrivateKey::new(Ed25519Keypair::from_seed(&seed).into(), name).map_err(error)?;
+    let data = match (algorithm, bits) {
+        ("ed25519", None) => {
+            let seed = Zeroizing::new(rand::random::<[u8; 32]>());
+            Ed25519Keypair::from_seed(&seed).into()
+        }
+        ("rsa", None | Some(2048 | 3072 | 4096)) => {
+            RsaKeypair::random(&mut rand::rng(), bits.unwrap_or(3072) as usize).map_err(error)?.into()
+        }
+        ("ecdsa", None | Some(256 | 384 | 521)) => {
+            let curve = match bits.unwrap_or(256) {
+                384 => EcdsaCurve::NistP384,
+                521 => EcdsaCurve::NistP521,
+                _ => EcdsaCurve::NistP256,
+            };
+            EcdsaKeypair::random(&mut rand::rng(), curve).map_err(error)?.into()
+        }
+        _ => return Err("密钥类型或位数无效。".into()),
+    };
+    let key = PrivateKey::new(data, name).map_err(error)?;
     let file = directory.join(name);
     let public_path = directory.join(format!("{name}.pub"));
     let public = format!("{}\n", key.public_key().to_openssh().map_err(error)?);

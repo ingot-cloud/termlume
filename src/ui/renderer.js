@@ -4,6 +4,16 @@ const api = window.termlume;
 const terminalPaths = window.terminalPaths;
 const keyboard = window.keyboardShortcuts;
 document.documentElement.dataset.platform = keyboard.isMac ? 'macos' : 'other';
+// Pointer focus should not resemble a selected resource. Show a focus ring only
+// when the user navigates with the keyboard, including newly opened dialogs.
+document.documentElement.dataset.focusMode = 'pointer';
+document.addEventListener('pointerdown', () => { document.documentElement.dataset.focusMode = 'pointer'; }, true);
+document.addEventListener('keydown', event => {
+  const editing = event.target.closest?.('input, textarea, [contenteditable]');
+  if (event.key === 'Tab' || (!editing && ['Enter', ' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key))) {
+    document.documentElement.dataset.focusMode = 'keyboard';
+  }
+}, true);
 keyboard.hints(document);
 const { selectControl, editableControl, close: closeDropdown } = window.dropdowns;
 const $ = (id) => document.getElementById(id);
@@ -36,6 +46,7 @@ let hostSortBusy = false;
 let hostDrag, hostDragFrame;
 let suppressHostOrderClickUntil = 0;
 let active;
+let closingAllTabs = false;
 let splitLayout;
 const splitGroups = new Map();
 let tabHoverTimer;
@@ -209,10 +220,20 @@ function chromeIcon(kind) {
   path.setAttribute('d', {
     key: 'M15.5 13.5a5 5 0 1 0-5-5 5 5 0 0 0 .5 2.2L4 17.7V21h3.3l1.5-1.5V17h2.5l2.5-2.5m3.6-7.2h.01',
     lock: 'M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3',
+    user: 'M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM4 21v-2a8 8 0 0 1 16 0v2',
+    eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0z',
+    'eye-off': 'M3 3l18 18M10.6 5.1A12 12 0 0 1 12 5c6.5 0 10 7 10 7a22 22 0 0 1-3.3 4.3M6.2 6.2A23 23 0 0 0 2 12s3.5 7 10 7a12 12 0 0 0 5.8-1.8M10 10a3 3 0 0 0 4 4',
     save: 'M5 3h12l4 4v14H3V3h2m2 0v7h10V3M7 21v-7h10v7',
     file: 'M6 3h8l4 4v14H6zM14 3v5h4m-9 5h6m-6 4h6',
+    import: 'M12 3v12m-4-4 4 4 4-4M4 15v6h16v-6',
+    export: 'M12 16V4m-4 4 4-4 4 4M4 15v6h16v-6',
     folder: 'M3 6h7l2 2h9v11H3z',
     group: 'M3 5h8v8H3zm10 6h8v8h-8zM15 5h6v3m-12 11H3v-3',
+    tag: 'M3 3h8l10 10-8 8L3 11zM7.5 7.5h.01',
+    sort: 'M7 4v16m-4-4 4 4 4-4M13 5h8m-8 6h6m-6 6h4',
+    cards: 'M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 0h7v7h-7z',
+    rows: 'M3 5h3m4 0h11M3 12h3m4 0h11M3 19h3m4 0h11',
+    tree: 'M4 3v14h6M4 7h6M11 3h9v7h-9zm0 11h9v7h-9z',
     server: 'M3 4h18v7H3zm0 9h18v7H3zM7 7.5h.01M7 16.5h.01m4-9h6m-6 9h6',
     'new-tab': 'M4 4h16v16H4zM12 8v8m-4-4h8',
     terminal: 'M3 5h18v14H3zM7 9l3 3-3 3m6 0h4',
@@ -258,8 +279,7 @@ function leaveSettings() {
   $('settings-page').replaceChildren();
 }
 
-function openSettings(section = settingsSection, session = origin()) {
-  if (vaultStatus.locked) return;
+function beginSettings(section, session) {
   leaveSettings();
   settingsSection = section;
   const page = { active: true, section, session };
@@ -269,6 +289,12 @@ function openSettings(section = settingsSection, session = origin()) {
     if (control.dataset.section === section) control.setAttribute('aria-current', 'page');
     else control.removeAttribute('aria-current');
   }
+  return page;
+}
+
+function openSettings(section = settingsSection, session = origin()) {
+  if (vaultStatus.locked) return;
+  const page = beginSettings(section, session);
   const render = { preferences: () => editPreferences(page), groups: () => manageGroups(page),
     identities: () => manageIdentities(page), snippets: () => manageSnippets(session, page),
     layouts: () => manageLayouts(page), logs: () => manageLogs(page), trust: () => manageTrust(page),
@@ -305,7 +331,7 @@ function promptSettings(page, title, fields, submit, onSubmit, extra, options) {
     const actions = node('div', 'settings-actions', ...extra);
     if (!overview) {
       const save = node('button', 'primary', submit); save.type = 'submit';
-      const back = button('返回', () => { if (!busy) finish(); }, 'outlined');
+      const back = button(options.backLabel || '返回', () => { if (!busy) finish(); }, 'outlined');
       if (options.back !== false) actions.append(back);
       actions.append(save);
       form.append(node('footer', 'settings-form-actions', actions));
@@ -366,6 +392,7 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
   return new Promise((resolve) => {
     let result;
     let busy = false;
+    let checkingClose = false;
     dialog.returnValue = '';
     const heading = node('h2', '', title);
     heading.id = 'dialog-title';
@@ -375,8 +402,17 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
     }
     const error = node('p', 'dialog-error');
     error.setAttribute('role', 'alert');
-    const canClose = () => !busy && !drawerCloseAnimation && (!options.canClose || options.canClose());
-    const cancel = button(options.cancelLabel || '取消', () => { if (canClose()) closePrompt(); });
+    const requestClose = async () => {
+      if (busy || drawerCloseAnimation || checkingClose) return;
+      checkingClose = true;
+      try {
+        const check = options.canClose ? options.canClose() : true;
+        const allowed = typeof check?.then === 'function' ? await check : check;
+        if (allowed && dialog.open && !busy && !drawerCloseAnimation) closePrompt();
+      } catch (failure) { error.textContent = message(failure); }
+      finally { checkingClose = false; }
+    };
+    const cancel = button(options.cancelLabel || '取消', requestClose);
     const confirm = node('button', 'primary', submit);
     confirm.type = 'submit';
     confirm.value = options.submitValue || '';
@@ -385,7 +421,7 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
       ? node('form', '', node('div', 'drawer-fields', ...fields, error), controls)
       : node('form', '', node('div','dialog-fields',...fields,error), controls);
     const header = options.drawer ? node('header', 'drawer-header', heading,
-      button('×', () => { if (canClose()) closePrompt(); }, '', '关闭主机表单')) : heading;
+      button('×', requestClose, '', options.closeLabel || '关闭主机表单')) : heading;
     dialog.replaceChildren(header, form);
     dialog.classList.toggle('host-drawer', Boolean(options.drawer));
     dialog.classList.toggle('split-dialog', Boolean(options.split));
@@ -394,7 +430,7 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
       field.matches?.(collection) || field.querySelector?.(collection)));
     const cancelEvent = (event) => {
       event.preventDefault();
-      if (canClose()) closePrompt();
+      void requestClose();
     };
     dialog.addEventListener('cancel', cancelEvent);
     dialog.addEventListener('close', () => {
@@ -438,6 +474,33 @@ function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
 
 async function confirm(title, text, submit) {
   return prompt(title, [node('p', '', text)], submit, () => true);
+}
+
+function confirmDiscardHostChanges(subject = '主机') {
+  closeDropdown();
+  const pane = node('dialog');
+  pane.id = 'host-discard-dialog';
+  pane.setAttribute('role', 'alertdialog');
+  pane.setAttribute('aria-labelledby', 'host-discard-title');
+  pane.setAttribute('aria-describedby', 'host-discard-description');
+  const title = node('h2', '', '放弃尚未保存的修改？'); title.id = 'host-discard-title';
+  const description = node('p', '', `关闭后，本次${subject}修改将不会保存。`); description.id = 'host-discard-description';
+  return new Promise(resolve => {
+    let discard = false;
+    const keep = button('继续编辑', () => pane.close(), 'primary');
+    const drop = button('放弃修改', () => { discard = true; pane.close(); }, 'outlined danger');
+    const closeWithParent = () => { if (pane.open) pane.close(); };
+    dialog.addEventListener('close', closeWithParent, { once: true });
+    pane.addEventListener('close', () => {
+      dialog.removeEventListener('close', closeWithParent);
+      pane.remove();
+      resolve(discard);
+    }, { once: true });
+    pane.append(title, description, node('div', 'actions', keep, drop));
+    document.body.append(pane);
+    window.overlays.show(pane);
+    keep.focus({ preventScroll: true });
+  });
 }
 
 async function refreshHosts() {
@@ -1223,24 +1286,15 @@ function keyBrowser() {
   const search = input('', 'search');
   search.placeholder = '搜索名称、类型或指纹';
   search.setAttribute('aria-label', '搜索密钥');
-  const name = input('id_ed25519_termlume');
-  name.required = true;
-  const passphrase = input('', 'password');
-  passphrase.autocomplete = 'new-password';
-  const submit = node('button', 'primary', '生成密钥');
-  submit.type = 'submit';
-  const generator = node('form', 'key-generator', node('h2', '', '生成 Ed25519 密钥'),
-    field('密钥文件名', name), field('私钥口令（可选）', passphrase),
-    node('div', 'settings-actions', button('取消', hideGenerator), submit));
-  generator.hidden = true;
-  const generate = button('＋ 生成密钥', () => {
-    setSource(false);
-    generator.hidden = false;
-    name.focus();
-    generator.scrollIntoView({ block: 'nearest' });
-  }, 'primary');
+  const generate = button('＋ 生成密钥', generateKey, 'primary');
+  const create = button('＋ 创建密钥', createKey, 'outlined');
+  create.hidden = !api.keys.create;
   const localTab = button('本机密钥', () => setSource(false));
   const agentTab = button('SSH Agent', () => setSource(true));
+  const addAgent = button('加入 SSH Agent', () => loadAgentKey(), 'outlined');
+  const agentGuide = node('section', 'host-form-section key-agent-guide', node('h3', '', 'SSH Agent'),
+    node('p', 'muted', 'Agent 暂存已解锁的私钥并代为签名，减少连接时重复输入口令。先生成或选择本机私钥，再将它加入正在运行的 Agent；主机认证方式选择「SSH Agent」即可使用。'),
+    button('刷新 Agent', loadAgent, 'outlined'));
   const directories = node('div', 'key-directories', node('div', '', node('span', 'muted', '扫描目录'), location),
     node('div', 'settings-actions', button('扫描 ~/.ssh', () => scan(), 'outlined'),
       button('选择目录', async () => { const directory = await api.keys.directory(); if (directory && browser.isConnected) await scan(directory); }, 'outlined')));
@@ -1254,7 +1308,190 @@ function keyBrowser() {
   let agentRevision = 0;
   let directoryReady = false;
 
-  function hideGenerator() { passphrase.value = ''; generator.hidden = true; }
+  async function createKey() {
+    if (!directoryReady) return;
+    let directory = location.textContent;
+    const destination = node('code', '', directory);
+    const name = input(); name.required = true; name.maxLength = 80; name.placeholder = '如 production_key'; name.dataset.keyCreate = 'name';
+    const privateKey = node('textarea'); privateKey.rows = 7; privateKey.required = true; privateKey.spellcheck = false;
+    privateKey.placeholder = '粘贴 OpenSSH / PEM 格式的私钥内容'; privateKey.dataset.keyCreate = 'private';
+    const publicKey = node('textarea'); publicKey.rows = 3; publicKey.spellcheck = false;
+    publicKey.placeholder = '可留空，自动从私钥提取'; publicKey.dataset.keyCreate = 'public';
+    const mode = node('select'); mode.append(new Option('密码', 'password'));
+    const secret = passwordEditor(undefined, mode, false, () => false, () => false, { label: '私钥口令',
+      placeholder: '加密私钥需要填写，未加密可留空', hint: '仅用于本次校验，不会另存此口令。' });
+    secret.update(); secret.password.dataset.keyCreate = 'passphrase';
+    const addAfterCreation = input('', 'checkbox'); addAfterCreation.dataset.keyCreate = 'add-agent';
+    const agentOption = node('div', '', node('label', 'checkbox-row', addAfterCreation, '创建后加入 SSH Agent'),
+      node('p', 'muted', '加入本机正在运行的 Agent，使用本次口令解锁，无需再次输入。'));
+    agentOption.hidden = !api.keys.addAgent;
+    const setup = node('div', 'key-create-fields',
+      node('section', 'host-form-section', field('名称（保存文件名）', name),
+        field('私钥内容', privateKey),
+        ...(api.keys.importFile ? [button('从私钥文件导入', async () => {
+          const imported = await api.keys.importFile();
+          if (!imported || !dialog.contains(privateKey)) return;
+          privateKey.value = imported.privateKey;
+          if (!name.value.trim()) name.value = imported.name;
+          publicKey.value = '';
+        }, 'outlined')] : []), secret.pane, agentOption),
+      node('section', 'host-form-section', field('公钥内容（可选）', publicKey), node('small', 'muted', '留空自动提取；填写时会核对与私钥是否匹配。')),
+      node('section', 'host-form-section', node('h3', '', '保存位置'), destination,
+        button('选择目录', async () => { const chosen = await api.keys.directory(); if (chosen) { directory = chosen; destination.textContent = chosen; } }, 'outlined'),
+        node('small', 'muted', '保留原私钥的加密状态，不覆盖同名文件。创建后可在主机中选择使用。')));
+    const savedName = node('strong'), savedPath = node('code');
+    const savedSummary = node('section', 'host-form-section key-created-summary', node('h3', '', '密钥已创建'), savedName, savedPath,
+      node('p', 'muted', '私钥与公钥已保存到本机。重试仅加载 Agent，不会重新创建密钥。'));
+    savedSummary.hidden = true;
+    const progress = node('p', 'muted'); progress.setAttribute('role', 'status');
+    const content = node('div', '', setup, savedSummary, progress);
+    const snapshot = () => JSON.stringify([directory, name.value, privateKey.value, publicKey.value, secret.password.value, addAfterCreation.checked]);
+    const original = snapshot();
+    let saved, savedDirectory, savedPassphrase = '', shouldAdd = false, agentAdded = false;
+    window.addEventListener('blur', secret.hide);
+    try {
+      await prompt('创建 SSH 密钥', [content], '创建密钥', async () => {
+        try {
+          if (!saved) {
+            progress.textContent = '正在创建密钥，请稍候…';
+            savedDirectory = directory; savedPassphrase = secret.password.value;
+            shouldAdd = addAfterCreation.checked;
+            saved = await api.keys.create({ directory: savedDirectory, name: name.value.trim(), privateKey: privateKey.value,
+              publicKey: publicKey.value, passphrase: savedPassphrase });
+          }
+          if (shouldAdd && !agentAdded) {
+            setup.hidden = true; savedSummary.hidden = false;
+            savedName.textContent = saved.name; savedPath.textContent = saved.path;
+            dialog.querySelector('.actions button[type="submit"]').textContent = '重试加入 SSH Agent';
+            dialog.querySelector('.actions button[type="button"]').textContent = '完成';
+            progress.textContent = '密钥已创建，正在加入 SSH Agent…';
+            try {
+              await api.keys.addAgent({ path: saved.path, passphrase: savedPassphrase });
+              agentAdded = true;
+            } catch (failure) {
+              throw new Error(`密钥已创建并保存，但加入 SSH Agent 失败：${message(failure)} 可重试，或点击「完成」保留密钥。`);
+            }
+          }
+          return saved;
+        } finally { progress.textContent = ''; }
+      }, [], { drawer: true, closeLabel: '关闭密钥创建表单',
+        canClose: () => Boolean(saved) || snapshot() === original || confirmDiscardHostChanges('密钥配置') });
+      if (saved && browser.isConnected) {
+        setSource(false); await scan(savedDirectory, saved);
+        if (directoryReady) note.textContent = localNote = agentAdded ? `已创建 ${saved.name}，并已加入 SSH Agent。`
+          : shouldAdd ? `已创建 ${saved.name}；尚未加入 SSH Agent，可从密钥详情重试。` : `已创建 ${saved.name}，可在主机中选择使用。`;
+      }
+    } finally {
+      window.removeEventListener('blur', secret.hide); secret.hide();
+      secret.password.value = ''; savedPassphrase = ''; privateKey.value = ''; publicKey.value = '';
+    }
+  }
+
+  async function loadAgentKey(key) {
+    const path = input(key?.path || ''); path.readOnly = true; path.placeholder = '请选择已有私钥';
+    path.setAttribute('aria-label', '要加入 Agent 的私钥');
+    const passphrase = input('', 'password'); passphrase.autocomplete = 'off';
+    const initialPath = path.value;
+    const fields = node('section', 'host-form-section',
+      field('本机私钥', path), button('选择私钥', () => manageKeys(value => { path.value = value; }, path.value), 'outlined'),
+      field('私钥口令（加密私钥需要）', passphrase),
+      node('p', 'muted', '口令仅用于本次解锁；Agent 退出或移除密钥后，需要重新加载。'));
+    try {
+      const result = await prompt('加入 SSH Agent', [fields], '加入 Agent', () => {
+        if (!path.value) throw new Error('请选择已有私钥。');
+        return api.keys.addAgent({ path: path.value, passphrase: passphrase.value });
+      }, [], { drawer: true, closeLabel: '关闭 Agent 加载表单',
+        canClose: () => (path.value === initialPath && !passphrase.value) || confirmDiscardHostChanges('Agent 加载配置') });
+      if (result && browser.isConnected) {
+        setSource(true, false);
+        await loadAgent();
+        note.textContent = `已加入 SSH Agent。${agentNote}`;
+      }
+    } finally { passphrase.value = ''; }
+  }
+
+  async function generateKey() {
+    if (!directoryReady) return;
+    let directory = location.textContent;
+    const destination = node('code', '', directory);
+    const name = input('id_ed25519_termlume'); name.required = true; name.dataset.keyField = 'name';
+    const passphrase = input('', 'password'); passphrase.autocomplete = 'new-password'; passphrase.dataset.keyField = 'passphrase';
+    const addAfterGeneration = input('', 'checkbox'); addAfterGeneration.dataset.keyField = 'add-agent';
+    const agentOption = node('div', '', node('label', 'checkbox-row', addAfterGeneration, '生成后加入 SSH Agent'),
+      node('p', 'muted', '加入本机正在运行的 Agent，使用本次口令解锁，无需再次输入。'));
+    agentOption.hidden = !api.keys.addAgent;
+    const type = node('select'); type.dataset.keyField = 'type';
+    type.append(new Option('Ed25519（推荐）', 'ed25519'), new Option('RSA', 'rsa'), new Option('ECDSA', 'ecdsa'));
+    const rsaBits = node('select'); rsaBits.dataset.keyField = 'rsa-bits';
+    for (const bits of [2048, 3072, 4096]) rsaBits.append(new Option(`${bits} 位`, bits));
+    rsaBits.value = '3072';
+    const ecBits = node('select'); ecBits.dataset.keyField = 'ecdsa-bits';
+    for (const bits of [256, 384, 521]) ecBits.append(new Option(`${bits} 位 · NIST P-${bits}`, bits));
+    const rsaField = field('密钥位数', selectControl(rsaBits, 'RSA 密钥位数'));
+    const ecField = field('曲线 / 位数', selectControl(ecBits, 'ECDSA 曲线 / 位数'));
+    const hint = node('p', 'muted');
+    const updateType = () => {
+      rsaField.hidden = type.value !== 'rsa'; ecField.hidden = type.value !== 'ecdsa';
+      hint.textContent = ({ ed25519: 'Ed25519 使用固定长度，无需配置位数。', rsa: 'RSA 默认 3072 位；位数越大，生成所需时间越长。', ecdsa: '位数对应所选的 NIST 椭圆曲线。' })[type.value];
+      if (/^id_(ed25519|rsa|ecdsa)_termlume$/.test(name.value)) name.value = `id_${type.value}_termlume`;
+    };
+    type.addEventListener('change', updateType); updateType();
+    const snapshot = () => JSON.stringify([directory, name.value, passphrase.value, type.value, rsaBits.value, ecBits.value, addAfterGeneration.checked]);
+    const initial = snapshot();
+    const progress = node('p', 'muted'); progress.setAttribute('role', 'status');
+    const setup = node('div', 'key-generation-fields',
+      node('section', 'host-form-section', node('h3', '', '保存位置'), destination,
+        button('选择目录', async () => {
+          const selected = await api.keys.directory();
+          if (selected) { directory = selected; destination.textContent = selected; }
+        }, 'outlined')),
+      node('section', 'host-form-section', field('密钥文件名', name), field('密钥类型', selectControl(type, '密钥类型')),
+        rsaField, ecField, hint, field('私钥口令（可选）', passphrase),
+        node('p', 'muted', '同时创建私钥与 .pub 公钥，不覆盖同名文件。'), agentOption));
+    const generatedName = node('strong');
+    const generatedPath = node('code');
+    const generatedSummary = node('section', 'host-form-section key-generated-summary', node('h3', '', '密钥已生成'), generatedName, generatedPath,
+      node('p', 'muted', '私钥与公钥已保存到本机。重试仅加载 Agent，不会重新生成密钥。'));
+    generatedSummary.hidden = true;
+    const fields = node('div', '', setup, generatedSummary, progress);
+    let generated, generatedDirectory, generatedPassphrase = '', shouldAdd = false, agentAdded = false;
+    try {
+      await prompt('生成 SSH 密钥', [fields], '生成密钥', async () => {
+        try {
+          if (!generated) {
+            progress.textContent = '正在生成密钥，请稍候…';
+            generatedDirectory = directory;
+            generatedPassphrase = passphrase.value;
+            shouldAdd = addAfterGeneration.checked;
+            generated = await api.keys.generate({ directory: generatedDirectory, name: name.value, passphrase: generatedPassphrase, type: type.value,
+              ...(type.value === 'ed25519' ? {} : { bits: Number(type.value === 'rsa' ? rsaBits.value : ecBits.value) }) });
+          }
+          if (shouldAdd && !agentAdded) {
+            setup.hidden = true; generatedSummary.hidden = false;
+            generatedName.textContent = generated.name; generatedPath.textContent = generated.path;
+            dialog.querySelector('.actions button[type="submit"]').textContent = '重试加入 SSH Agent';
+            dialog.querySelector('.actions button[type="button"]').textContent = '完成';
+            progress.textContent = '密钥已生成，正在加入 SSH Agent…';
+            try {
+              await api.keys.addAgent({ path: generated.path, passphrase: generatedPassphrase });
+              agentAdded = true;
+            } catch (failure) {
+              throw new Error(`密钥已生成并保存，但加入 SSH Agent 失败：${message(failure)} 可重试，或点击「完成」保留密钥。`);
+            }
+          }
+          return generated;
+        } finally { progress.textContent = ''; }
+      }, [], { drawer: true, closeLabel: '关闭密钥创建表单',
+        canClose: () => Boolean(generated) || snapshot() === initial || confirmDiscardHostChanges('密钥配置') });
+      if (generated && browser.isConnected) {
+        setSource(false); await scan(generatedDirectory, generated);
+        if (directoryReady && shouldAdd) {
+          localNote = agentAdded ? `已生成 ${generated.name}，并已加入 SSH Agent。` : `已生成 ${generated.name}；尚未加入 SSH Agent，可从密钥详情重试。`;
+          note.textContent = localNote;
+        }
+      }
+    } finally { passphrase.value = ''; generatedPassphrase = ''; }
+  }
   function describe(key) {
     return fromAgent ? key.type : `${key.type} · ${key.private ? (key.encrypted ? '加密私钥' : '私钥') : '仅公钥'}`;
   }
@@ -1264,6 +1501,7 @@ function keyBrowser() {
     for (const card of list.children) if (card.key) card.setAttribute('aria-pressed', String(card.key === key));
     if (!key) { detail.replaceChildren(); return; }
     const controls = node('div', 'settings-actions');
+    if (!fromAgent && key.private && api.keys.addAgent) controls.append(button('加入 SSH Agent', () => loadAgentKey(key), 'outlined'));
     if (key.publicKey) controls.append(button('复制公钥', async () => {
       await api.keys.copy(key.publicKey);
       note.textContent = '已复制公钥。';
@@ -1294,16 +1532,17 @@ function keyBrowser() {
       (fromAgent ? '暂无可显示的 Agent 身份。' : '此目录中没有找到 SSH 密钥。'))));
     showDetail(visible.includes(selected) ? selected : undefined);
   }
-  function setSource(agent) {
+  function setSource(agent, reload = true) {
     if (fromAgent !== agent) { selected = undefined; search.value = ''; }
     fromAgent = agent;
     localTab.setAttribute('aria-pressed', String(!agent));
     agentTab.setAttribute('aria-pressed', String(agent));
     directories.hidden = agent;
-    if (agent) hideGenerator();
+    agentGuide.hidden = !agent;
+    addAgent.hidden = !agent || !api.keys.addAgent;
     note.textContent = agent ? agentNote : localNote;
     render();
-    if (agent) void loadAgent();
+    if (agent && reload) void loadAgent();
   }
   async function loadAgent() {
     const current = ++agentRevision;
@@ -1311,15 +1550,16 @@ function keyBrowser() {
     try {
       const agent = await api.keys.agent();
       if (current !== agentRevision || !browser.isConnected) return;
-      agentRows = agent.keys;
-      agentNote = agent.available ? `已加载 ${agent.keys.length} 个身份。` : 'SSH Agent 暂不可用。';
+      agentRows = agent.keys.map(key => ({ ...key, name: rows.find(local => local.fingerprint === key.fingerprint)?.name || key.name }));
+      agentNote = agent.available ? `已加载 ${agent.keys.length} 个身份。` : 'SSH Agent 暂不可用，请先启动或解锁本机 Agent。';
     } catch (error) { agentNote = message(error); }
     if (current === agentRevision && browser.isConnected && fromAgent) { note.textContent = agentNote; render(); }
   }
   async function scan(directory, reveal) {
     const current = ++revision;
     directoryReady = false;
-    submit.disabled = true;
+    generate.disabled = true;
+    create.disabled = true;
     localNote = '正在扫描本机密钥…';
     if (!fromAgent) note.textContent = localNote;
     try {
@@ -1334,24 +1574,13 @@ function keyBrowser() {
       if (reveal && !fromAgent) { search.value = ''; selected = rows.find((key) => key.path === reveal.path); }
     } catch (error) { if (current === revision) localNote = message(error); }
     if (current !== revision || !browser.isConnected) return;
-    submit.disabled = !directoryReady;
+    generate.disabled = !directoryReady;
+    create.disabled = !directoryReady;
     if (!fromAgent) { note.textContent = localNote; render(); }
   }
-  generator.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    if (!directoryReady || submit.disabled) return;
-    submit.disabled = true;
-    try {
-      const directory = location.textContent;
-      const key = await api.keys.generate({ directory, name: name.value, passphrase: passphrase.value });
-      hideGenerator();
-      if (browser.isConnected) await scan(directory, key);
-    } catch (error) { note.textContent = message(error); }
-    finally { passphrase.value = ''; submit.disabled = !directoryReady; }
-  });
   search.addEventListener('input', render);
-  const controls = node('div', 'key-toolbar', node('div', 'settings-switcher', localTab, agentTab), search, generate);
-  const body = node('div', 'page-body', directories, generator, note, node('div', 'key-body', list, detail));
+  const controls = node('div', 'key-toolbar', node('div', 'settings-switcher', localTab, agentTab), search, addAgent, create, generate);
+  const body = node('div', 'page-body', directories, agentGuide, note, node('div', 'key-body', list, detail));
   controls.classList.add('page-toolbar');
   browser.append(controls, body);
   setSource(false);
@@ -1416,8 +1645,10 @@ function manageKeys(onSelect, currentPath) {
   });
 }
 
-function passwordEditor(host, auth, hasPassword, sameTarget, isLinked = () => false) {
+function passwordEditor(host, auth, hasPassword, sameTarget, isLinked = () => false, settings = {}) {
+  const label = settings.label || 'SSH 密码';
   const password = input('', 'password');
+  password.setAttribute('aria-label', label);
   password.autocomplete = 'new-password';
   password.spellcheck = false;
   password.setAttribute('autocorrect', 'off');
@@ -1427,7 +1658,7 @@ function passwordEditor(host, auth, hasPassword, sameTarget, isLinked = () => fa
   revealed.readOnly = true;
   revealed.autocomplete = 'off';
   revealed.spellcheck = false;
-  revealed.setAttribute('aria-label', '已保存的 SSH 密码');
+  revealed.setAttribute('aria-label', `已保存的${label === 'SSH 密码' ? ' ' : ''}${label}`);
   revealed.hidden = true;
   const hint = node('small');
   hint.setAttribute('role', 'status');
@@ -1437,15 +1668,19 @@ function passwordEditor(host, auth, hasPassword, sameTarget, isLinked = () => fa
   const eligible = () => hasPassword && sameTarget() && !isLinked();
   const visible = () => password.type === 'text' || !revealed.hidden;
   const update = () => {
-    pane.hidden = auth.value !== 'password' || isLinked();
+    pane.hidden = auth.value !== (settings.auth || 'password') || isLinked();
     const saved = eligible();
-    password.placeholder = saved ? '留空保留已保存的密码' : '留空可在连接时输入';
-    toggle.textContent = visible() ? '隐藏' : !password.value && saved ? '查看已保存' : '显示';
-    toggle.setAttribute('aria-label', visible() ? '隐藏 SSH 密码' : !password.value && saved ? '查看已保存的 SSH 密码' : '显示 SSH 密码');
-    toggle.disabled = loading || password.form?.getAttribute('aria-busy') === 'true' || (!password.value && !saved);
+    password.placeholder = saved ? '••••••••••••' : settings.placeholder || '输入 SSH 密码，或在连接时输入';
+    password.classList.toggle('has-saved-password', Boolean(saved));
+    password.hidden = !revealed.hidden;
+    toggle.replaceChildren(chromeIcon(visible() ? 'eye-off' : 'eye'));
+    toggle.setAttribute('aria-label', visible() ? `隐藏${label}` : !password.value && saved ? `查看已保存的${label}` : `显示${label}`);
+    toggle.title = toggle.getAttribute('aria-label');
+    toggle.setAttribute('aria-pressed', String(visible()));
+    toggle.disabled = loading || password.disabled || password.form?.getAttribute('aria-busy') === 'true' || (!password.value && !saved);
     hint.textContent = hasPassword && !saved
-      ? '连接信息有变更，请为新目标输入密码。'
-      : '填写后由 Termlume 加密保存在本机。';
+      ? settings.changedHint || '连接信息有变更，请为新目标输入密码。'
+      : saved ? settings.savedHint || '密码已加密保存在本机；输入新密码可替换。' : settings.hint || '填写后由 Termlume 加密保存在本机。';
   };
   const hide = () => {
     generation++;
@@ -1465,7 +1700,7 @@ function passwordEditor(host, auth, hasPassword, sameTarget, isLinked = () => fa
       loading = true;
       update();
       try {
-        const secret = await api.hosts.revealPassword(host.id);
+        const secret = await (settings.reveal ? settings.reveal() : api.hosts.revealPassword(host.id));
         if (request !== generation || !dialog.open || !dialog.contains(revealed) || !eligible()) return;
         revealed.value = secret;
         revealed.hidden = false;
@@ -1476,8 +1711,9 @@ function passwordEditor(host, auth, hasPassword, sameTarget, isLinked = () => fa
     } else return;
     update();
     timer = setTimeout(hide, 20_000);
-  }, 'outlined');
-  const pane = node('div', 'credential-pane', node('div', 'credential-row', field('SSH 密码', password), toggle), revealed, hint);
+  }, 'password-visibility');
+  const pane = node('div', 'credential-pane host-password-pane', field(label,
+    node('div', 'credential-row password-control', chromeIcon('lock'), password, revealed, toggle)), hint);
   password.addEventListener('input', () => {
     if (!revealed.hidden || loading) hide();
     else update();
@@ -2238,16 +2474,46 @@ async function manageGroups(page) {
     await ask('分组管理',[search,list],'关闭',()=>true,[button('新建分组',()=>{choice={create:true};close();},'primary')]);
     if(!choice) break;
     if (choice.remove) { await deleteHostGroup(choice.remove); continue; }
-    const g=choice.group;const name=input(g?.name);const parent=node('select');const port=input(g?.port||'','number');port.min=1;port.max=65535;
-    const identities=await api.identities.list();const identity=node('select');const theme=node('select');for(const[value,label]of [['','继承 / 终端偏好'],['dark','深色'],['light','浅色']]){const o=node('option','',label);o.value=value;theme.append(o);}theme.value=g?.terminalTheme||'';
-    const excluded = g ? window.hostTree.descendants(groupAssets, g.id) : new Set();
-    for(const [value,label] of [['','无上级分组'],...groupAssets.filter(p=>!excluded.has(p.id)).map(p=>[p.id,p.path])]) {const o=node('option','',label);o.value=value;parent.append(o);}parent.value=g?.parentId||choice.parent?.id||'';
-    identity.append(new Option('继承上级 / 未设置', ''), ...identities.map(identityChoiceOption));identity.value=g?.identityId||'';
-    await ask(g?'编辑分组':choice.parent?'添加子组':'新建分组',[node('p','muted',`影响 ${g?.hosts.length||0} 台主机（含子分组），仅启用继承的主机使用默认值。`),field('分组名称',name),field('上级分组',selectControl(parent,'上级分组',{searchable:true,placeholder:'搜索分组名称或路径'})),field('默认 SSH 端口（留空继承）',port),field('默认登录配置',identitySelectControl(identity,'分组登录配置')),node('p','muted','组内主机勾选「使用分组的登录配置」后，会复用此处选择的 SSH 用户名和认证方式。'),field('默认终端配色',selectControl(theme,'分组终端配色'))],'保存分组',async()=>{
-      const result=await api.groups.save({group:{id:g?.id,name:name.value,parentId:parent.value||undefined,port:port.value?Number(port.value):undefined,identityId:identity.value||undefined,terminalTheme:theme.value||undefined},expected:g});groupAssets=result.groups;hosts=result.hosts;if(parent.value)collapsedSettingsGroups.delete(parent.value);renderHosts();return true;
-    });
+    await editGroup(choice.group, choice.parent, page);
   }
   await refreshHosts();
+}
+
+async function editGroup(group, parentGroup, page, options = {}) {
+  const name = input(group?.name || options.name);
+  name.required = true; name.maxLength = 120;
+  const parent = node('select');
+  const excluded = group ? window.hostTree.descendants(groupAssets, group.id) : new Set();
+  parent.append(new Option('无上级分组', ''), ...groupAssets.filter(item => !excluded.has(item.id)).map(item => new Option(item.path, item.id)));
+  parent.value = group?.parentId || parentGroup?.id || '';
+  const port = input(group?.port || '', 'number'); port.min = 1; port.max = 65535;
+  const identities = api.identities ? await api.identities.list() : [];
+  const identity = node('select');
+  identity.append(new Option('继承上级 / 未设置', ''), ...identities.map(identityChoiceOption));
+  identity.value = group?.identityId || '';
+  const theme = node('select');
+  for (const [value, label] of [['', '继承 / 终端偏好'], ['dark', '深色'], ['light', '浅色']]) theme.append(new Option(label, value));
+  theme.value = group?.terminalTheme || '';
+  const snapshot = () => JSON.stringify([name.value, parent.value, port.value, identity.value, theme.value]);
+  const original = snapshot();
+  const ask = page ? settingsAsk(page) : prompt;
+  return ask(group ? '编辑分组' : parentGroup ? '添加子组' : '新建分组', [
+    node('section', 'host-form-section',
+      node('p', 'muted', group ? `影响 ${group.hosts?.length || 0} 台主机（含子分组），仅启用继承的主机使用默认值。` : '设置分组名称，可选择上级分组及默认连接配置。'),
+      field('分组名称', name), field('上级分组', selectControl(parent, '上级分组', { searchable: true, placeholder: '搜索分组名称或路径' }))),
+    node('section', 'host-form-section', node('h3', '', '默认连接配置'),
+      field('默认 SSH 端口（留空继承）', port), field('默认登录配置', identitySelectControl(identity, '分组登录配置')),
+      node('p', 'muted', '组内主机勾选「使用分组的登录配置」后，会复用此处选择的 SSH 用户名和认证方式。'),
+      field('默认终端配色', selectControl(theme, '分组终端配色')))
+  ], options.submitLabel || '保存分组', async () => {
+    const result = await api.groups.save({ group: { id: group?.id, name: name.value, parentId: parent.value || undefined,
+      port: port.value ? Number(port.value) : undefined, identityId: identity.value || undefined, terminalTheme: theme.value || undefined }, expected: group });
+    groupAssets = result.groups; hosts = result.hosts;
+    if (parent.value) collapsedSettingsGroups.delete(parent.value);
+    renderHosts();
+    return groupAssets.find(item => group ? item.id === group.id : item.name === name.value.trim() && (item.parentId || '') === parent.value);
+  }, [], { ...(!page ? { drawer: true, closeLabel: '关闭分组表单',
+    canClose: () => snapshot() === original || confirmDiscardHostChanges('分组配置') } : {}), ...options });
 }
 
 const identityPurpose = '登录配置保存 SSH 用户名和认证方式，可给多台主机复用。在主机的「更多设置 → 登录配置」中选择，也可在「分组管理」中设为默认登录配置。';
@@ -2447,6 +2713,8 @@ async function editHost(host, draftTab, target) {
   if(host?.identityId&&!identities.some(i=>i.id===host.identityId)) {const o=node('option','','登录配置不可用，请重新选择');o.value=host.identityId;identity.append(o);}
   identity.value=host?.identityId||'';const identityPicker=identitySelectControl(identity,'登录配置');
   const identityHint = node('p', 'muted');
+  const identityField = field('登录配置', identityPicker);
+  const identityHelp = node('p', 'muted', '选择登录配置可复用用户名和认证方式。');
   const hasPassword = !host?.identityId && host?.auth === 'password' && await api.hosts.hasPassword(host.id);
   const hasKeyPassphrase = host?.auth === 'key' && api.hosts.hasKeyPassphrase && await api.hosts.hasKeyPassphrase(host.id);
   const name = input(host?.name);
@@ -2454,8 +2722,7 @@ async function editHost(host, draftTab, target) {
   const port = input(host?.port || target?.port || '22', 'number');
   port.min = 1; port.max = 65535;
   const username = input(host?.username ?? target?.username);
-  const group = input(host?.group ?? currentGroup);
-  group.placeholder = '选择或输入分组';
+  const group = node('select');
   const tags = input(host?.tags?.join(', ') || '');
   tags.placeholder = '以逗号分隔';
   const inheritPort=input('','checkbox');inheritPort.checked=Boolean(host?.inheritPort);
@@ -2469,12 +2736,21 @@ async function editHost(host, draftTab, target) {
   const startup=node('textarea');startup.value=host?.startupCommand||'';startup.rows=3;
   const reconnect=input('','checkbox');reconnect.checked=Boolean(host?.autoReconnect);
   const autoStartup=input('','checkbox');autoStartup.checked=Boolean(host?.startupEnabled);
-  const groups = [...new Set([...groupAssets.map(g=>g.path),...hosts.map((item) => item.group).filter(Boolean)])].sort((a, b) => a.localeCompare(b, 'zh-CN'));
-  const groupPicker = editableControl(group, '分组', (query) => {
-    const matches = groups.filter((value) => !query || value.toLowerCase().includes(query.toLowerCase())).map((value) => ({ value, label: value }));
-    if (!query) return [{ value: '', label: '无分组' }, ...matches];
-    if (!groups.includes(query)) matches.push({ value: query, label: `新建「${query}」` });
-    return matches;
+  const refreshGroupChoices = (selected = group.value) => {
+    const groups = [...new Set([...groupAssets.map(item => item.path), ...hosts.map(item => item.group).filter(Boolean)])]
+      .sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    group.replaceChildren(new Option('无分组', ''), ...groups.map(path => new Option(path, path)));
+    group.value = groups.includes(selected) ? selected : '';
+    group.dispatchEvent(new Event('input'));
+  };
+  refreshGroupChoices(host?.group ?? currentGroup);
+  let createGroupRequested = false, newGroupName = '';
+  const groupPicker = selectControl(group, '分组', {
+    searchable: true, placeholder: '搜索分组名称或路径',
+    ...(api.groups ? { action: { label: '新建分组', run: query => {
+      createGroupRequested = true; newGroupName = query;
+      closePrompt('create-group');
+    } } } : {})
   });
   const jump = node('select');
   const routeOptions = [{ id: '', name: '直连' }, ...hosts.filter((item) => item.id !== host?.id && !item.jumpHostId && (api.ssh.jumpHosts || item.id === host?.jumpHostId))];
@@ -2495,78 +2771,140 @@ async function editHost(host, draftTab, target) {
   }
   auth.required = true;
   auth.value = host?.auth || 'password';
-  const authPicker = selectControl(auth, '认证方式');
+  const authPicker = selectControl(auth, '认证方式', { valueLabel: option => option?.value === 'password'
+    ? '＋ 使用私钥或 SSH Agent' : `切换认证方式 · ${option?.textContent || '请选择'}` });
+  authPicker.classList.add('host-auth-switch');
+  const agentHint = node('p', 'muted host-agent-hint', '使用本机 SSH Agent 中已加载的密钥进行认证。');
   const key = input(host?.keyPath, 'hidden');
   const selectedKeyName = node('span', 'selected-key-name');
-  const select = button('选择私钥', () => manageKeys(file => { key.value = file; updateAuth(); }, key.value), 'outlined');
-  const keyRow = node('div', 'credential-pane', node('span', '', '私钥'), key,
-    node('div', 'host-key-selection', selectedKeyName, select));
-  const keySecret = input('', 'password'); keySecret.autocomplete = 'new-password'; keySecret.maxLength = 4096;
+  const select = button('', () => manageKeys(file => { key.value = file; updateAuth(); }, key.value), 'key-picker-trigger', '选择私钥');
+  const keyCaret = node('span', 'dropdown-caret'); keyCaret.setAttribute('aria-hidden', 'true');
+  select.append(chromeIcon('key'), selectedKeyName, keyCaret);
+  select.setAttribute('aria-haspopup', 'dialog'); select.setAttribute('aria-controls', 'key-dialog');
+  const keyRow = node('div', 'credential-pane host-private-key', node('label', '', '私钥'), node('div', 'host-key-selection', key, select));
   const clearKeySecret = input('', 'checkbox');
   const clearKeyRow = node('label', 'checkbox-row', clearKeySecret, '清除此主机已保存的私钥口令');
-  const keySecretHint = node('small', 'muted');
-  const keySecretPane = node('div', 'credential-pane', field('私钥口令（仅保存在本机）', keySecret), keySecretHint, clearKeyRow);
-  clearKeySecret.addEventListener('change', () => { keySecret.disabled = clearKeySecret.checked; if (clearKeySecret.checked) keySecret.value = ''; });
+  const keyEditor = passwordEditor(host, auth, hasKeyPassphrase,
+    () => auth.value === 'key' && key.value === host?.keyPath && !clearKeySecret.checked,
+    () => Boolean(identity.value) || inheritIdentity.checked, { auth: 'key', label: '私钥口令', placeholder: '未加密私钥可留空',
+      hint: '口令加密保存在本机，连接时自动使用。', savedHint: '口令已保存在本机；输入新口令可替换。', changedHint: '私钥已更换，请填写所选私钥的口令。',
+      reveal: () => api.hosts.revealKeyPassphrase({ id: host.id, keyPath: key.value }) });
+  const keySecret = keyEditor.password, keySecretPane = keyEditor.pane;
+  keySecretPane.classList.add('host-key-passphrase');
+  const keySecretHint = keySecretPane.querySelector('small');
+  clearKeySecret.addEventListener('change', () => {
+    keySecret.disabled = clearKeySecret.checked; if (clearKeySecret.checked) keySecret.value = '';
+    keyEditor.hide(); if (clearKeySecret.checked) keySecretHint.textContent = '保存后将清除已保存的私钥口令。';
+  });
   const normalizedAddress = () => addressField.value.trim().replace(/^\[(.*)\]$/, '$1').toLowerCase();
   const matches = (item) => item.address.toLowerCase() === normalizedAddress() && item.port === Number(port.value) && item.username === username.value.trim();
   const sameTarget = () => Boolean(host?.auth === 'password' && auth.value === 'password' && matches(host));
   const editor = api.hosts.revealPassword ? passwordEditor(host, auth, hasPassword, sameTarget,
     () => Boolean(identity.value) || inheritIdentity.checked) : null;
-  const inheritanceHint=node('p','muted');inheritanceHint.setAttribute('aria-live','polite');
-  const inheritanceOptions = node('div', 'group-inheritance-options',
-    node('label','checkbox-row',inheritPort,'继承分组端口（未设置时 22）'),
-    node('label','checkbox-row',inheritIdentity,'使用分组的登录配置'),
-    node('label','checkbox-row',inheritTheme,'继承分组终端配色'), inheritanceHint);
+  const inheritanceRow = (id, label, toggle) => {
+    const value = node('span', 'inheritance-value'); value.id = `host-inherit-${id}-value`;
+    const source = node('small', 'inheritance-source'); source.id = `host-inherit-${id}-source`;
+    toggle.setAttribute('role', 'switch');
+    toggle.setAttribute('aria-label', `${label}跟随分组`);
+    toggle.setAttribute('aria-describedby', `${value.id} ${source.id}`);
+    const row = node('label', 'inheritance-row', node('span', 'inheritance-name', label),
+      node('span', 'inheritance-detail', value, source),
+      node('span', 'security-switch', toggle, node('span', 'security-switch-track')));
+    return { row, value, source };
+  };
+  const inheritanceRows = {
+    port: inheritanceRow('port', '端口', inheritPort),
+    identity: inheritanceRow('identity', '登录', inheritIdentity),
+    theme: inheritanceRow('theme', '配色', inheritTheme)
+  };
+  inheritIdentity.setAttribute('aria-label', '登录配置跟随分组');
+  inheritTheme.setAttribute('aria-label', '终端配色跟随分组');
+  const inheritanceOptions = node('div', 'group-inheritance-options', node('h4', '', '分组默认设置'),
+    node('div', 'inheritance-columns', node('span', '', '设置'), node('span', '', '使用值'), node('span', '', '跟随分组')),
+    ...Object.values(inheritanceRows).map(item => item.row));
+  inheritanceOptions.setAttribute('role', 'group');
+  inheritanceOptions.setAttribute('aria-label', '分组默认设置');
   const inheritedSource=property=>{let g=groupAssets.find(g=>g.path===group.value);const seen=new Set();while(g&&!seen.has(g.id)){seen.add(g.id);if(g[property]!==undefined&&g[property]!==null&&g[property]!=='')return g;g=groupAssets.find(p=>p.id===g.parentId);}return undefined;};
+  const updateInheritance = () => {
+    const display = (key, value, source, unavailable = false) => {
+      const item = inheritanceRows[key];
+      item.value.textContent = value; item.source.textContent = source;
+      item.row.classList.toggle('inheritance-unavailable', unavailable);
+    };
+    const portSource = inheritedSource('port'), identitySource = inheritedSource('identityId'), themeSource = inheritedSource('terminalTheme');
+    const inheritedIdentity = identities.find(item => item.id === identitySource?.identityId);
+    const selectedIdentity = identities.find(item => item.id === identity.value);
+    display('port', port.value || '未设置', inheritPort.checked ? portSource ? `来自 ${portSource.path}` : '系统默认' : '单独设置');
+    const missingIdentity = inheritIdentity.checked && !inheritedIdentity;
+    display('identity', missingIdentity ? '未设置登录配置' : username.value.trim() ? `${username.value.trim()} · ${identityAuthLabels[auth.value] || '请选择认证方式'}` : '尚未设置',
+      missingIdentity ? '分组及上级均未设置，请设置分组登录配置或关闭跟随' : inheritIdentity.checked ? `来自 ${identitySource.path}`
+        : selectedIdentity ? `登录配置「${selectedIdentity.name}」` : '单独设置', missingIdentity);
+    const themeValue = terminalTheme.value || uiPreferences.terminalTheme;
+    display('theme', themeValue === 'light' ? '浅色' : '深色', inheritTheme.checked
+      ? themeSource ? `来自 ${themeSource.path}` : '分组未设置，使用终端偏好' : terminalTheme.value ? '单独设置' : '终端偏好');
+  };
+  let wasInheritingIdentity = inheritIdentity.checked;
   const updateAuth = () => {
     const grouped = Boolean(group.value.trim());
     inheritanceOptions.hidden = !grouped;
     if (!grouped) inheritPort.checked = inheritIdentity.checked = inheritTheme.checked = false;
+    if (wasInheritingIdentity && !inheritIdentity.checked) {
+      // The displayed group identity is an effective value, not a direct host association.
+      identity.value = '';
+      identity.dispatchEvent(new Event('input'));
+    }
+    wasInheritingIdentity = inheritIdentity.checked;
     const portSource=inheritedSource('port'),identitySource=inheritedSource('identityId'),themeSource=inheritedSource('terminalTheme');
     const inheritedIdentity=identities.find(i=>i.id===identitySource?.identityId);
-    const hints=[];
-    if(inheritPort.checked){port.value=portSource?.port||22;hints.push(`端口 ${port.value}：${portSource?.path||'默认值'}`);}
-    if(inheritIdentity.checked){identity.value=inheritedIdentity?.id||'';identity.dispatchEvent(new Event('input'));if(inheritedIdentity){username.value=inheritedIdentity.username;auth.value=inheritedIdentity.auth;key.value=inheritedIdentity.keyPath||'';auth.dispatchEvent(new Event('input'));}hints.push(inheritedIdentity?`登录配置 ${inheritedIdentity.name}：${identitySource.path}`:'未找到分组登录配置，请先设置或取消使用分组登录配置');}
-    if(inheritTheme.checked){terminalTheme.value=themeSource?.terminalTheme||'';terminalTheme.dispatchEvent(new Event('input'));hints.push(`终端配色：${themeSource?`${themeSource.path}（${themeSource.terminalTheme==='light'?'浅色':'深色'}）`:'设备终端偏好'}`);}
-    inheritanceHint.textContent=hints.join('；');inheritanceHint.hidden=!hints.length;
+    if(inheritPort.checked) port.value=portSource?.port||22;
+    if(inheritIdentity.checked){identity.value=inheritedIdentity?.id||'';identity.dispatchEvent(new Event('input'));if(inheritedIdentity){username.value=inheritedIdentity.username;auth.value=inheritedIdentity.auth;key.value=inheritedIdentity.keyPath||'';auth.dispatchEvent(new Event('input'));}}
+    if(inheritTheme.checked){terminalTheme.value=themeSource?.terminalTheme||'';terminalTheme.dispatchEvent(new Event('input'));}
     const linked=Boolean(identity.value)||inheritIdentity.checked;
     const selectedIdentity = identities.find(item => item.id === identity.value);
     identityHint.hidden = !selectedIdentity && !inheritIdentity.checked;
     identityHint.textContent = selectedIdentity
       ? `使用登录配置「${selectedIdentity.name}」中的用户名和认证方式。可到「设置 → 登录配置」统一修改。`
       : '选择登录配置，可让多台主机复用相同的 SSH 用户名和认证方式。也可以选择「单独配置此主机」。';
+    connectionSection.hidden = identityField.hidden = identityHelp.hidden = inheritIdentity.checked;
     auth.disabled=username.disabled=key.disabled=select.disabled=linked;port.disabled=inheritPort.checked;identity.disabled=inheritIdentity.checked;terminalTheme.disabled=inheritTheme.checked;
     if(editor) {editor.pane.hidden=linked;if(linked) editor.password.value='';}
     keyRow.hidden = linked || auth.value !== 'key';
-    selectedKeyName.textContent = keyName(key.value) || '尚未选择私钥';
-    selectedKeyName.title = selectedKeyName.textContent;
-    keySecretPane.hidden = auth.value !== 'key' || !api.hosts.hasKeyPassphrase;
+    agentHint.hidden = linked || auth.value !== 'agent';
+    selectedKeyName.textContent = keyName(key.value) || '选择私钥';
+    select.title = key.value || '选择私钥';
+    if (inheritIdentity.checked) { keySecret.value = ''; clearKeySecret.checked = false; }
     const savedKey = hasKeyPassphrase && key.value === host?.keyPath;
-    keySecret.placeholder = savedKey ? '留空保留已保存的口令' : '未加密私钥可留空';
-    keySecretHint.textContent = savedKey ? '已由 Termlume 加密保存在本机；连接时自动使用。' : '由 Termlume 在本机加密保存，连接时自动使用，不加入备份或 Git 同步。';
-    clearKeyRow.hidden = !savedKey;
+    clearKeyRow.hidden = !savedKey || linked || auth.value !== 'key';
     if (!savedKey) { clearKeySecret.checked = false; keySecret.disabled = false; }
     if (auth.value !== 'key') keySecret.value = '';
+    keyEditor.hide();
+    keySecretPane.hidden = linked || auth.value !== 'key' || !api.hosts.hasKeyPassphrase;
     key.required = auth.value === 'key' && !(host?.auth === 'key' && !host.keyPath);
     if (editor) {
       if (auth.value !== 'password') editor.password.value = '';
       editor.hide();
       editor.pane.hidden = linked || auth.value !== 'password';
     }
+    updateInheritance();
   };
   inheritPort.addEventListener('change',updateAuth);inheritIdentity.addEventListener('change',updateAuth);inheritTheme.addEventListener('change',updateAuth);
   group.addEventListener('input',updateAuth);group.addEventListener('change',updateAuth);
   identity.addEventListener('change',()=>{const i=identities.find(i=>i.id===identity.value);if(i){username.value=i.username;auth.value=i.auth;key.value=i.keyPath||'';auth.dispatchEvent(new Event('change'));}updateAuth();});
   auth.addEventListener('change', updateAuth);
   key.addEventListener('input', updateAuth);
-  updateAuth();
+  for (const control of [username, port, terminalTheme]) control.addEventListener('input', updateInheritance);
+  terminalTheme.addEventListener('change', updateInheritance);
   for (const required of [addressField, username, port]) required.required = true;
   const draft = () => ({ id: host?.id, name: name.value, address: addressField.value, port: Number(port.value), username: username.value, group: group.value, groupId:groupAssets.find(g=>g.path===group.value)?.id, inheritPort:inheritPort.checked, inheritIdentity:inheritIdentity.checked, inheritTheme:inheritTheme.checked,terminalTheme:terminalTheme.value||undefined,keepaliveInterval:Number(keepalive.value),connectTimeout:Number(timeout.value),
     identityId: inheritIdentity.checked ? undefined : identity.value || undefined, auth: auth.value, keyPath: key.value || undefined, jumpHostId: jump.value || undefined, tags: tags.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean), note: note.value, logPath: logPath.value, service: service.value, startupCommand:startup.value, startupEnabled:autoStartup.checked, autoReconnect:reconnect.checked });
-  const original = JSON.stringify(draft());
   const duplicate = input('', 'checkbox');
   const duplicateRow = node('label', 'checkbox-row', duplicate, '已有相同地址、端口和用户名，仍保存为另一条配置');
-  const duplicateHost = () => !(host && matches(host)) && hosts.some((item) => item.id !== host?.id && matches(item));
+  const connectionSection = node('section', 'host-form-section host-ssh-settings', node('h3', '', 'SSH 连接'),
+    field('SSH 用户名', node('div', 'host-username-control', chromeIcon('user'), username)), identityHint,
+    ...(editor ? [editor.pane] : []), keyRow, keySecretPane, agentHint, authPicker);
+  updateAuth();
+  const original = JSON.stringify(draft());
+  const duplicateHost = () => !host?.id && hosts.some(matches);
   const updateDuplicate = () => {
     duplicateRow.hidden = !duplicateHost();
     duplicate.checked = false;
@@ -2591,12 +2929,13 @@ async function editHost(host, draftTab, target) {
     port.value = target.port || port.value;
     pasteHint.textContent = '已填入连接信息，请核对后保存。';
     updateDuplicate();
+    updateInheritance();
   });
   const details = node('details', 'host-form-section', node('summary', '', '更多设置'),
     field('连接路径', jumpPicker), routeHint,
-    ...(api.identities ? [field('登录配置', identityPicker), node('p', 'muted', '选择登录配置可复用用户名和认证方式。')] : []),
+    ...(api.identities ? [identityField, identityHelp] : []),
     field('标签', tags), field('备注', note), field('常用日志路径', logPath), field('常用 systemd 服务', service),...(api.snippets?[field('终端配色（未继承时）',terminalThemePicker),field('SSH 保活间隔（秒，0 关闭）',keepalive),field('连接超时（秒）',timeout),field('启动命令',startup),node('label','checkbox-row',autoStartup,'每次新建连接后在终端自动执行上述命令'),node('label','checkbox-row',reconnect,'异常断线后自动重连（最多 3 次；仅 Agent 或已保存密码）'),node('p','muted','自动重连会创建新会话，也会重新执行已启用的启动命令；转发规则须手动恢复。')]:[]));
-  const management = host && node('details', 'host-form-section', node('summary', '', '管理主机'), node('div', 'management-actions',
+  const management = host && node('details', 'host-form-section', node('summary', '', '管理主机'), clearKeyRow, node('div', 'management-actions',
     ...(hasPassword ? [button('清除已保存密码', () => { closePrompt('clear-password'); }, 'outlined')] : []),
     button('忘记指纹', () => { closePrompt('forget'); }, 'outlined'),
     button('删除主机', () => { closePrompt('delete'); }, 'outlined danger')));
@@ -2606,30 +2945,49 @@ async function editHost(host, draftTab, target) {
   const save = node('button', '', '保存');
   save.type = 'submit';
   save.value = 'save';
-  const conceal = () => editor?.hide();
+  const conceal = () => { editor?.hide(); keyEditor.hide(); };
+  const groupCreationError = node('p', 'dialog-error');
+  groupCreationError.setAttribute('role', 'alert');
+  groupCreationError.hidden = true;
   let result;
   window.addEventListener('blur', conceal);
   document.addEventListener('visibilitychange', conceal);
   try {
-    result = await prompt(host ? '编辑主机' : '新建主机', [
-      node('section', 'host-form-section', node('h3', '', '地址'), field('主机地址', addressField), pasteHint),
-      node('section', 'host-form-section', node('h3', '', '常规'), field('显示名称', name), field('分组', groupPicker), ...(api.groups ? [inheritanceOptions] : [])),
-      node('section', 'host-form-section', node('h3', '', 'SSH 连接'),
-        node('div', 'dialog-row', field('SSH 用户名', username), field('端口', port)), field('认证方式', authPicker), identityHint,
-        keyRow, keySecretPane, ...(editor ? [editor.pane] : []), duplicateRow),
-      details, ...(management ? [management] : [])
-    ], '保存并连接', async (action) => {
-      if (duplicateHost() && !duplicate.checked) throw new Error('请确认是否保存重复的连接配置。');
-      if (auth.value === 'key' && !key.value && !identity.value && !inheritIdentity.checked) throw new Error('请选择本机私钥。');
-      conceal();
-      const localPassword = auth.value === 'password' ? editor?.password.value || undefined : undefined;
-      return { hosts: await api.hosts.save({ ...draft(), localPassword,
-        localKeyPassphrase: auth.value === 'key' ? keySecret.value || undefined : undefined,
-        clearKeyPassphrase: clearKeySecret.checked }), connect: action === 'connect' };
-    }, [save], {
-      drawer: true, focus: addressField, submitValue: 'connect',
-      canClose: () => (JSON.stringify(draft()) === original && !editor?.password.value && !keySecret.value && !clearKeySecret.checked) || window.confirm('放弃尚未保存的主机修改？')
-    });
+    while (!vaultStatus.locked) {
+      result = await prompt(host ? '编辑主机' : '新建主机', [
+        node('section', 'host-form-section', node('h3', '', '地址'),
+          node('div', 'dialog-row', field('主机地址', addressField), field('端口', port)), pasteHint),
+        node('section', 'host-form-section', node('h3', '', '常规'), field('显示名称', name), field('分组', groupPicker), groupCreationError, ...(api.groups ? [inheritanceOptions] : [])),
+        connectionSection, duplicateRow, details, ...(management ? [management] : [])
+      ], '保存并连接', async (action) => {
+        if (duplicateHost() && !duplicate.checked) throw new Error('请确认是否保存重复的连接配置。');
+        if (auth.value === 'key' && !key.value && !identity.value && !inheritIdentity.checked) throw new Error('请选择本机私钥。');
+        conceal();
+        const localPassword = auth.value === 'password' ? editor?.password.value || undefined : undefined;
+        const previousIds = new Set(hosts.map(item => item.id));
+        const savedHosts = await api.hosts.save({ ...draft(), localPassword,
+          localKeyPassphrase: auth.value === 'key' ? keySecret.value || undefined : undefined,
+          clearKeyPassphrase: clearKeySecret.checked });
+        return { hosts: savedHosts, savedHostId: host?.id || savedHosts.find(item => !previousIds.has(item.id))?.id, connect: action === 'connect' };
+      }, [save], {
+        drawer: true, focus: addressField, submitValue: 'connect',
+        canClose: () => (JSON.stringify(draft()) === original && !editor?.password.value && !keySecret.value && !clearKeySecret.checked) || confirmDiscardHostChanges()
+      });
+      if (!createGroupRequested || result || vaultStatus.locked) break;
+      createGroupRequested = false;
+      groupCreationError.hidden = true;
+      try {
+        const created = await editGroup(undefined, groupAssets.find(item => item.path === group.value), undefined, {
+          name: newGroupName, submitLabel: '创建并返回主机', cancelLabel: '返回主机'
+        });
+        if (vaultStatus.locked) break;
+        refreshGroupChoices(created?.path || group.value);
+        updateAuth();
+      } catch (failure) {
+        groupCreationError.textContent = message(failure);
+        groupCreationError.hidden = false;
+      }
+    }
   } finally {
     conceal();
     if (editor) editor.password.value = '';
@@ -2641,7 +2999,7 @@ async function editHost(host, draftTab, target) {
     hosts = result.hosts;
     renderHosts();
     if (active?.kind === 'new') renderQuickConnect(active);
-    if (result.connect) await openHost(hosts.at(-1), { draftTab });
+    if (result.connect) await openHost(hosts.find(item => item.id === result.savedHostId), { draftTab });
     return;
   }
   const choice = dialog.returnValue;
@@ -3029,6 +3387,25 @@ function showHostSortMenu(anchor) {
   showActionMenu('主机与分组排序', anchor, actions);
 }
 
+function showHostActions() {
+  const anchor = $('host-actions'), actions = [];
+  const add = (label, run, icon, id, style = '') => {
+    const action = button('', run, `menu-with-icon ${style}`);
+    action.append(chromeIcon(icon), node('span', '', label));
+    if (id) action.id = id;
+    actions.push(action);
+  };
+  if (api.groups) add('新建分组', async () => {
+    const created = await editGroup(undefined, groupAssets.find(group => group.path === currentGroup), undefined, { submitLabel: '创建分组' });
+    if (created) openGroup(created.path);
+  }, 'group');
+  add('导入 OpenSSH', () => importHosts(), 'import', 'import-hosts');
+  if (api.hosts.csvPreview) add('导入 CSV', () => importHosts(true), 'import', 'import-csv');
+  if (api.hosts.csvExport) add('导出 CSV', () => exportHosts(), 'export', 'export-csv');
+  if (currentGroup) add('删除当前分组', () => deleteHostGroup(currentGroup), 'group', undefined, 'danger');
+  showActionMenu('更多主机操作', anchor, actions, anchor.getBoundingClientRect().left);
+}
+
 function hostOrderScope(kind, item) {
   const parentId = kind === 'group' ? item.parentId || null : item.groupId || groupAssets.find(g => g.path === item.group)?.id || null;
   return window.hostTree.scopes(orderedHostTree(), kind).find(scope => scope.parentId === parentId);
@@ -3228,7 +3605,6 @@ function renderHosts() {
   if (!visibleGroups.some(([group]) => group === selectedGroup)) selectedGroup = '';
   $('host-breadcrumb').hidden = treeLayout || !currentGroup;
   $('current-group').textContent = $('current-group').title = currentGroup;
-  $('remove-group').hidden = treeLayout || !currentGroup;
   const exact = query ? matching.filter((host) => target ? matchesTarget(host, target) : host.name.toLowerCase() === query) : [];
   const candidates = target || exact.length ? exact : matching;
   const saved = query && candidates.length === 1 ? candidates[0] : undefined;
@@ -3572,6 +3948,8 @@ function renderTabs() {
     open.querySelector('.tab-unread').hidden = !unread;
   }
   $('switch-tabs').hidden = entries.length < 2;
+  $('close-all-tabs').hidden = tabs.size < 2;
+  $('close-all-tabs').disabled = closingAllTabs;
   updateTabEdges();
   if (sessionFilters && $('session-switcher').open) renderSessionSwitcher();
 }
@@ -4022,6 +4400,25 @@ async function openHost(host, { force = false, draftTab, connectNow = true } = {
   if (connectNow) await connect(tab);
   else updateSession(tab, 'idle', '会话布局已打开，点击「连接」开始 SSH 会话。');
   return tab;
+}
+
+async function closeAllTabs() {
+  if (closingAllTabs || vaultStatus.locked || dialog.open || fileEditor.open || $('key-dialog').open) return;
+  const targets = [...tabs.values()];
+  if (!targets.length) return;
+  closingAllTabs = true; renderTabs();
+  try {
+    const ids = new Set(targets.map(tab => tab.id));
+    const ongoing = () => [...jobs.values()].filter(job => ids.has(job.sessionId) && ['queued', 'running', 'committing'].includes(job.status));
+    if (ongoing().some(job => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭所有会话。'); return; }
+    const transfers = ongoing();
+    if (transfers.length && !await confirm('关闭所有会话', `关闭 ${targets.length} 个标签，并取消正在传输的 ${transfers.length} 项任务？`, '取消任务并关闭所有')) return;
+    if (ongoing().some(job => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭所有会话。'); return; }
+    for (const tab of [...targets.filter(tab => tab.kind === 'command'), ...targets.filter(tab => tab.kind !== 'command')]) {
+      if (tabs.has(tab.id)) await closeTab(tab, { confirmed: true });
+    }
+    if (!tabs.size) status('已关闭所有会话。');
+  } finally { closingAllTabs = false; renderTabs(); }
 }
 
 async function closeWorkspaceTab(tab) {
@@ -5537,14 +5934,7 @@ $('host-search-form').addEventListener('submit', (event) => {
 $('library-button').addEventListener('click', () => selectTab(undefined, libraryView));
 $('tag-filter').addEventListener('change', renderHosts);
 $('all-hosts').addEventListener('click', () => openGroup(''));
-$('import-hosts').addEventListener('click', () => importHosts().catch((error) => status(message(error))));
-$('remove-group').addEventListener('click', async () => {
-  const group = currentGroup;
-  if (!group) return;
-  try {
-    await deleteHostGroup(group);
-  } catch (error) { status(message(error)); }
-});
+$('host-actions').addEventListener('click', showHostActions);
 for (const control of pageButtons) {
   control.addEventListener('click', () => {
     const page = control.dataset.page;
@@ -5611,12 +6001,14 @@ for (const type of ['pointerdown', 'keydown', 'wheel']) {
 }
 $('add-host').addEventListener('click', () => editHost().catch((error) => status(message(error))));
 $('host-sort').addEventListener('click', () => showHostSortMenu($('host-sort')));
+const hostSortCaret = node('span', 'dropdown-caret'); hostSortCaret.setAttribute('aria-hidden', 'true');
+$('host-sort').replaceChildren(chromeIcon('sort'), node('span', 'dropdown-text', '排序'), hostSortCaret);
 const hostLayout = $('host-layout');
 try { const saved = localStorage.getItem('host-layout'); if (['cards', 'rows', 'tree'].includes(saved)) hostLayout.value = saved; } catch { /* Card view is the default. */ }
 workspace.dataset.hostLayout = hostLayout.value;
-const hostLayoutPicker = selectControl(hostLayout);
+const hostLayoutPicker = selectControl(hostLayout, '主机视图', { align: 'end', icon: option => chromeIcon(option?.value || 'cards') });
 hostLayoutPicker.classList.add('host-layout');
-selectControl($('tag-filter'), '筛选标签', { searchable: true, placeholder: '搜索主机标签' });
+selectControl($('tag-filter'), '筛选标签', { searchable: true, placeholder: '搜索主机标签', align: 'end', icon: () => chromeIcon('tag') });
 selectControl($('unlock-mode'));
 hostLayout.addEventListener('change', () => {
   workspace.dataset.hostLayout = hostLayout.value;
@@ -5693,6 +6085,7 @@ $('quick-connect-search').addEventListener('input', (event) => {
 $('quick-add-host').addEventListener('click', () => editHost(undefined, active).catch((error) => status(message(error))));
 $('add-tab').addEventListener('click', addNewTab);
 $('switch-tabs').addEventListener('click', chooseSession);
+$('close-all-tabs').addEventListener('click', () => { void closeAllTabs().catch(error => status(message(error))); });
 $('session-switcher-search').addEventListener('input', renderSessionSwitcher);
 const sessionSwitcher = $('session-switcher');
 $('close-switcher').addEventListener('click', () => sessionSwitcher.close());
@@ -5794,5 +6187,3 @@ if (api.updates) {
   }, 8000);
 }
 if(api.preferences) matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{if(uiPreferences.theme==='system')applyPreferences();});
-if (api.hosts.csvPreview) $('import-hosts').after(button('导入 CSV', () => importHosts(true), 'toolbar-button'));
-if (api.hosts.csvExport) $('import-hosts').parentElement.append(button('导出 CSV', () => exportHosts(), 'toolbar-button'));

@@ -28,16 +28,15 @@
     const rect = wrapper.getBoundingClientRect();
     const viewportWidth = document.documentElement.clientWidth;
     const viewportHeight = document.documentElement.clientHeight;
-    const width = active.config.searchable
-      ? Math.min(640, Math.max(380, rect.width), viewportWidth - 16)
-      : Math.min(rect.width, viewportWidth - 16);
+    const width = Math.min(Math.max(rect.width, active.config.minWidth ?? (active.config.searchable ? 280 : 176)), viewportWidth - 16);
     panel.classList.toggle('dropdown-compact', !active.config.searchable && width < 208);
     panel.style.width = `${width}px`;
     const below = viewportHeight - rect.bottom - 12;
     const titlebar = document.querySelector('.titlebar')?.getBoundingClientRect().bottom || 0;
     const above = rect.top - titlebar - 12;
     const aboveTrigger = below < (active.config.searchable ? 220 : Math.min(220, panel.scrollHeight)) && above > below;
-    panel.style.left = `${Math.max(8, Math.min(rect.left, viewportWidth - width - 8))}px`;
+    const left = active.config.align === 'end' ? rect.right - width : rect.left;
+    panel.style.left = `${Math.max(8, Math.min(left, viewportWidth - width - 8))}px`;
     const height = Math.min(active.config.searchable ? 380 : 272, Math.max(36, aboveTrigger ? above : below));
     panel.style.maxHeight = `${height}px`;
     panel.style.height = active.config.searchable ? `${height}px` : '';
@@ -91,7 +90,8 @@
     row.setAttribute('aria-selected', String(option.value === active.config.value()));
     if (option.disabled) row.setAttribute('aria-disabled', 'true');
     if (option.icon) {
-      const icon = element('span', 'dropdown-icon', option.icon);
+      const icon = element('span', 'dropdown-icon');
+      icon.append(option.icon);
       icon.setAttribute('aria-hidden', 'true');
       row.append(icon);
     }
@@ -141,7 +141,20 @@
     search.setAttribute('aria-controls', list.id);
     const count = element('small', 'dropdown-count');
     count.setAttribute('role', 'status');
-    panel.append(element('div', 'dropdown-search', ''), list, count);
+    const footer = element('div', 'dropdown-footer');
+    footer.append(count);
+    if (config.action) {
+      const action = element('button', 'outlined', config.action.label);
+      action.type = 'button';
+      action.addEventListener('pointerdown', event => event.preventDefault());
+      action.addEventListener('click', event => {
+        event.preventDefault();
+        close();
+        config.action.run(search.value.trim());
+      });
+      footer.append(action);
+    }
+    panel.append(element('div', 'dropdown-search', ''), list, footer);
     panel.firstChild.append(search, filters);
     (wrapper.closest('dialog, #vault-lock') || document.body).append(panel);
     const render = () => {
@@ -282,10 +295,11 @@
     wrapper.append(trigger, select, description, error);
     const refresh = () => {
       const selected = select.selectedOptions[0];
-      icon.textContent = selected?.dataset.icon || '';
-      icon.hidden = !icon.textContent;
-      value.textContent = selected?.textContent || '请选择';
-      value.title = [value.textContent, selected?.dataset.description].filter(Boolean).join('\n');
+      const selectedIcon = settings.icon?.(selected) ?? selected?.dataset.icon;
+      icon.replaceChildren(...(selectedIcon ? [selectedIcon] : []));
+      icon.hidden = !selectedIcon;
+      value.textContent = settings.valueLabel?.(selected) ?? selected?.textContent ?? '请选择';
+      value.title = [selected?.textContent || value.textContent, selected?.dataset.description].filter(Boolean).join('\n');
       description.textContent = selected?.dataset.description || '';
       description.hidden = !settings.showDescription || !description.textContent;
       trigger.disabled = select.disabled;
@@ -298,7 +312,7 @@
     };
     const config = { ...settings, anchor: trigger, wrapper, label, value: () => select.value,
       options: () => Array.from(select.options, (option) => ({
-        value: option.value, label: option.textContent, icon: option.dataset.icon,
+        value: option.value, label: option.textContent, icon: settings.icon?.(option) ?? option.dataset.icon,
         description: option.dataset.description, search: option.dataset.search,
         source: option.dataset.source, group: option.dataset.group,
         disabled: option.disabled || (select.required && !option.value)
@@ -311,9 +325,13 @@
       }
     };
     configure(config);
-    trigger.addEventListener('click', () => {
+    // Keep native focus/label activation from reopening a menu during the same click.
+    trigger.addEventListener('pointerdown', event => { if (event.button === 0) event.preventDefault(); });
+    trigger.addEventListener('click', event => {
+      event.preventDefault();
+      const opened = active?.anchor === trigger;
       trigger.focus({ preventScroll: true });
-      if (active?.anchor === trigger) close();
+      if (opened) close();
       else open(config);
     });
     select.addEventListener('change', refresh);
@@ -353,7 +371,8 @@
     input.addEventListener('input', (event) => { if (!event.isComposing) open(config, input.value.trim()); });
     input.addEventListener('compositionend', () => open(config, input.value.trim()));
     toggle.addEventListener('pointerdown', (event) => event.preventDefault());
-    toggle.addEventListener('click', () => {
+    toggle.addEventListener('click', event => {
+      event.preventDefault();
       if (active?.anchor === input) close();
       else {
         input.focus({ preventScroll: true });

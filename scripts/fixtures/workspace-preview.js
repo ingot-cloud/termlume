@@ -174,7 +174,8 @@ window.termlume = {
     else previewIdentities[index] = identity;
     return { identityId: identity.id, hosts: previewHosts };
   }},
-  keys:{scan:async()=>({directory:'/preview/.ssh',keys:previewKeys}),agent:async()=>({available:true,keys:[]})},
+  keys:{scan:async()=>({directory:'/preview/.ssh',keys:previewKeys}),agent:async()=>({available:true,keys:[]}),importFile:async()=>null,
+    create:async request=>{previewCalls.push(['create-key',request]);const key={name:request.name,path:request.directory+'/'+request.name,type:'ssh-ed25519',private:true,encrypted:!!request.passphrase,fingerprint:'SHA256:created',publicKey:'ssh-ed25519 created'};previewKeys.push(key);return key;}},
   snippets:{list:async()=>structuredClone(previewSnippets),run:async value=>previewCalls.push(['run',value]),
     save:async ({snippet,expected})=>{
       previewCalls.push(['save-snippet',snippet]);

@@ -32,6 +32,9 @@
         <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
       </button>
       <button id="switch-tabs" type="button" aria-haspopup="dialog" aria-controls="session-switcher" aria-expanded="false" aria-label="切换会话" data-shortcut="J" hidden>⋯</button>
+      <button id="close-all-tabs" type="button" aria-label="关闭所有会话" title="关闭所有会话" hidden>
+        <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h14v14M3 7h14v14H3zM7 11l6 6m0-6-6 6"/></svg>
+      </button>
     </div>
     <button id="palette-button" class="launcher" aria-label="查找主机、会话或命令" data-shortcut="K">
       <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg>
@@ -76,11 +79,12 @@
           </form>
           <div class="toolbar-row">
             <div class="toolbar-actions">
-              <button id="add-host" type="button" class="primary">＋ 新建主机</button>
-              <button id="import-hosts" type="button" class="toolbar-button">导入 OpenSSH</button>
+              <div class="host-create-split">
+                <button id="add-host" type="button" class="primary">＋ 新建主机</button>
+                <button id="host-actions" type="button" class="primary" aria-label="更多主机操作" title="更多主机操作" aria-haspopup="menu" aria-expanded="false"><span class="dropdown-caret" aria-hidden="true"></span></button>
+              </div>
             </div>
             <div class="toolbar-actions host-filters">
-              <button id="remove-group" type="button" hidden>删除分组</button>
               <select id="tag-filter" aria-label="筛选标签"></select>
               <button id="host-sort" type="button" class="toolbar-button" aria-haspopup="menu" aria-expanded="false" hidden>排序</button>
               <select id="host-layout" aria-label="主机视图">

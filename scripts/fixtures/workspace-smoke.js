@@ -3,7 +3,7 @@
   const results = [];
   const assert = (condition, label) => { if (!condition) throw new Error(label); results.push(label); };
   const tick = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  const findButton = (root, label) => [...root.querySelectorAll('button')].find(b => b.textContent === label);
+  const findButton = (root, label) => [...root.querySelectorAll('button')].find(b => b.textContent === label || b.getAttribute('aria-label') === label);
   try {
     await tick(); await refreshHosts();
     const library = $('host-library');
@@ -317,30 +317,80 @@
     selectTab(undefined,'hosts'); await tick();
     const quickEdit=$('host-list').querySelector('.host-quick-edit');
     assert(quickEdit?.getAttribute('aria-label').startsWith('编辑主机'), '主机卡片提供独立快捷编辑按钮');
+    const backgroundGeometry = () => [...document.querySelectorAll('#workspace-content, .host-toolbar, #host-search-form, #host-library, #host-list .host-open, #host-list .group-open, .host-toolbar .toolbar-actions > *')]
+      .map(element => { const rect=element.getBoundingClientRect(); return ['x','y','width','height'].map(key=>Math.round(rect[key]*100)/100); });
+    const beforeDrawer = JSON.stringify(backgroundGeometry());
     quickEdit.click(); await tick();
     assert(dialog.open && dialog.textContent.includes('编辑主机'), '快捷编辑直接打开主机表单');
     assert(!dialog.matches(':modal') && workspace.inert && !document.querySelector('.titlebar').inert &&
       document.elementFromPoint(innerWidth / 2, 6).closest('.titlebar'), '抽屉只阻止内容操作，标题栏仍可接收窗口操作');
     assert(getComputedStyle(dialog).animationName === 'host-drawer-enter', '主机抽屉打开时具有滑入动画');
+    assert(JSON.stringify(backgroundGeometry()) === beforeDrawer, '编辑抽屉浮动覆盖，后台工具栏、卡片和内容区的位置及尺寸保持不变');
     const drawerClosed = new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
     findButton(dialog,'取消').click();
     assert(dialog.open && dialog.dataset.closing === 'true', '抽屉关闭时先滑出，再结束对话框');
     await drawerClosed; await tick();
     assert(!workspace.inert && !document.body.classList.contains('overlay-open'), '关闭抽屉恢复工作区交互');
+    assert(JSON.stringify(backgroundGeometry()) === beforeDrawer, '关闭编辑抽屉后后台布局保持不变');
     const createHostForm = editHost(); await tick();
+    assert(JSON.stringify(backgroundGeometry()) === beforeDrawer, '新建主机抽屉同样浮动覆盖，不挤压后台布局');
     const inheritance = dialog.querySelector('.group-inheritance-options');
-    const groupInput = dialog.querySelector('[aria-label="分组"]');
+    const groupTrigger = dialog.querySelector('[aria-label="分组"]');
+    const groupInput = groupTrigger.closest('.dropdown').querySelector('select');
     const routeControl = dialog.querySelector('[aria-label="连接路径"]');
     assert(inheritance.hidden && !routeControl.closest('details').open,
       '新建主机默认隐藏分组继承选项，连接路径收起在更多设置');
-    groupInput.value = '新建测试分组'; groupInput.dispatchEvent(new Event('input')); await tick();
+    assert(groupTrigger.tagName === 'BUTTON' && !groupTrigger.closest('.dropdown').querySelector('input'),
+      '主机分组只允许选择，搜索输入位于弹出的选择框内');
+    groupTrigger.click(); await tick();
+    const groupPanel = $(groupTrigger.getAttribute('aria-controls'));
+    const groupSearch = groupPanel.querySelector('input[type="search"]');
+    groupSearch.value = '生产'; groupSearch.dispatchEvent(new Event('input'));
+    assert(groupPanel.querySelectorAll('[role="option"]').length === 1 && groupPanel.textContent.includes('生产环境'),
+      '分组选择框可按名称或路径筛选');
+    assert(Math.abs(groupPanel.getBoundingClientRect().width - groupTrigger.getBoundingClientRect().width) <= 1,
+      '搜索分组下拉框与触发框等宽');
+    groupPanel.querySelector('[role="option"]').click();
     assert(!inheritance.hidden && inheritance.querySelectorAll('input[type="checkbox"]').length === 3,
-      '输入新分组后才显示端口、登录配置和配色继承');
+      '选择分组后才显示端口、登录配置和配色继承');
     inheritance.querySelector('input').click();
     groupInput.value = ''; groupInput.dispatchEvent(new Event('input')); await tick();
     assert(inheritance.hidden && [...inheritance.querySelectorAll('input')].every(input => !input.checked)
       && !dialog.querySelector('input[type="number"]').disabled,
       '清空分组同步清除隐藏的继承状态并恢复端口编辑');
+    const hostInput = label => [...dialog.querySelectorAll('label')].find(item=>item.firstChild.textContent === label).querySelector('input');
+    const draftAddress = hostInput('主机地址'), draftName = hostInput('显示名称'), draftUsername = hostInput('SSH 用户名');
+    const draftPassword = dialog.querySelector('.credential-row input[type="password"]');
+    draftAddress.value = 'draft.example.test'; draftName.value = '保留的主机草稿'; draftUsername.value = 'draft-user';
+    draftPassword.value = 'draft-only-password';
+    const createFromPicker = async query => {
+      dialog.querySelector('[aria-label="分组"]').click(); await tick();
+      const panel = dialog.querySelector('.dropdown-searchable');
+      const search = panel.querySelector('input'); search.value = query; search.dispatchEvent(new Event('input'));
+      const closed = new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+      findButton(panel,'新建分组').click(); await closed; await tick();
+    };
+    await createFromPicker('新建测试分组');
+    const groupPage = dialog;
+    assert(dialog.open && dialog.classList.contains('host-drawer') && workspace.dataset.view === 'hosts' && groupPage.querySelector('h2').textContent === '新建分组'
+      && groupPage.querySelector('input[type="text"]').value === '新建测试分组',
+      '下拉框的新建按钮打开分组浮动抽屉，并带入搜索名称');
+    groupPage.querySelector('[aria-label="上级分组"]').closest('.dropdown').querySelector('select').value = 'prod';
+    const groupSaved = new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+    findButton(groupPage,'创建并返回主机').click(); await groupSaved; await tick();
+    assert(dialog.open && workspace.dataset.view === 'hosts' && hostInput('主机地址') === draftAddress
+      && draftAddress.value === 'draft.example.test' && draftName.value === '保留的主机草稿'
+      && draftUsername.value === 'draft-user' && draftPassword.value === 'draft-only-password',
+      '创建分组后自动返回主机抽屉，保留地址、名称、用户名和未保存密码草稿');
+    const createdGroup = previewGroups.find(item=>item.name === '新建测试分组');
+    assert(groupInput.value === '生产环境 / 新建测试分组' && createdGroup?.parentId === 'prod',
+      '新建的嵌套分组自动出现在选择框并选中');
+    await createFromPicker('取消创建测试');
+    const groupCancelled = new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+    findButton(groupPage,'返回主机').click(); await groupCancelled; await tick();
+    assert(dialog.open && groupInput.value === '生产环境 / 新建测试分组' && draftPassword.value === 'draft-only-password'
+      && !previewGroups.some(item=>item.name === '取消创建测试'),
+      '取消分组创建也返回原主机草稿，且不创建分组');
     const authInput = dialog.querySelector('[aria-label="认证方式"]').closest('.dropdown').querySelector('select');
     assert(!dialog.querySelector('.credential-row').closest('.credential-pane').hidden && dialog.querySelector('.host-key-selection').parentElement.hidden,
       '默认 SSH 密码认证只显示密码内容');
@@ -351,9 +401,76 @@
     assert(dialog.querySelector('.credential-row').closest('.credential-pane').hidden && dialog.querySelector('.host-key-selection').parentElement.hidden,
       '切换 Agent 认证不显示密码或私钥输入');
     dialog.close(); await createHostForm;
+    previewGroups.splice(previewGroups.indexOf(createdGroup),1);
+    const inheritedGroup = {id:'inherit-editor-parent',name:'登录继承测试',identityId:'ops',port:2222,terminalTheme:'light'};
+    const inheritedChild = {id:'inherit-editor-child',name:'子组',parentId:inheritedGroup.id};
+    const inheritedHost = {id:'inherit-editor-host',name:'继承登录测试',address:'inherit.example.test',port:22,
+      username:'ops',auth:'agent',groupId:inheritedChild.id,group:'登录继承测试 / 子组',inheritIdentity:true,identityId:'ops'};
+    previewGroups.push(inheritedGroup,inheritedChild);
+    previewHosts.push(inheritedHost);
+    const inheritedForm = editHost(inheritedHost); await tick();
+    const hostUsernameInput = () => [...dialog.querySelectorAll('label')].find(label=>label.firstChild.textContent === 'SSH 用户名').querySelector('input');
+    const inheritedUsername = hostUsernameInput();
+    const inheritedAuth = dialog.querySelector('[aria-label="认证方式"]').closest('.dropdown').querySelector('select');
+    const inheritedCheckbox = dialog.querySelectorAll('.group-inheritance-options input')[1];
+    const inheritedPicker = dialog.querySelector('[aria-label="登录配置"]');
+    const inheritedSelect = inheritedPicker.closest('.dropdown').querySelector('select');
+    assert(inheritedUsername.disabled && inheritedAuth.disabled && inheritedSelect.disabled,
+      '重新编辑继承登录的主机时，用户名和认证方式由上级分组控制');
+    const inheritedRows = dialog.querySelectorAll('.inheritance-row');
+    assert(dialog.querySelectorAll('.group-inheritance-options [role="switch"]').length === 3
+      && inheritedRows[1].querySelector('.inheritance-value').textContent === 'ops · SSH Agent'
+      && inheritedRows[1].querySelector('.inheritance-source').textContent === '来自 登录继承测试',
+      '集中开关按端口、登录、配色三行显示使用值及上级分组来源');
+    dialog.querySelectorAll('.group-inheritance-options input')[0].click();
+    dialog.querySelectorAll('.group-inheritance-options input')[2].click();
+    assert(inheritedRows[0].querySelector('.inheritance-value').textContent === '2222'
+      && inheritedRows[2].querySelector('.inheritance-value').textContent === '浅色'
+      && [...dialog.querySelectorAll('.group-inheritance-options input')].every(item=>item.checked),
+      '三个集中开关可同时开启，端口和配色分别解析到上级分组默认值');
+    assert(dialog.querySelector('.host-ssh-settings').hidden && !dialog.querySelector('input[type="number"]').closest('section').hidden,
+      '继承分组登录时隐藏 SSH 连接区，地址旁的端口仍可查看和设置');
+    inheritedCheckbox.click();
+    assert(!inheritedUsername.disabled && !inheritedAuth.disabled && !inheritedSelect.disabled && inheritedSelect.value === ''
+      && inheritedUsername.value === 'ops' && inheritedAuth.value === 'agent',
+      '取消登录继承立即解除关联并恢复用户名和认证方式编辑，保留现有连接值');
+    assert(!dialog.querySelector('.host-ssh-settings').hidden, '取消分组登录继承后重新显示 SSH 连接区');
+    assert(inheritedPicker.textContent.includes('单独配置此主机'), '取消继承后登录配置选择器同步显示单独配置此主机');
+    inheritedUsername.value = 'local-operator'; inheritedUsername.dispatchEvent(new Event('input'));
+    assert(inheritedRows[1].querySelector('.inheritance-value').textContent === 'local-operator · SSH Agent'
+      && inheritedRows[1].querySelector('.inheritance-source').textContent === '单独设置',
+      '取消登录继承后，行内使用值随用户名编辑实时更新');
+    dialog.querySelector('button[value="save"]').click(); await inheritedForm;
+    const savedInheritedHost = previewHosts.find(h=>h.id===inheritedHost.id);
+    assert(savedInheritedHost.username === 'local-operator' && !savedInheritedHost.inheritIdentity && !savedInheritedHost.identityId,
+      '取消继承后的用户名与独立登录状态正确保存');
+    assert(savedInheritedHost.inheritPort && savedInheritedHost.port === 2222 && savedInheritedHost.inheritTheme && savedInheritedHost.terminalTheme === 'light',
+      '保存时保留端口和配色的独立继承状态');
+    const reopenedInheritedForm = editHost(savedInheritedHost); await tick();
+    assert(!hostUsernameInput().disabled
+      && hostUsernameInput().value === 'local-operator',
+      '保存后再次编辑仍可修改独立用户名');
+    const reopenedCheckbox = dialog.querySelectorAll('.group-inheritance-options input')[1];
+    reopenedCheckbox.click();
+    const reopenedGroup = dialog.querySelector('[aria-label="分组"]').closest('.dropdown').querySelector('select');
+    reopenedGroup.value = ''; reopenedGroup.dispatchEvent(new Event('input'));
+    assert(!reopenedCheckbox.checked && !hostUsernameInput().disabled
+      && dialog.querySelector('[aria-label="登录配置"]').closest('.dropdown').querySelector('select').value === '',
+      '清空分组同步解除继承登录关联并恢复用户名编辑');
+    const directIdentity = dialog.querySelector('[aria-label="登录配置"]').closest('.dropdown').querySelector('select');
+    directIdentity.value = 'ops'; directIdentity.dispatchEvent(new Event('change'));
+    reopenedGroup.dispatchEvent(new Event('input'));
+    assert(hostUsernameInput().disabled && directIdentity.value === 'ops',
+      '单独选择的共享登录配置仍控制用户名，不受普通表单刷新影响');
+    dialog.close(); await reopenedInheritedForm;
+    previewHosts.splice(previewHosts.findIndex(h=>h.id===inheritedHost.id),1);
+    previewGroups.splice(previewGroups.indexOf(inheritedGroup),2);
+    await refreshHosts();
     const more=$('host-list').querySelector('.host-open ~ .host-edit:last-child'); more.click(); await tick();
     assert(hostMenu.panel.querySelectorAll('button').length >= 5 && [...hostMenu.panel.querySelectorAll('button')].every(b=>b.scrollWidth<=b.clientWidth+1 && b.scrollHeight<=b.clientHeight+1), '主机更多菜单文字完整容纳在按钮内');
-    assert([...hostMenu.panel.querySelectorAll('button'), $('import-hosts'), ...$('import-hosts').parentElement.querySelectorAll('button')].every(b=>!/(?:…|\.{3})$/.test(b.textContent.trim())), '导入及主机操作菜单使用完整文字，不带省略号后缀');
+    assert([...hostMenu.panel.querySelectorAll('button')].every(b=>!/(?:…|\.{3})$/.test(b.textContent.trim())), '主机操作菜单使用完整文字，不带省略号后缀');
+    closeHostMenu();$('host-actions').click();
+    assert($('import-hosts') && [...hostMenu.panel.querySelectorAll('button')].every(b=>!/(?:…|\.{3})$/.test(b.textContent.trim())), '导入操作收进新建主机旁的下拉菜单，并使用完整文字');
     closeHostMenu(); selectTab(production);
     const keyHost={id:'key-host',name:'密钥认证测试',address:'key.example.test',port:22,username:'ops',auth:'key',keyPath:'/preview/key'};
     previewHosts.push(keyHost);
@@ -378,7 +495,7 @@
     findButton(dialog,'选择私钥').click(); await tick();
     assert(findButton(picker,'确定').disabled && picker.textContent.includes('暂无可选私钥'), '没有已有私钥时不能确认空选择');
     findButton(picker,'关闭').click(); previewKeys.push(...savedKeys); await tick();
-    const keySecretInput=[...dialog.querySelectorAll('label')].find(label=>label.textContent.startsWith('私钥口令（仅保存在本机）')).querySelector('input');
+    const keySecretInput=dialog.querySelector('.host-key-passphrase input[type="password"]');
     keySecretInput.value='fixture-only-key-secret';
     dialog.querySelector('button[value="save"]').click(); await editKey;
     assert(previewCalls.some(([type,value])=>type==='save-host'&&value.id===keyHost.id&&value.localKeyPassphrase==='fixture-only-key-secret'&&value.keyPath==='/preview/second-key'), '私钥选择和口令从主机编辑表单保存');

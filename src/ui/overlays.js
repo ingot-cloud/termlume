@@ -76,7 +76,9 @@
     if (pane?.open && !pane.contains(event.target)) focus(pane);
   });
   backdrop.addEventListener('click', () => {
-    if (stack.at(-1)?.pane.id === 'session-switcher') stack.at(-1).pane.close();
+    const pane = stack.at(-1)?.pane;
+    if (pane?.id === 'session-switcher') pane.close();
+    else if (pane?.classList.contains('host-drawer')) pane.dispatchEvent(new Event('cancel', { cancelable: true }));
   });
   window.overlays = { show };
 })();

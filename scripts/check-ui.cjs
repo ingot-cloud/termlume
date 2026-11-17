@@ -637,15 +637,604 @@ async function main() {
     assert(Math.abs(wide.trigger.width-wide.panel.width)<=1 && Math.abs(wide.trigger.left-wide.panel.left)<=1,'Wide menus must match their trigger');
     await shot(`dropdown-width-${width}.png`);
     await js("closeDropdown();selectTab(undefined,'hosts');$('host-layout').closest('.dropdown').querySelector('button').click()");
-    const narrow=await js("(()=>{const t=$('host-layout').closest('.dropdown').querySelector('button'),p=document.querySelector('.dropdown-panel[role=listbox]');return[t.getBoundingClientRect().width,p.getBoundingClientRect().width]})()");
-    assert(Math.abs(narrow[0]-narrow[1])<=1,'Compact menus must match their trigger too');
+    const narrow=await js("(()=>{const t=$('host-layout').closest('.dropdown').querySelector('button'),p=document.querySelector('.dropdown-panel[role=listbox]');return[t.getBoundingClientRect().width,p.getBoundingClientRect().width,p.getBoundingClientRect().left,p.getBoundingClientRect().right,innerWidth]})()");
+    assert(narrow[1]>=176 && narrow[1]>narrow[0] && narrow[2]>=8 && narrow[3]<=narrow[4]-8,'Compact menus must expand for readability and remain inside the window');
     assert(await js("[...document.querySelectorAll('.dropdown-panel[role=listbox] .dropdown-text > span')].every(s=>s.getClientRects().length===1)"),'Short options must stay on one line in compact menus');
+    await js("closeDropdown();$('tag-filter').closest('.dropdown').querySelector('button').click()");
+    const tagBounds=await js("(()=>{const t=$('tag-filter').closest('.dropdown').querySelector('button'),p=document.querySelector('.dropdown-searchable'),s=p.querySelector('input');return{trigger:t.getBoundingClientRect().width,panel:p.getBoundingClientRect().width,search:s.getBoundingClientRect().width,left:p.getBoundingClientRect().left,right:p.getBoundingClientRect().right,viewport:innerWidth,shortLabels:[...p.querySelectorAll('.dropdown-option .dropdown-text > span')].filter(s=>s.textContent==='全部标签').every(s=>s.getBoundingClientRect().height<25)}})()");
+    assert(tagBounds.panel>=280 && tagBounds.panel>tagBounds.trigger && tagBounds.search>=240 && tagBounds.left>=8 && tagBounds.right<=tagBounds.viewport-8 && tagBounds.shortLabels,
+      `Tag search and options must remain readable: ${JSON.stringify(tagBounds)}`);
+    await overflow();await shot(`toolbar-tag-menu-${width}.png`);await js('closeDropdown()');
+    const styles=await js("[$('tag-filter').closest('.dropdown').querySelector('button'),$('host-sort'),$('host-layout').closest('.dropdown').querySelector('button')].map(b=>{const s=getComputedStyle(b);return{height:b.getBoundingClientRect().height,border:s.borderTopWidth,radius:s.borderRadius,icon:!!b.querySelector('svg.chrome-icon[aria-hidden=true]'),caret:!!b.querySelector('.dropdown-caret[aria-hidden=true]')}})");
+    assert(styles.every(s=>s.icon&&s.caret&&s.border==='1px'&&s.radius===styles[0].radius&&Math.abs(s.height-styles[0].height)<=1),'Tag, sort and layout triggers must share icons, carets and dimensions');
+    const closedCaret=await js("getComputedStyle($('host-sort').querySelector('.dropdown-caret')).transform");
+    for(let click=0;click<2;click++) {
+      const point=await js("(()=>{const r=$('host-sort').getBoundingClientRect();return{x:r.left+r.width/2,y:r.top+r.height/2}})()");
+      await run('Input.dispatchMouseEvent',{type:'mouseMoved',...point});
+      await run('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
+      await run('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});await tick();
+      assert.equal(await js("$('host-sort').getAttribute('aria-expanded')"),String(click===0),'Sort trigger must toggle on repeated real pointer clicks');
+      const caret=await js("getComputedStyle($('host-sort').querySelector('.dropdown-caret')).transform");
+      if(click===0){assert.notEqual(caret,closedCaret);await overflow();await shot(`toolbar-sort-menu-${width}.png`);}else assert.equal(caret,closedCaret);
+    }
     await js(`(async()=>{closeDropdown();await viewPreferencesSave;previewPreferences={...previewPreferences,theme:'light',fontSize:18,hostLayout:'tree',navigationCollapsed:true};await refreshHosts()})()`);
     assert.deepEqual(await js("[document.documentElement.dataset.theme,$('host-layout').value,workspace.dataset.hostLayout,workspace.dataset.navCollapsed]"),['light','tree','tree','true']);
     await js("(async()=>{previewPreferences=settingsOriginal;await refreshHosts()})()");
     await overflow();
-    console.log(`${width}px: PASS dropdown width and live application of shared appearance/view preferences`);
+    console.log(`${width}px: PASS readable compact dropdowns, aligned toolbar icons/carets, real pointer sort toggling and live appearance/view preferences`);
   };
+  if (process.argv.includes('--toolbar-dropdowns-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await sharedUiChecks(width);
+    }
+    return;
+  }
+  const inheritanceChecks = async width => {
+    await js(`(async()=>{window.inheritOriginalHosts=structuredClone(previewHosts);window.inheritOriginalGroups=structuredClone(previewGroups);
+      previewGroups.push({id:'inherit-parent',name:'继承来源测试 / 长名称业务分组',port:2222,identityId:'ops',terminalTheme:'light'},
+        {id:'inherit-child',name:'应用子组',parentId:'inherit-parent'});
+      previewHosts.push({id:'inherit-layout',name:'集中开关验收',address:'inherit.example.test',port:22,username:'local-user',auth:'agent',groupId:'inherit-child',group:'继承来源测试 / 长名称业务分组 / 应用子组'});
+      selectTab(undefined,'hosts');await refreshHosts();void editHost(hosts.find(h=>h.id==='inherit-layout'))})()`);
+    await wait("dialog.open && Boolean(dialog.querySelector('.inheritance-row'))");
+    await wait("!dialog.getAnimations().some(a=>a.playState==='running')");
+    await js("dialog.querySelector('.group-inheritance-options').scrollIntoView({block:'center'})");
+    await overflow();await shot(`inheritance-local-${width}.png`);
+    await js("dialog.querySelectorAll('.group-inheritance-options input').forEach(input=>input.click())");
+    assert.deepEqual(await js("[...dialog.querySelectorAll('.inheritance-value')].map(v=>v.textContent)"),['2222','ops · SSH Agent','浅色']);
+    assert(await js("dialog.querySelector('.host-ssh-settings').hidden && [...dialog.querySelectorAll('.inheritance-source')].every(s=>s.textContent==='来自 继承来源测试 / 长名称业务分组')"));
+    const columns=await js("[...dialog.querySelectorAll('.inheritance-row .security-switch')].map(e=>e.getBoundingClientRect().right)");
+    assert(Math.max(...columns)-Math.min(...columns)<=1,'All switches must align in one column');
+    await overflow();await shot(`inheritance-group-${width}.png`);
+    await js("dialog.querySelector('[aria-label=\"登录配置跟随分组\"]').focus()");
+    await run('Input.dispatchKeyEvent',{type:'keyDown',key:' ',code:'Space',windowsVirtualKeyCode:32});
+    await run('Input.dispatchKeyEvent',{type:'keyUp',key:' ',code:'Space',windowsVirtualKeyCode:32});
+    assert(await js("!dialog.querySelector('[aria-label=\"登录配置跟随分组\"]').checked && !dialog.querySelector('.host-ssh-settings').hidden && dialog.querySelector('[aria-label=\"端口跟随分组\"]').checked && dialog.querySelector('[aria-label=\"终端配色跟随分组\"]').checked"),'Space must toggle only the focused inheritance setting');
+    await js("(()=>{const group=dialog.querySelector('[aria-label=\"分组\"]').closest('.dropdown').querySelector('select');group.value='预发环境';group.dispatchEvent(new Event('change'));dialog.querySelector('[aria-label=\"登录配置跟随分组\"]').click()})()");
+    assert.deepEqual(await js("[...dialog.querySelectorAll('.inheritance-value')].slice(0,2).map(v=>v.textContent)"),['22','未设置登录配置']);
+    assert(await js("dialog.querySelector('.inheritance-unavailable .inheritance-source').textContent.includes('关闭跟随') && dialog.querySelector('.inheritance-source').textContent==='系统默认'"));
+    await overflow();await shot(`inheritance-fallback-${width}.png`);
+    await js("(async()=>{dialog.close();previewHosts.splice(0,previewHosts.length,...inheritOriginalHosts);previewGroups.splice(0,previewGroups.length,...inheritOriginalGroups);await refreshHosts()})()");
+    console.log(`${width}px: PASS centralized inheritance switch alignment, parent sources, defaults, independent keyboard toggles and missing-login hint`);
+  };
+  if (process.argv.includes('--inheritance-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await inheritanceChecks(width);
+    }
+    return;
+  }
+  const hostLoginChecks = async width => {
+    await wait('!dialog.open && !dialog.childElementCount');
+    await js("window.loginOriginal={hasPassword:api.hosts.hasPassword,revealPassword:api.hosts.revealPassword,save:api.hosts.save};window.loginRevealCalls=0;api.hosts.hasPassword=async()=>true;api.hosts.revealPassword=async()=>{loginRevealCalls++;return 'disposable saved login password'};selectTab(undefined,'hosts');currentGroup='';void editHost()");
+    await wait("dialog.open && dialog.querySelector('.host-auth-switch')");
+    assert(await js("dialog.querySelector('.host-auth-switch select').value==='password' && !dialog.querySelector('.host-password-pane').hidden"),'New hosts must default to username/password');
+    assert(await js("(()=>{const p=dialog.querySelector('.password-control'),s=dialog.querySelector('.host-auth-switch');return s.getBoundingClientRect().top>=p.getBoundingClientRect().bottom&&p.contains(dialog.querySelector('.password-visibility'))})()"),'Auth switching must sit below the credentials, with the eye inside the password field');
+    await js("dialog.querySelector('.password-control input[type=password]').value='disposable new password';dialog.querySelector('.password-control input[type=password]').dispatchEvent(new Event('input'));dialog.querySelector('.password-visibility').click()");
+    assert(await js("dialog.querySelector('.password-control input:not([readonly])').type==='text' && dialog.querySelector('.password-visibility').getAttribute('aria-pressed')==='true'"));
+    await js("window.dispatchEvent(new Event('blur'))");
+    assert.equal(await js("dialog.querySelector('.password-control input:not([readonly])').type"),'password','Blur must conceal newly typed passwords');
+    await js("dialog.querySelector('[aria-label=\"认证方式\"]').click()");
+    assert(await js("[...document.querySelectorAll('.dropdown-panel [role=option]')].some(o=>o.textContent.includes('本机私钥'))"));
+    await js("[...document.querySelectorAll('.dropdown-panel [role=option]')].find(o=>o.textContent.includes('本机私钥')).click()");
+    assert(await js("dialog.querySelector('.host-password-pane').hidden && !dialog.querySelector('.host-key-selection').parentElement.hidden"));
+    await js("dialog.querySelector('.host-auth-switch select').value='agent';dialog.querySelector('.host-auth-switch select').dispatchEvent(new Event('change'))");
+    assert(await js("dialog.querySelector('.host-password-pane').hidden && !dialog.querySelector('.host-agent-hint').hidden"));
+    await js("dialog.close()");await wait('!dialog.open && !dialog.childElementCount');
+    await js("window.loginHost={...hosts[0],id:'saved-login-test',group:'',groupId:undefined,identityId:undefined,inheritIdentity:false,auth:'password'};void editHost(loginHost)");
+    await wait("dialog.open && dialog.querySelector('.password-control')");
+    assert.equal(await js('loginRevealCalls'),0,'Opening an editor must not read a saved password');
+    assert(await js("dialog.querySelector('.password-control input:not([readonly])').value==='' && /^•+$/.test(dialog.querySelector('.password-control input:not([readonly])').placeholder)"),'Stored passwords use a mask placeholder without populating the draft');
+    const passwordBounds=await js("(()=>{const r=dialog.querySelector('.password-control input:not([readonly])').getBoundingClientRect();return[r.width,r.height]})()");
+    await js("dialog.querySelector('.password-visibility').click()");
+    await wait("!dialog.querySelector('[aria-label=\"已保存的 SSH 密码\"]').hidden");
+    assert(await js("dialog.querySelector('.password-control input:not([readonly])').hidden && dialog.querySelector('[aria-label=\"已保存的 SSH 密码\"]').value==='disposable saved login password' && dialog.querySelector('.password-control input:not([readonly])').value===''") );
+    assert.deepEqual(await js("(()=>{const r=dialog.querySelector('[aria-label=\"已保存的 SSH 密码\"]').getBoundingClientRect();return[r.width,r.height]})()"),passwordBounds,'Stored reveal must replace the mask in place');
+    await overflow();await shot(`host-login-eye-${width}.png`);
+    await js("window.dispatchEvent(new Event('blur'))");
+    assert(await js("dialog.querySelector('[aria-label=\"已保存的 SSH 密码\"]').hidden && !dialog.querySelector('[aria-label=\"已保存的 SSH 密码\"]').value"));
+    await js("api.hosts.revealPassword=()=>new Promise(resolve=>window.finishLoginReveal=resolve);dialog.querySelector('.password-visibility').click()");
+    await wait('Boolean(window.finishLoginReveal)');
+    await js("(()=>{const u=[...dialog.querySelectorAll('label')].find(l=>l.firstChild.textContent==='SSH 用户名').querySelector('input');u.value='different-target';u.dispatchEvent(new Event('input'));finishLoginReveal('late saved secret')})()");
+    await tick();
+    assert(await js("dialog.querySelector('[aria-label=\"已保存的 SSH 密码\"]').hidden && !dialog.querySelector('[aria-label=\"已保存的 SSH 密码\"]').value"),'A late saved-password response must be discarded after a target change');
+    await js("(()=>{const u=[...dialog.querySelectorAll('label')].find(l=>l.firstChild.textContent==='SSH 用户名').querySelector('input');u.value=loginHost.username;u.dispatchEvent(new Event('input'));api.hosts.save=async value=>{window.loginSave=value;return hosts};dialog.querySelector('button[value=save]').click()})()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert.equal(await js('loginSave.localPassword===undefined'),true,'Viewing a saved password must not replace it when saving');
+    await js("api.hosts.hasPassword=loginOriginal.hasPassword;api.hosts.revealPassword=loginOriginal.revealPassword;api.hosts.save=loginOriginal.save;void editHost({...hosts[0],auth:'key',keyPath:'/preview/key'})");
+    await wait("dialog.open && dialog.querySelector('.host-auth-switch')");
+    assert.equal(await js("dialog.querySelector('.host-auth-switch select').value"),'key','Editing must retain an existing authentication method');
+    await js('dialog.close()');await wait('!dialog.open && !dialog.childElementCount');
+    console.log(`${width}px: PASS compact username/password layout, auth switching, masked saved password, in-place eye reveal, blur/late-response conceal and save preservation`);
+  };
+  const closeAllChecks = async width => {
+    await js("for(const tab of [...tabs.values()])removeTab(tab);window.closeAllOriginal={ssh:api.ssh.close,commands:api.commands.close};window.closeAllCalls=[];api.ssh.close=async id=>closeAllCalls.push(['shell',id]);api.commands.close=async id=>closeAllCalls.push(['command',id]);");
+    await js("(async()=>{window.closeOne=await openHost(hosts[0],{force:true,connectNow:false})})()");
+    assert(await js("$('close-all-tabs').hidden"),'The shortcut is hidden for one host');
+    await js("(async()=>{window.closeTwo=await openHost(hosts[1],{force:true,connectNow:false});const tab={id:'close-command',kind:'command',sessionId:closeOne.id,host:closeOne.host,action:'disk',status:'closed',used:Date.now(),view:node('section')};tabs.set(tab.id,tab);renderTabs();jobs.set('close-all-job',{id:'close-all-job',sessionId:closeOne.id,status:'committing'})})()");
+    assert(await js("!$('close-all-tabs').hidden"),'Multiple host tabs expose the shortcut');
+    await js("$('close-all-tabs').click()");await tick();
+    assert(await js("tabs.size===3 && closeAllCalls.length===0 && $('status').textContent.includes('文件正在提交')"),'Committing transfers block batch close before any session is closed');
+    await js("jobs.get('close-all-job').status='running';$('close-all-tabs').click()");
+    await wait("dialog.open && dialog.textContent.includes('关闭所有会话')");
+    await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='取消').click()");await wait('!dialog.open && !dialog.childElementCount');
+    assert.equal(await js('closeAllCalls.length'),0,'Cancelling transfer confirmation keeps all sessions');
+    await js("$('close-all-tabs').click()");await wait('dialog.open');
+    await js("dialog.querySelector('form').requestSubmit()");await wait('!dialog.open && !dialog.childElementCount && !closingAllTabs');
+    assert(await js("tabs.size===0 && splitGroups.size===0 && $('close-all-tabs').hidden && closeAllCalls.length===3 && closeAllCalls[0][0]==='command'"),'Batch close must dispose all snapshot tabs and close commands before host sessions');
+    await js("jobs.delete('close-all-job');(async()=>{window.closeOne=await openHost(hosts[0],{force:true,connectNow:false});window.closeTwo=await openHost(hosts[1],{force:true,connectNow:false});api.ssh.close=async()=>{throw new Error('batch close failure')};$('close-all-tabs').click()})()");
+    await wait("!closingAllTabs && $('status').textContent.includes('batch close failure')");
+    assert(await js("tabs.size===2 && !$('close-all-tabs').disabled"),'A close error retains remaining tabs and enables retry');
+    await js("window.closeHold=true;api.ssh.close=async id=>{closeAllCalls.push(['shell',id]);if(closeHold){closeHold=false;await new Promise(resolve=>window.finishBatchClose=resolve)}};$('close-all-tabs').click()");
+    await wait('Boolean(window.finishBatchClose)');
+    await js("$('close-all-tabs').click();addNewTab();finishBatchClose()");
+    await wait('!closingAllTabs');
+    assert(await js("tabs.size===1 && [...tabs.values()][0].kind==='new' && $('close-all-tabs').hidden"),'Tabs opened during a pending batch are preserved');
+    await js("for(const tab of [...tabs.values()])removeTab(tab);api.ssh.close=closeAllOriginal.ssh;api.commands.close=closeAllOriginal.commands;selectTab(undefined,'hosts')");
+    await overflow();
+    console.log(`${width}px: PASS close-all visibility, transfer blocking/confirmation, dependent command cleanup, retry and concurrent-tab preservation`);
+  };
+  if (process.argv.includes('--host-login-tabs-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await hostLoginChecks(width);await closeAllChecks(width);
+    }
+    return;
+  }
+  const pointerFocusChecks = async width => {
+    await wait('!dialog.open && !dialog.childElementCount');
+    await js("selectTab(undefined,'hosts');currentGroup='';renderHosts()");
+    const click = async selector => {
+      const point = await js(`(()=>{const e=document.querySelector(${JSON.stringify(selector)});e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+      await run('Input.dispatchMouseEvent',{type:'mouseMoved',...point});
+      await run('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
+      await run('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});
+      await tick();
+    };
+    const border = selector => js(`(()=>{const s=getComputedStyle(document.querySelector(${JSON.stringify(selector)}));return[s.borderTopColor,s.borderTopWidth,s.boxShadow]})()`);
+    const noRing = selector => js(`getComputedStyle(document.querySelector(${JSON.stringify(selector)})).outlineStyle==='none'`);
+    const searchBorder = await border('#host-search-form');
+    await click('#host-search');
+    assert.deepEqual(await border('#host-search-form'),searchBorder,'Mouse focus must not highlight the search frame');
+    assert(await noRing('#host-search'));
+    await run('Input.dispatchKeyEvent',{type:'keyDown',key:'Tab',code:'Tab',windowsVirtualKeyCode:9});
+    await run('Input.dispatchKeyEvent',{type:'keyUp',key:'Tab',code:'Tab',windowsVirtualKeyCode:9});
+    assert(await js("document.documentElement.dataset.focusMode==='keyboard' && getComputedStyle(document.activeElement.closest('.tab-search')||document.activeElement).outlineStyle==='solid'"),'Keyboard navigation must retain a visible focus indicator');
+    await click('#host-search');
+    assert(await noRing('#host-search') && await noRing('#host-search-form'),'A mouse click after keyboard navigation must remove focus rings');
+    for (const selector of ['#host-sort','.host-filters [aria-label="筛选标签"]','.host-filters [aria-label="主机视图"]']) {
+      const original = await border(selector); await click(selector);
+      assert.deepEqual(await border(selector),original,`${selector}: opening must keep the existing border`);
+      assert(await noRing(selector));await js('closeHostMenu();closeDropdown()');
+    }
+    await click('#add-host');
+    await wait("dialog.open && dialog.querySelector('.host-ssh-settings') && !dialog.getAnimations().some(a=>a.playState==='running')");
+    for (const selector of ['#dialog input[type=text]','#dialog .host-username-control input','#dialog .password-control input[type=password]','#dialog [aria-label="分组"]']) {
+      const original = await border(selector);await click(selector);
+      assert.deepEqual(await border(selector),original,`${selector}: pointer focus must not add an accent border`);
+      assert(await noRing(selector));await js('closeDropdown()');
+    }
+    await js("dialog.querySelector('details').open=true");
+    await click('#dialog textarea');assert(await noRing('#dialog textarea'));
+    await js("dialog.close();selectTab(undefined,'keys')");
+    await wait("document.querySelector('#keys-page .key-card')");
+    await click('#keys-page .key-card');
+    assert(await js("getComputedStyle(document.querySelector('#keys-page .key-card[aria-pressed=true]')).boxShadow!=='none'"),'SSH key selection must retain its resource border');
+    await js("selectTab(undefined,'hosts')");
+    await click('#host-list .host-open');
+    assert(await js("getComputedStyle(document.querySelector('#host-list .host-open[aria-pressed=true]').closest('.host-row')).boxShadow!=='none'"),'Host selection must retain its outer resource border');
+    await js("openSettings('snippets')");
+    await wait("document.querySelector('.command-pin')");
+    const pinBorder = await border('.command-pin');await click('.command-pin');
+    await wait("!document.querySelector('.command-pin').disabled");
+    assert.deepEqual(await border('.command-pin'),pinBorder,'Pinned command state must not add an accent border');
+    await js("selectTab(undefined,'hosts')");
+    console.log(`${width}px: PASS pointer focus without extra borders, keyboard focus restoration, stable dropdown/input frames and preserved key/host selection`);
+  };
+  if (process.argv.includes('--pointer-focus-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await pointerFocusChecks(width);
+    }
+    return;
+  }
+  const groupDrawerChecks = async width => {
+    await wait('!dialog.open && !dialog.childElementCount');
+    await js("window.groupDrawerOriginal=structuredClone(previewGroups);selectTab(undefined,'hosts');currentGroup='';renderHosts()");
+    const geometry = () => js("['#hosts .toolbar-row','#host-list'].map(s=>{const r=document.querySelector(s).getBoundingClientRect();return[r.x,r.y,r.width,r.height]})");
+    const before = await geometry();
+    const open = async () => {
+      await js("$('host-actions').click();[...hostMenu.panel.querySelectorAll('button')].find(b=>b.textContent==='新建分组').click()");
+      await wait("dialog.open && dialog.querySelector('[aria-label=\"上级分组\"]') && !dialog.getAnimations().some(a=>a.playState==='running')");
+    };
+    const groupName = "[...dialog.querySelectorAll('label')].find(l=>l.firstChild.textContent==='分组名称').querySelector('input')";
+    await open();
+    assert.deepEqual(await geometry(),before,'The new-group drawer must float without moving host content');
+    assert(await js("workspace.dataset.view==='hosts' && dialog.classList.contains('host-drawer')"));
+    await js(`${groupName}.value='unsaved-group';document.querySelector('.overlay-backdrop').click()`);
+    await wait("Boolean($('host-discard-dialog')?.open)");
+    await js("[...$('host-discard-dialog').querySelectorAll('button')].find(b=>b.textContent==='继续编辑').click()");
+    await wait("!$('host-discard-dialog')");
+    assert.equal(await js(`${groupName}.value`),'unsaved-group');
+    await js(`${groupName}.value='drawer-group';dialog.querySelector('form').requestSubmit()`);
+    await wait("!dialog.open && !dialog.childElementCount && currentGroup==='drawer-group'");
+    await open();
+    assert(await js("dialog.querySelector('[aria-label=\"上级分组\"]').closest('.dropdown').querySelector('select').value===groupAssets.find(g=>g.path==='drawer-group').id"),'New groups inside a group must default to that parent');
+    await js("dialog.dispatchEvent(new Event('cancel',{cancelable:true}))");
+    await wait('!dialog.open && !dialog.childElementCount');
+    await js("currentGroup='';renderHosts();void editHost()");
+    await wait("dialog.open && dialog.querySelector('.host-ssh-settings')");
+    await js("[...dialog.querySelectorAll('label')].find(l=>l.firstChild.textContent==='主机地址').querySelector('input').value='draft.example.test';dialog.querySelector('.host-username-control input').value='draft-user';dialog.querySelector('[aria-label=\"分组\"]').click();document.querySelector('.dropdown-footer button').click()");
+    await wait("dialog.open && dialog.querySelector('[aria-label=\"上级分组\"]')");
+    assert.equal(await js('workspace.dataset.view'),'hosts');
+    await js(`${groupName}.value='draft-created-group';dialog.querySelector('form').requestSubmit()`);
+    await wait("dialog.open && dialog.querySelector('.host-ssh-settings')");
+    assert.deepEqual(await js("[[...dialog.querySelectorAll('label')].find(l=>l.firstChild.textContent==='主机地址').querySelector('input').value,dialog.querySelector('.host-username-control input').value,dialog.querySelector('[aria-label=\"分组\"]').closest('.dropdown').querySelector('select').value]"),['draft.example.test','draft-user','draft-created-group'],'Group creation must return to the original host draft and select the new group');
+    await js("dialog.close();previewGroups.splice(0,previewGroups.length,...groupDrawerOriginal);currentGroup='';void refreshHosts()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    console.log(`${width}px: PASS floating group drawer, stable host layout, dirty close protection, parent defaults and draft-preserving return`);
+  };
+  const keyImportUiChecks = async width => {
+    await groupDrawerChecks(width);
+    await wait('!dialog.open && !dialog.childElementCount');
+    await js("selectTab(undefined,'hosts');currentGroup='';window.importUiOriginal={importPreview:api.hosts.importPreview,csvPreview:api.hosts.csvPreview,save:api.hosts.save,revealKey:api.hosts.revealKeyPassphrase,create:api.keys.create,importFile:api.keys.importFile};window.importUiKeyCount=previewKeys.length;window.importUiReads=[];api.hosts.importPreview=async()=>{importUiReads.push('openssh');return null};api.hosts.csvPreview=async()=>{importUiReads.push('csv');return null}");
+    assert(await js("!document.querySelector('#hosts .toolbar-row > .toolbar-actions:not(.host-filters) .toolbar-button') && Boolean($('host-actions'))"),'Host toolbar must use the compact new-host split button');
+    for(const id of ['import-hosts','import-csv']) {
+      await js("$('host-actions').click()");
+      assert(await js("hostMenu.panel.textContent.includes('新建分组') && hostMenu.panel.textContent.includes('导出 CSV')"));
+      await overflow();
+      await js(`document.getElementById('${id}').click()`);await tick();
+    }
+    assert.deepEqual(await js('importUiReads'),['openssh','csv']);
+    await js("$('host-actions').click();[...hostMenu.panel.querySelectorAll('button')].find(b=>b.textContent==='新建分组').click()");
+    await wait("dialog.open && dialog.classList.contains('host-drawer') && !dialog.getAnimations().some(a=>a.playState==='running')");
+    assert.equal(await js("workspace.dataset.view"),'hosts','New group must open above the host workspace');
+    await js("dialog.dispatchEvent(new Event('cancel',{cancelable:true}))");
+    await wait("!dialog.open && !dialog.childElementCount");
+    await js("window.importKeyHost={...hosts[0],id:'import-key-eye',auth:'key',keyPath:'/preview/key',group:'',identityId:undefined,inheritIdentity:false};previewKeySecrets.set(importKeyHost.id,'disposable saved key passphrase');window.importKeyReveals=[];api.hosts.revealKeyPassphrase=async request=>{importKeyReveals.push(request);return 'disposable saved key passphrase'};void editHost(importKeyHost)");
+    await wait("dialog.open && dialog.querySelector('.host-key-passphrase') && !dialog.getAnimations().some(a=>a.playState==='running')");
+    assert(await js("(()=>{const u=[...dialog.querySelectorAll('label')].find(l=>l.firstChild.textContent==='SSH 用户名').querySelector('input'),k=dialog.querySelector('.key-picker-trigger'),p=dialog.querySelector('.host-key-passphrase input[type=password]');return Math.abs(u.getBoundingClientRect().width-k.getBoundingClientRect().width)<1 && Math.abs(u.getBoundingClientRect().width-p.getBoundingClientRect().width)<1 && getComputedStyle(dialog.querySelector('.host-private-key')).borderTopWidth==='0px'})()"),'Private-key selection and passphrase must align with the username and avoid nested frames');
+    assert(await js("/^•+$/.test(dialog.querySelector('.host-key-passphrase input[type=password]').placeholder) && importKeyReveals.length===0"));
+    await js("dialog.querySelector('.host-key-passphrase .password-visibility').click()");
+    await wait("!dialog.querySelector('[aria-label=\"已保存的私钥口令\"]').hidden");
+    assert.deepEqual(await js('importKeyReveals[0]'),{id:'import-key-eye',keyPath:'/preview/key'});
+    await js("dialog.querySelector('.host-ssh-settings').scrollIntoView({block:'start'})");await tick();
+    await overflow();await shot(`private-key-compact-${width}.png`);
+    await js("window.dispatchEvent(new Event('blur'));dialog.querySelector('[aria-label=\"认证方式\"]').focus()");
+    assert(await js("(()=>{const s=getComputedStyle(dialog.querySelector('[aria-label=\"认证方式\"]'));return s.outlineStyle==='none'&&s.boxShadow==='none'&&s.borderTopColor==='rgba(0, 0, 0, 0)'})()"),'The authentication switch must not draw a selected frame');
+    await js("dialog.querySelector('[aria-label=\"认证方式\"]').click()");
+    assert(await js("getComputedStyle(dialog.querySelector('[aria-label=\"认证方式\"]')).borderTopColor==='rgba(0, 0, 0, 0)'"));
+    await js("closeDropdown();api.hosts.save=async value=>{window.importKeySaved=value;return hosts};dialog.querySelector('button[value=save]').click()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert.equal(await js('importKeySaved.localKeyPassphrase===undefined'),true,'Viewing a passphrase must not save a replacement');
+    await js("api.hosts.save=importUiOriginal.save;api.hosts.revealKeyPassphrase=importUiOriginal.revealKey;previewKeySecrets.delete(importKeyHost.id);selectTab(undefined,'keys');api.keys.importFile=async()=>({name:'created-ui-key',privateKey:'disposable private content'});api.keys.create=async request=>{if(request.name==='invalid')throw new Error('私钥内容无效');return importUiOriginal.create(request)}");
+    await wait("!document.querySelector('#keys-page .key-toolbar .primary').disabled");
+    await js("[...document.querySelectorAll('#keys-page .key-toolbar button')].find(b=>b.textContent==='＋ 创建密钥').click()");
+    await wait("dialog.open && dialog.querySelector('[data-key-create=private]') && !dialog.getAnimations().some(a=>a.playState==='running')");
+    await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='从私钥文件导入').click()");
+    await wait("dialog.querySelector('[data-key-create=private]').value==='disposable private content'");
+    await js("dialog.querySelector('[data-key-create=name]').value='invalid';dialog.querySelector('form').requestSubmit()");
+    await wait("dialog.querySelector('.dialog-error').textContent.includes('私钥内容无效')");
+    assert.equal(await js("dialog.querySelector('[data-key-create=private]').value"),'disposable private content','Import errors must retain the draft');
+    await js("dialog.querySelector('[data-key-create=name]').value='created-ui-key';dialog.querySelector('[data-key-create=passphrase]').value='disposable key passphrase';window.importPrivateField=dialog.querySelector('[data-key-create=private]');window.importPassField=dialog.querySelector('[data-key-create=passphrase]')");
+    await js("dialog.querySelector('.drawer-fields').scrollTop=0");await tick();
+    await overflow();await shot(`key-create-drawer-${width}.png`);
+    await js("dialog.querySelector('form').requestSubmit()");
+    await wait("!dialog.open && !dialog.childElementCount && document.querySelector('#keys-page .key-note').textContent.includes('已创建 created-ui-key')");
+    assert(await js("!importPrivateField.value && !importPassField.value"),'Private content and passphrase must be cleared after creation');
+    await js("selectTab(undefined,'hosts');void editHost()");
+    await wait("dialog.open && dialog.querySelector('.host-auth-switch')");
+    await js("dialog.querySelector('.host-auth-switch select').value='key';dialog.querySelector('.host-auth-switch select').dispatchEvent(new Event('change'));dialog.querySelector('.key-picker-trigger').click()");
+    await wait("$('key-dialog').open && $('key-dialog').querySelector('[data-path=\"/preview/.ssh/created-ui-key\"]')");
+    await js("$('key-dialog').querySelector('[data-path=\"/preview/.ssh/created-ui-key\"]').click();$('key-dialog').querySelector('.key-picker-confirm').click()");
+    assert.equal(await js("dialog.querySelector('.selected-key-name').textContent"),'created-ui-key','Created keys must be selectable by host editors');
+    await js("dialog.close();previewKeys.splice(importUiKeyCount);api.hosts.importPreview=importUiOriginal.importPreview;api.hosts.csvPreview=importUiOriginal.csvPreview;api.keys.create=importUiOriginal.create;api.keys.importFile=importUiOriginal.importFile;selectTab(undefined,'hosts')");
+    await wait('!dialog.open && !dialog.childElementCount');
+    console.log(`${width}px: PASS compact host actions, borderless auth switching, aligned key/passphrase controls, protected reveal, key creation/file import and host selection`);
+  };
+  if (process.argv.includes('--key-import-ui-only')) {
+    for(const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await keyImportUiChecks(width);
+    }
+    return;
+  }
+  const keyCreationChecks = async width => {
+    await wait('!dialog.open && !dialog.childElementCount');
+    await js("selectTab(undefined,'hosts');currentGroup='';selectedHostId='';$('host-layout').value='cards';$('host-layout').dispatchEvent(new Event('change'));renderHosts()");
+    const hover = async selector => {
+      const point = await js(`(()=>{const e=document.querySelector(${JSON.stringify(selector)}),r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+      await run('Input.dispatchMouseEvent',{type:'mouseMoved',...point}); await tick();
+      return js("(()=>{const b=document.querySelector('#host-list .host-open'),row=b.closest('.host-row');return {background:getComputedStyle(row).backgroundColor,button:getComputedStyle(b).backgroundColor,hover:getComputedStyle(document.documentElement).getPropertyValue('--surface-hover').trim()}})()");
+    };
+    await run('Input.dispatchMouseEvent',{type:'mouseMoved',x:1,y:1});await tick();
+    const idle = await js("getComputedStyle(document.querySelector('#host-list .host-open').closest('.host-row')).backgroundColor");
+    const middle = await hover('#host-list .host-open');
+    assert.notEqual(middle.background,idle,'Entering a host card must highlight its outer container');
+    assert.equal(middle.button,'rgba(0, 0, 0, 0)','Main card button must not paint a smaller hover block');
+    const edge = await hover('#host-list .host-open ~ .host-quick-edit');
+    assert.equal(edge.background,middle.background,'Card hover must cover the entire card, including the action area');
+    await js("selectTab(undefined,'keys');window.keyTestOriginalGenerate=api.keys.generate;window.keyTestOriginalAddAgent=api.keys.addAgent;api.keys.addAgent=async request=>{previewCalls.push(['add-agent',request]);if(request.passphrase==='incorrect')throw new Error('无法解锁私钥');return {fingerprint:'SHA256:fixture'}};api.keys.generate=async request=>{previewCalls.push(['generate-key',request]);if(request.name==='conflict')throw new Error('已有同名密钥');return {name:request.name,path:request.directory+'/'+request.name,type:request.type}};");
+    await wait("!document.querySelector('#keys-page .key-toolbar .primary').disabled");
+    const bounds = () => js("['.key-toolbar','.key-directories','.key-grid'].map(s=>{const r=document.querySelector('#keys-page '+s).getBoundingClientRect();return [r.x,r.y,r.width,r.height]})");
+    const before = await bounds();
+    const open = async () => {
+      await wait('!dialog.open && !dialog.childElementCount');
+      await js("document.querySelector('#keys-page .key-toolbar .primary').click()");
+      await wait("dialog.open && dialog.querySelector('[data-key-field=type]') && !dialog.getAnimations().some(a=>a.playState==='running')");
+    };
+    const setType = value => js(`(()=>{const t=dialog.querySelector('[data-key-field=type]');t.value=${JSON.stringify(value)};t.dispatchEvent(new Event('change'))})()`);
+    await open();
+    assert.deepEqual(await bounds(),before,'Opening key creation must not move the key page');
+    assert(await js("dialog.classList.contains('host-drawer') && !dialog.querySelector('[data-key-field=rsa-bits]').closest('label').getClientRects().length && !dialog.querySelector('[data-key-field=ecdsa-bits]').closest('label').getClientRects().length"),'Ed25519 needs no size configuration');
+    await setType('rsa');
+    assert.deepEqual(await js("[dialog.querySelector('[data-key-field=name]').value,dialog.querySelector('[data-key-field=rsa-bits]').value]"),['id_rsa_termlume','3072']);
+    await js("dialog.querySelector('[aria-label=\"RSA 密钥位数\"]').click()");
+    assert(await js("(()=>{const t=dialog.querySelector('[aria-label=\"RSA 密钥位数\"]'),p=document.getElementById(t.getAttribute('aria-controls'));return Math.abs(t.getBoundingClientRect().width-p.getBoundingClientRect().width)<=1})()"),'Size popup must match its trigger width');
+    await js('closeDropdown()');await overflow();await shot(`key-generation-rsa-${width}.png`);
+    await js("dialog.querySelector('[data-key-field=name]').value='conflict';dialog.querySelector('form').requestSubmit()");
+    await wait("dialog.querySelector('.dialog-error').textContent.includes('同名')");
+    assert(await js("dialog.open && !dialog.querySelector('button[type=submit]').disabled"),'Generation errors must keep the drawer retryable');
+    await js("dialog.querySelector('[data-key-field=name]').value='rsa-probe';dialog.querySelector('[data-key-field=rsa-bits]').value='4096';dialog.querySelector('form').requestSubmit()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert.deepEqual(await js("previewCalls.filter(([t])=>t==='generate-key').at(-1)[1]"),{directory:'/preview/.ssh',name:'rsa-probe',passphrase:'',type:'rsa',bits:4096});
+    await open();await setType('ecdsa');
+    assert(await js("dialog.querySelector('[data-key-field=ecdsa-bits]').closest('label').getClientRects().length && !dialog.querySelector('[data-key-field=rsa-bits]').closest('label').getClientRects().length"));
+    await js("dialog.querySelector('[data-key-field=ecdsa-bits]').value='521';dialog.querySelector('form').requestSubmit()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert.equal(await js("previewCalls.filter(([t])=>t==='generate-key').at(-1)[1].bits"),521);
+    await open();
+    await js("dialog.querySelector('[data-key-field=passphrase]').value='disposable fixture passphrase';dialog.dispatchEvent(new Event('cancel',{cancelable:true}))");
+    await wait("document.querySelector('#host-discard-dialog[open]')");
+    await js("[...document.querySelectorAll('#host-discard-dialog button')].find(b=>b.textContent==='继续编辑').click()");
+    await wait("!document.querySelector('#host-discard-dialog')");
+    assert.equal(await js("dialog.querySelector('[data-key-field=passphrase]').value"),'disposable fixture passphrase');
+    await js("dialog.dispatchEvent(new Event('cancel',{cancelable:true}))");
+    await wait("document.querySelector('#host-discard-dialog[open]')");
+    await js("[...document.querySelectorAll('#host-discard-dialog button')].find(b=>b.textContent==='放弃修改').click()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    await open();await js("dialog.querySelector('form').requestSubmit()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert(await js("!('bits' in previewCalls.filter(([t])=>t==='generate-key').at(-1)[1])"),'Ed25519 requests must omit bits');
+    await js("document.querySelector('#keys-page .key-card').click();[...document.querySelectorAll('#keys-page .key-detail button')].find(b=>b.textContent==='加入 SSH Agent').click()");
+    await wait("dialog.open && dialog.querySelector('[aria-label=\"要加入 Agent 的私钥\"]')");
+    await js("dialog.querySelector('input[type=password]').value='incorrect';dialog.querySelector('form').requestSubmit()");
+    await wait("dialog.querySelector('.dialog-error').textContent.includes('解锁')");
+    await js("dialog.querySelector('input[type=password]').value='disposable passphrase';dialog.querySelector('form').requestSubmit()");
+    await wait("!dialog.open && !dialog.childElementCount && document.querySelector('#keys-page .key-agent-guide').getClientRects().length");
+    assert.deepEqual(await js("previewCalls.filter(([t])=>t==='add-agent').at(-1)[1]"),{path:'/preview/key',passphrase:'disposable passphrase'});
+    await overflow();await shot(`key-agent-${width}.png`);
+    await js("[...document.querySelectorAll('#keys-page .key-toolbar button')].find(b=>b.textContent==='加入 SSH Agent').click()");
+    await wait('dialog.open');
+    await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='选择私钥'||b.getAttribute('aria-label')==='选择私钥').click()");
+    await wait("$('key-dialog').open && $('key-dialog').querySelector('[role=radio]')");
+    await js("$('key-dialog').querySelector('[role=radio]').click();$('key-dialog').querySelector('.key-picker-confirm').click()");
+    await wait("!$('key-dialog').open && Boolean(dialog.querySelector('[aria-label=\"要加入 Agent 的私钥\"]').value)");
+    await js("dialog.querySelector('form').requestSubmit()");
+    await wait('!dialog.open && !dialog.childElementCount');
+    await js("api.keys.generate=keyTestOriginalGenerate;api.keys.addAgent=keyTestOriginalAddAgent;selectTab(undefined,'hosts')");
+    console.log(`${width}px: PASS full-card hover, floating key creation, algorithm/size selection, retry, unsaved close confirmation and Agent loading`);
+  };
+  const keyAutoAgentChecks = async (width, creating = false) => {
+    await wait('!dialog.open && !dialog.childElementCount');
+    await js(`selectTab(undefined,'keys');window.autoKeyOriginal={generate:api.keys.generate,create:api.keys.create,addAgent:api.keys.addAgent};
+      window.autoKeyCalls=[];window.autoKeyAgentFailure=false;window.autoKeyGenerateFailure=false;
+      api.keys.generate=async value=>{autoKeyCalls.push(['generate',structuredClone(value)]);if(autoKeyGenerateFailure)throw new Error('同名文件');if(window.autoKeyGeneratePending)await new Promise(resolve=>window.autoKeyResolveGenerate=resolve);return {name:value.name,path:value.directory+'/'+value.name,type:value.type}};
+      api.keys.create=async value=>{autoKeyCalls.push(['create',structuredClone(value)]);if(autoKeyGenerateFailure)throw new Error('同名文件');if(window.autoKeyGeneratePending)await new Promise(resolve=>window.autoKeyResolveGenerate=resolve);return {name:value.name,path:value.directory+'/'+value.name,type:'ssh-ed25519',private:true}};
+      api.keys.addAgent=async value=>{autoKeyCalls.push(['agent',structuredClone(value)]);if(window.autoKeyAgentPending)await new Promise(resolve=>window.autoKeyResolveAgent=resolve);if(autoKeyAgentFailure)throw new Error('Agent 未运行');return {fingerprint:'SHA256:auto-key'}};`);
+    const operation = creating ? 'create' : 'generate';
+    const attribute = creating ? 'key-create' : 'key-field';
+    const field = key => `dialog.querySelector('[data-${attribute}=${key}]')`;
+    const open = async () => {
+      await wait('!dialog.open && !dialog.childElementCount');
+      await js(creating ? "[...document.querySelectorAll('#keys-page .key-toolbar button')].find(b=>b.textContent==='＋ 创建密钥').click()" : "document.querySelector('#keys-page .key-toolbar .primary').click()");
+      await wait(`dialog.open && ${field('add-agent')} && !dialog.getAnimations().some(a=>a.playState==='running')`);
+      if (creating) await js(`${field('name')}.value='auto-created';${field('private')}.value='disposable private content'`);
+    };
+    const submit = () => js("dialog.querySelector('form').requestSubmit()");
+    await open();
+    assert.equal(await js(`${field('add-agent')}.checked`),false,'Auto Agent loading must be opt-in');
+    await js(`${field('name')}.value='auto-unchecked';`);await submit();
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert.deepEqual(await js('autoKeyCalls.map(([type])=>type)'),[operation],'Unchecked key saving must not touch the Agent');
+    await open();
+    await js(`${field('add-agent')}.click();dialog.dispatchEvent(new Event('cancel',{cancelable:true}))`);
+    await wait("document.querySelector('#host-discard-dialog[open]')");
+    await js("[...document.querySelectorAll('#host-discard-dialog button')].find(b=>b.textContent==='继续编辑').click()");
+    await wait("!document.querySelector('#host-discard-dialog')");
+    assert(await js(`${field('add-agent')}.checked`),'Continue must preserve the auto-load option');
+    await js(`${field('name')}.value='auto-encrypted';${field('passphrase')}.value='disposable auto key passphrase';window.autoKeyGeneratePending=true;window.autoKeyAgentPending=true;`);
+    await submit();await wait('Boolean(window.autoKeyResolveGenerate)');
+    await js(`${field('passphrase')}.value='changed while generating';${field('add-agent')}.checked=false;window.autoKeyGeneratePending=false;autoKeyResolveGenerate()`);
+    await wait('Boolean(window.autoKeyResolveAgent)');
+    assert.deepEqual(await js('autoKeyCalls.at(-1)'),['agent',{path:'/preview/.ssh/auto-encrypted',passphrase:'disposable auto key passphrase'}],'Auto loading must use the actual generated key and original passphrase');
+    await js("dialog.dispatchEvent(new Event('cancel',{cancelable:true}));dialog.querySelector('form').requestSubmit()");
+    assert(await js("dialog.open && dialog.querySelector('form').getAttribute('aria-busy')==='true'"),'Agent loading must block closing and duplicate submission');
+    assert.equal(await js("autoKeyCalls.filter(([t])=>t==='agent').length"),1);
+    await js('window.autoKeyAgentPending=false;autoKeyResolveAgent()');
+    await wait("!dialog.open && !dialog.childElementCount && document.querySelector('#keys-page .key-note').textContent.includes('并已加入 SSH Agent')");
+    await open();
+    await js(`${field('name')}.value='auto-generate-failure';${field('add-agent')}.checked=true;autoKeyGenerateFailure=true`);await submit();
+    await wait("dialog.querySelector('.dialog-error').textContent.includes('同名文件')");
+    assert.equal(await js("autoKeyCalls.filter(([t])=>t==='agent').length"),1,'Failed generation must not try adding a key');
+    await js(`autoKeyGenerateFailure=false;autoKeyAgentFailure=true;${field('name')}.value='auto-agent-failure';${field('passphrase')}.value='partial success passphrase';window.autoKeyPasswordField=${field('passphrase')}`);await submit();
+    await wait(`dialog.querySelector('.dialog-error').textContent.includes('${creating ? '密钥已创建并保存' : '密钥已生成并保存'}')`);
+    const generatedCount = await js(`autoKeyCalls.filter(([t])=>t==='${operation}').length`);
+    assert(await js(`dialog.querySelector('.${creating ? 'key-created-summary' : 'key-generated-summary'}').getClientRects().length && !${field('name')}.getClientRects().length && dialog.querySelector('button[type=submit]').textContent==='重试加入 SSH Agent'`),'Partial success must show the saved key and offer an Agent-only retry');
+    await overflow();await shot(`key-${operation}-auto-agent-failure-${width}.png`);
+    await js('autoKeyAgentFailure=false');await submit();
+    await wait('!dialog.open && !dialog.childElementCount');
+    assert.equal(await js(`autoKeyCalls.filter(([t])=>t==='${operation}').length`),generatedCount,'Retry must never regenerate an already saved key');
+    assert.equal(await js('autoKeyPasswordField.value'),'','Finishing must clear the retained passphrase field');
+    await open();
+    await js(`${field('name')}.value='auto-complete-partial';${field('add-agent')}.checked=true;autoKeyAgentFailure=true`);await submit();
+    await wait("dialog.querySelector('.dialog-error').textContent.includes('Agent 未运行')");
+    await js("[...dialog.querySelectorAll('.actions button')].find(b=>b.textContent==='完成').click()");
+    await wait("!dialog.open && !dialog.childElementCount && document.querySelector('#keys-page .key-note').textContent.includes('尚未加入 SSH Agent')");
+    assert(!await js("document.querySelector('#host-discard-dialog')"),'Saved keys must remain usable when Agent loading is skipped after failure');
+    await js('api.keys.generate=autoKeyOriginal.generate;api.keys.create=autoKeyOriginal.create;api.keys.addAgent=autoKeyOriginal.addAgent;selectTab(undefined,\'hosts\')');
+    console.log(`${width}px: PASS opt-in ${operation}-and-load, original passphrase reuse, busy guard, generation failure, Agent-only retry and saved-key completion`);
+  };
+  if (process.argv.includes('--key-creation-only') || process.argv.includes('--key-auto-agent-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      if (process.argv.includes('--key-creation-only')) await keyCreationChecks(width);
+      await keyAutoAgentChecks(width);await keyAutoAgentChecks(width,true);
+    }
+    return;
+  }
+  const drawerDismissChecks = async width => {
+    const clickBackdrop = async () => {
+      const point=await js("({x:6,y:document.querySelector('.titlebar').getBoundingClientRect().bottom+12})");
+      await run('Input.dispatchMouseEvent',{type:'mouseMoved',...point});
+      await run('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
+      await run('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});
+      await tick();
+    };
+    const field = label => `[...dialog.querySelectorAll('label')].find(l=>l.firstChild.textContent===${JSON.stringify(label)}).querySelector('input')`;
+    const open = async expression => { await wait('!dialog.open && !dialog.childElementCount');await js(`selectTab(undefined,'hosts');currentGroup='';void ${expression}`);await wait('dialog.open');await wait("!dialog.getAnimations().some(a=>a.playState==='running')"); };
+    await open('editHost()');await clickBackdrop();await wait('!dialog.open');
+    await open('editHost(hosts[0])');await clickBackdrop();await wait('!dialog.open');
+    await open('editHost(hosts[0])');
+    const savesBefore=await js("previewCalls.filter(([type])=>type==='save-host').length");
+    await js(`(()=>{const name=${field('显示名称')};name.value='unsaved-edit';name.dispatchEvent(new Event('input'))})()`);
+    await clickBackdrop();await wait("Boolean($('host-discard-dialog')?.open)");
+    assert(await js("dialog.open && dialog.inert && workspace.inert && $('host-discard-dialog').getAttribute('role')==='alertdialog'"));
+    await clickBackdrop();
+    assert.equal(await js("document.querySelectorAll('#host-discard-dialog[open]').length"),1,'Repeated backdrop clicks must keep one confirmation open');
+    await overflow();await shot(`drawer-discard-confirm-${width}.png`);
+    await js("[...$('host-discard-dialog').querySelectorAll('button')].find(b=>b.textContent==='继续编辑').click()");
+    await wait("!$('host-discard-dialog') && !dialog.inert");
+    assert.equal(await js(`${field('显示名称')}.value`),'unsaved-edit','Continuing editing must retain the draft');
+    await js("dialog.querySelector('[aria-label=\"关闭主机表单\"]').click()");await wait("Boolean($('host-discard-dialog')?.open)");
+    await run('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+    await run('Input.dispatchKeyEvent',{type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+    await wait("!$('host-discard-dialog') && dialog.open");
+    await js("[...dialog.querySelector('form > .actions').querySelectorAll('button')].find(b=>b.textContent==='取消').click()");
+    await wait("Boolean($('host-discard-dialog')?.open)");
+    await js("[...$('host-discard-dialog').querySelectorAll('button')].find(b=>b.textContent==='放弃修改').click()");await wait('!dialog.open');
+    assert.equal(await js("previewCalls.filter(([type])=>type==='save-host').length"),savesBefore,'Discarding must not save host data');
+    await open('editHost()');
+    await js("dialog.querySelector('.credential-row input[type=password]').value='draft-only-password'");
+    await clickBackdrop();await wait("Boolean($('host-discard-dialog')?.open)");
+    await js("[...$('host-discard-dialog').querySelectorAll('button')].find(b=>b.textContent==='继续编辑').click()");await wait("!$('host-discard-dialog')");
+    assert.equal(await js("dialog.querySelector('.credential-row input[type=password]').value"),'draft-only-password','Cancelling close must retain an unsaved credential');
+    await js("dialog.querySelector('.credential-row input[type=password]').value=''");await clickBackdrop();await wait('!dialog.open');
+    await open("editHost({...hosts[0],auth:'key',keyPath:'/preview/key'})");
+    await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='选择私钥'||b.getAttribute('aria-label')==='选择私钥').click()");await wait("$('key-dialog').open");
+    await clickBackdrop();
+    assert(await js("dialog.open && $('key-dialog').open && !$('host-discard-dialog')"),'A nested picker must shield the host drawer from backdrop dismissal');
+    await js("[...$('key-dialog').querySelectorAll('button')].find(b=>b.textContent==='关闭').click();dialog.close()");await wait('!dialog.open');
+    await open('editHost()');
+    await js(`(()=>{${field('主机地址')}.value='busy.example.test';${field('SSH 用户名')}.value='busy-user';const auth=dialog.querySelector('[aria-label="认证方式"]').closest('.dropdown').querySelector('select');auth.value='agent';auth.dispatchEvent(new Event('change'));window.dismissSaveApi=api.hosts.save;api.hosts.save=()=>new Promise(resolve=>{window.finishDismissSave=()=>resolve(previewHosts)});dialog.querySelector('button[value=save]').click()})()`);
+    await wait("dialog.querySelector('form').getAttribute('aria-busy')==='true'");await clickBackdrop();
+    assert(await js("dialog.open && !$('host-discard-dialog')"),'Saving must block dismissal through the backdrop');
+    await js("api.hosts.save=dismissSaveApi;finishDismissSave()");await wait('!dialog.open');
+    console.log(`${width}px: PASS backdrop dismissal, dirty confirmation/continue/discard, close/Escape consistency, unsaved credentials, nested picker and busy-save protection`);
+  };
+  if (process.argv.includes('--drawer-dismiss-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await drawerDismissChecks(width);
+    }
+    return;
+  }
+  const hostFormChecks = async width => {
+    await js("selectTab(undefined,'hosts');currentGroup='';void editHost()");
+    await wait("dialog.open && Boolean(dialog.querySelector('.host-ssh-settings'))");
+    await wait("!dialog.getAnimations().some(a=>a.playState==='running')");
+    assert.equal(await js('Math.round(dialog.getBoundingClientRect().width)'),480,'Host drawer should provide a wider editing area');
+    await js("dialog.querySelector('[aria-label=\"连接路径\"]').closest('details').open=true");
+    for (const label of ['分组','认证方式','登录配置','连接路径']) {
+      const selector = `dialog [aria-label="${label}"]`;
+      for (let click = 0; click < 4; click++) {
+        const point = await js(`(()=>{const t=document.querySelector(${JSON.stringify(selector)});t.scrollIntoView({block:'center'});const r=t.getBoundingClientRect();return{x:${click%2 ? 'r.right-14' : 'r.left+30'},y:r.top+r.height/2}})()`);
+        await run('Input.dispatchMouseEvent',{type:'mouseMoved',...point});
+        await run('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
+        await run('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});
+        await tick();
+        assert.equal(await js(`document.querySelector(${JSON.stringify(selector)}).getAttribute('aria-expanded')`),String(click%2===0),`${label}: repeated real pointer clicks must toggle the menu`);
+        if (click%2===0) {
+          const bounds = await js(`(()=>{const t=document.querySelector(${JSON.stringify(selector)}),p=document.getElementById(t.getAttribute('aria-controls'));return[t.getBoundingClientRect().width,p.getBoundingClientRect().width,t.getBoundingClientRect().left,p.getBoundingClientRect().left]})()`);
+          assert((label==='认证方式' ? bounds[1]>=Math.max(bounds[0],176)-1 : Math.abs(bounds[0]-bounds[1])<=1)
+            && Math.abs(bounds[2]-bounds[3])<=1,`${label}: form menus must align, allowing the compact authentication switch to expand for readability`);
+          await overflow();
+          if (click===0) await shot(`host-form-${label}-${width}.png`);
+        }
+      }
+    }
+    await js("dialog.querySelector('[aria-label=\"分组\"]').scrollIntoView({block:'center'});dialog.querySelector('[aria-label=\"分组\"]').click()");
+    const createPoint = await js("(()=>{const b=document.querySelector('.dropdown-footer button'),r=b.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2}})()");
+    await run('Input.dispatchMouseEvent',{type:'mouseMoved',...createPoint});
+    await run('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...createPoint});
+    await run('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...createPoint});
+    await wait("dialog.open && dialog.querySelector('h2').textContent==='新建分组'");
+    assert.equal(await js("workspace.dataset.view"),'hosts','Creating a group from a host draft must keep the workspace in place');
+    await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='返回主机').click()");
+    await wait("dialog.open && Boolean(dialog.querySelector('.host-ssh-settings'))");
+    await js('dialog.close()'); await tick();
+    console.log(`${width}px: PASS 480px host drawer, real pointer dropdown toggles and group drawer return, matching searchable/plain popup widths`);
+  };
+  const hostSaveChecks = async width => {
+    await js(`(async()=>{window.saveCallsStart=previewCalls.length;window.saveOriginalHosts=structuredClone(previewHosts);window.saveOriginalApi=api.hosts.save;
+      previewHosts.push({id:'edit-save',name:'编辑保存测试',address:'edit-save.example.test',port:22,username:'root',auth:'agent'},
+        {id:'existing-target',name:'同地址已有配置',address:'edit-save.example.test',port:22,username:'ubuntu',auth:'agent'});
+      selectTab(undefined,'hosts');await refreshHosts();void editHost(hosts.find(h=>h.id==='edit-save'))})()`);
+    const userInput = "[...dialog.querySelectorAll('label')].find(l=>l.firstChild.textContent==='SSH 用户名').querySelector('input')";
+    await wait('dialog.open');
+    await js(`(()=>{const u=${userInput};u.value='ubuntu';u.dispatchEvent(new Event('input'));dialog.querySelector('button[value=save]').click()})()`);
+    await wait('!dialog.open');
+    assert(await js("previewHosts.filter(h=>h.id==='edit-save').length===1 && previewHosts.find(h=>h.id==='edit-save').username==='ubuntu'"),'Save must update the existing record without requiring duplicate confirmation');
+    assert.equal(await js("previewCalls.slice(saveCallsStart).filter(([type,value])=>type==='connect'&&value.expected.id==='edit-save').length"),0,'Save alone must not connect');
+    // Keep the edited record away from the last position to verify connection uses its ID.
+    await js(`(()=>{previewHosts.find(h=>h.id==='edit-save').username='root';api.hosts.save=async value=>{
+      await saveOriginalApi(value);previewHosts.sort((a,b)=>a.id.localeCompare(b.id));return previewHosts;};void editHost(previewHosts.find(h=>h.id==='edit-save'))})()`);
+    await wait('dialog.open');
+    await js(`(()=>{const u=${userInput};u.value='ubuntu';u.dispatchEvent(new Event('input'));dialog.querySelector('button[value=connect]').click()})()`);
+    await wait("!dialog.open && previewCalls.slice(saveCallsStart).some(([type,value])=>type==='connect'&&value.expected.id==='edit-save')");
+    assert(await js("active.host.id==='edit-save' && active.host.username==='ubuntu' && previewHosts.filter(h=>h.id==='edit-save').length===1"),'Save and connect must use the updated host ID and username even when the returned list is sorted');
+    await js("selectTab(undefined,'hosts');currentGroup='';void editHost()");await wait('dialog.open');
+    await js(`(()=>{const address=[...dialog.querySelectorAll('label')].find(l=>l.firstChild.textContent==='主机地址').querySelector('input');address.value='edit-save.example.test';address.dispatchEvent(new Event('input'));const u=${userInput};u.value='ubuntu';u.dispatchEvent(new Event('input'));const auth=dialog.querySelector('[aria-label=\"认证方式\"]').closest('.dropdown').querySelector('select');auth.value='agent';auth.dispatchEvent(new Event('change'));dialog.querySelector('button[value=connect]').click()})()`);
+    await wait("dialog.querySelector('.drawer-fields > .dialog-error').textContent.includes('重复的连接配置')");
+    assert(!await js("previewHosts.some(h=>h.id==='new-host')"),'A new duplicate must remain blocked until explicitly confirmed');
+    await js("[...dialog.querySelectorAll('label.checkbox-row')].find(l=>l.textContent.includes('仍保存为另一条配置')).querySelector('input').checked=true;dialog.querySelector('button[value=connect]').click()");
+    await wait("!dialog.open && active.host.id==='new-host'");
+    assert(await js("previewHosts.some(h=>h.id==='new-host')"),'Explicitly confirmed new duplicates may be saved and connected');
+    await js("(async()=>{for(const t of [...tabs.values()].filter(t=>['edit-save','new-host'].includes(t.host?.id)))await closeTab(t);api.hosts.save=saveOriginalApi;previewHosts.splice(0,previewHosts.length,...saveOriginalHosts);selectTab(undefined,'hosts');await refreshHosts()})()");
+    console.log(`${width}px: PASS existing-host save/save-and-connect, duplicate endpoint edits, saved-ID routing and new-duplicate confirmation`);
+  };
+  if (process.argv.includes('--host-save-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await hostSaveChecks(width);
+    }
+    return;
+  }
+  if (process.argv.includes('--host-form-only')) {
+    for (const [width,height] of [[1140,740],[550,490]]) {
+      await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+      await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+      await hostFormChecks(width);
+    }
+    return;
+  }
   if (process.argv.includes('--shared-ui-only')) {
     for (const [width,height] of [[1140,740],[550,490]]) {
       await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
@@ -710,6 +1299,12 @@ async function main() {
   assert.deepEqual(await js('unlockRequest'),{secret:await js('setupPassword'),useRecovery:false});
   assert.equal(await js("$('unlock-secret').value"),'');
   console.log('PASS two-step master password retention, mismatch validation, recovery password changes and immediate unlock routing');
+  for (const [width,height] of [[1140,740],[550,490]]) {
+    await run('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+    await run('Page.navigate',{url:pathToFileURL(path.join(root,'dist/ux-review/workspace.html')).href+'#shortcuts'});
+    await wait("typeof hostsLoaded!=='undefined' && hostsLoaded");
+    await hostLoginChecks(width);await closeAllChecks(width);await keyImportUiChecks(width);await pointerFocusChecks(width);
+  }
   await run('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'no-preference'}]});
   for (const [width, height] of [[1140, 740], [550, 490]]) {
     await run('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
@@ -719,6 +1314,12 @@ async function main() {
     assert.match(report, /^✓/, report);
     console.log(`${width}×${height}: ${report.split('（')[0]}`);
     await js("document.getElementById('smoke-results').hidden=true");
+    await hostFormChecks(width);
+    await keyCreationChecks(width);
+    await keyAutoAgentChecks(width);await keyAutoAgentChecks(width,true);
+    await drawerDismissChecks(width);
+    await hostSaveChecks(width);
+    await inheritanceChecks(width);
     await sharedUiChecks(width);
     await hostOrderChecks(width);
     await hostTreeChecks(width);
@@ -776,7 +1377,7 @@ async function main() {
       await wait("!dialog.getAnimations().some(a=>a.playState==='running')");
       await js("document.querySelector('.host-key-selection').scrollIntoView({block:'center'})");
       await tick(); await overflow(); await shot(`host-key-${theme}-${width}.png`);
-      await js("window.originalKeyScan=api.keys.scan;window.pendingKeyScans=[];api.keys.scan=(...args)=>new Promise(resolve=>pendingKeyScans.push(()=>resolve(originalKeyScan(...args))));[...dialog.querySelectorAll('button')].find(b=>b.textContent==='选择私钥').click()");
+      await js("window.originalKeyScan=api.keys.scan;window.pendingKeyScans=[];api.keys.scan=(...args)=>new Promise(resolve=>pendingKeyScans.push(()=>resolve(originalKeyScan(...args))));[...dialog.querySelectorAll('button')].find(b=>b.textContent==='选择私钥'||b.getAttribute('aria-label')==='选择私钥').click()");
       const loadingKeyBounds = await js("(()=>{const r=$('key-dialog').getBoundingClientRect();return [r.x,r.y,r.width,r.height]})()");
       await js("api.keys.scan=originalKeyScan;pendingKeyScans.forEach(release=>release())");
       await wait("document.querySelector('#key-dialog[open] [role=radio]')"); await overflow();

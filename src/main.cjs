@@ -6,7 +6,7 @@ const path = require('node:path');
 const { isIP } = require('node:net');
 const { WorkspaceSSH, commandFor } = require('./ssh.cjs');
 const { Transfers } = require('./transfers.cjs');
-const { scanKeys, generateKey, agentKeys } = require('./keys.cjs');
+const { scanKeys, generateKey, agentKeys, addAgentKey, createKey } = require('./keys.cjs');
 const { importSSHConfig } = require('./ssh-config.cjs');
 const vault = require('./vault.cjs');
 const credentials = require('./local-credentials.cjs');
@@ -689,6 +689,10 @@ function registerVaultHandlers() {
 function registerHandlers() {
   registerVaultHandlers();
   handle('keys:agent', () => agentKeys(process.env.SSH_AUTH_SOCK));
+  handle('keys:add-agent', async ({ path: file, passphrase }) => {
+    if (typeof file !== 'string' || !keyDirectories.has(path.dirname(file))) throw new Error('请先选择密钥目录。');
+    return addAgentKey(process.env.SSH_AUTH_SOCK, file, passphrase);
+  });
   handle('keys:scan', async (directory = defaultKeyDirectory) => {
     if (!keyDirectories.has(directory)) throw new Error('请先选择密钥目录。');
     return { directory, keys: await scanKeys(directory) };
@@ -699,10 +703,24 @@ function registerHandlers() {
     if (directory) keyDirectories.add(directory);
     return directory;
   });
-  handle('keys:generate', async ({ directory, name, passphrase }) => {
+  handle('keys:generate', async ({ directory, name, passphrase, type, bits }) => {
     if (!keyDirectories.has(directory)) throw new Error('请先选择密钥目录。');
     if (directory === defaultKeyDirectory) await fs.promises.mkdir(directory, { recursive: true, mode: 0o700 });
-    return generateKey(directory, name, passphrase);
+    return generateKey(directory, name, passphrase, type, bits);
+  });
+  handle('keys:create', async ({ directory, name, privateKey, publicKey, passphrase }) => {
+    if (!keyDirectories.has(directory)) throw new Error('请先选择密钥目录。');
+    if (directory === defaultKeyDirectory) await fs.promises.mkdir(directory, { recursive: true, mode: 0o700 });
+    return createKey(directory, name, privateKey, publicKey, passphrase);
+  });
+  handle('keys:import-file', async () => {
+    const result = await dialog.showOpenDialog(window, { title: '导入 SSH 私钥文件', properties: ['openFile','showHiddenFiles'] });
+    const file = result.filePaths[0]; if (!file) return null;
+    const handle = await fs.promises.open(file, 'r');
+    try {
+      const stat = await handle.stat(); if (!stat.isFile() || stat.size > 256 * 1024) throw new Error('私钥文件不能超过 256 KiB。');
+      return { name: path.basename(file), privateKey: await handle.readFile('utf8') };
+    } finally { await handle.close(); }
   });
   handle('keys:copy', (publicKey) => {
     if (typeof publicKey !== 'string' || !/^[\w@.-]+ [A-Za-z0-9+/=]+(?: [^\r\n\x00]*)?$/.test(publicKey) || publicKey.length > 32768) throw new Error('公钥格式无效。');

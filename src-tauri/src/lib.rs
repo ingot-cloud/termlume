@@ -522,6 +522,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         | "hosts:forget"
         | "hosts:has-password"
         | "hosts:has-key-passphrase"
+        | "hosts:reveal-key-passphrase"
         | "hosts:clear-password"
         | "hosts:remove-group"
         | "hosts:import" => {
@@ -554,6 +555,14 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             .await;
         }
         "keys:agent" => return Ok(keys::agent_keys().await),
+        "keys:add-agent" => {
+            let path = PathBuf::from(string(&value["path"])?);
+            let directory = path.parent().and_then(|p| p.to_str()).ok_or("私钥路径无效。")?;
+            ws.key_directory(&json!(directory))?;
+            let passphrase = Zeroizing::new(string(&value["passphrase"])?.to_owned());
+            let key = blocking(move || keys::read_private_key(&path, &passphrase)).await?;
+            return keys::add_to_agent(&key).await;
+        }
         "keys:scan" => {
             let directory = ws.key_directory(&value)?;
             return blocking(move || keys::scan(&directory)).await;
@@ -571,10 +580,26 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             }
             return Ok(json!(folder));
         }
-        "keys:generate" => {
+        #[cfg(desktop)]
+        "keys:import-file" => {
+            let file = rfd::AsyncFileDialog::new().set_title("导入 SSH 私钥文件").set_directory(ws.home.join(".ssh")).pick_file().await;
+            let Some(file) = file else { return Ok(Value::Null) };
+            let path = file.path().to_path_buf();
+            return blocking(move || {
+                let bytes = Zeroizing::new(vault::bounded_read(&path, 256 * 1024)?);
+                let text = std::str::from_utf8(&bytes).map_err(|_| "私钥文件需要使用文本格式。".to_owned())?;
+                Ok(json!({"name": path.file_name().and_then(|name| name.to_str()).unwrap_or("imported_key"), "privateKey": text}))
+            }).await;
+        }
+        "keys:create" | "keys:generate" => {
+            let import = name == "keys:create";
             let directory = ws.key_directory(&value["directory"])?;
             let name = string(&value["name"])?.to_owned();
             let passphrase = Zeroizing::new(string(&value["passphrase"])?.to_owned());
+            let algorithm = value.get("type").map(string).transpose()?.unwrap_or("ed25519").to_owned();
+            let bits = value.get("bits").map(|bits| bits.as_u64().ok_or("密钥位数无效。")).transpose()?;
+            let private_text = Zeroizing::new(if import { string(&value["privateKey"])?.to_owned() } else { String::new() });
+            let public_text = value.get("publicKey").map(string).transpose()?.unwrap_or("").to_owned();
             let is_default = directory == ws.home.join(".ssh");
             return blocking(move || {
                 if is_default {
@@ -587,7 +612,8 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
                     }
                     dirs.create(&directory).map_err(error)?;
                 }
-                keys::generate(&directory, &name, &passphrase)
+                if import { keys::create(&directory, &name, &private_text, &public_text, &passphrase) }
+                else { keys::generate(&directory, &name, &passphrase, &algorithm, bits) }
             })
             .await;
         }
@@ -790,6 +816,13 @@ fn hosts(ws: &Workspace, name: &str, value: Value) -> Result<Value, String> {
         "hosts:has-key-passphrase" => {
             let host = current.connection_host(id(&value)?)?;
             return Ok(json!(ssh::saved_key_passphrase(current, &host).is_some()));
+        }
+        "hosts:reveal-key-passphrase" => {
+            let host = current.connection_host(id(&value["id"])?)?;
+            let path = PathBuf::from(string(&value["keyPath"])?);
+            if host.auth != "key" || host.key_path.as_ref() != Some(&path) { return Err("主机私钥已变化，请重新打开编辑表单。".into()); }
+            let saved = ssh::saved_key_passphrase(current, &host).ok_or("没有已保存的私钥口令。")?;
+            return Ok(json!(&*store.read_secret(saved.token)?));
         }
         _ => {}
     }

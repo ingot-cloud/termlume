@@ -4,7 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const test = require('node:test');
-const { generateKey, scanKeys } = require('../src/keys.cjs');
+const { generateKey, scanKeys, agentKeys, addAgentKey, createKey } = require('../src/keys.cjs');
 const { branchName, mergeSnapshots, remoteURL, resolveAuth, useRepository } = require('../src/git-vault.cjs');
 const { importSSHConfig } = require('../src/ssh-config.cjs');
 const { createVault, decodeVault, encodeVault, gitKey, openGitEnvelope, protectGitEnvelope, recoveryCode, unlockVault } = require('../src/vault.cjs');
@@ -25,6 +25,71 @@ test('encrypted OpenSSH keys can be found and existing files survive generation 
   assert.equal(key.encrypted, true);
   assert.match(key.publicKey, /^ssh-ed25519 /);
   assert.equal('privateKey' in key, false);
+});
+
+test('key generation supports RSA sizes and ECDSA curves and rejects incompatible sizes', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'termlume-key-types-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  for (const [type, bits, prefix] of [['rsa', 3072, 'ssh-rsa'], ['ecdsa', 256, 'ecdsa-sha2-nistp256'], ['ecdsa', 384, 'ecdsa-sha2-nistp384'], ['ecdsa', 521, 'ecdsa-sha2-nistp521']]) {
+    const key = await generateKey(directory, `${type}-${bits}`, '', type, bits);
+    assert.equal(key.type, prefix);
+    assert.match(key.publicKey, new RegExp(`^${prefix} `));
+    assert.equal((await scanKeys(directory)).find(k => k.path === key.path).fingerprint, key.fingerprint);
+    if (type === 'rsa') {
+      const blob = Buffer.from(key.publicKey.split(' ')[1], 'base64');
+      let offset = 0;
+      for (let field = 0; field < 2; field++) offset += 4 + blob.readUInt32BE(offset);
+      assert.equal(blob.readUInt32BE(offset), bits / 8 + 1);
+    }
+  }
+  for (const [type, bits] of [['dsa', 1024], ['rsa', 1024], ['rsa', 8192], ['ecdsa', 3072], ['ed25519', 256]]) {
+    await assert.rejects(generateKey(directory, 'invalid', '', type, bits), /类型或位数无效/);
+  }
+  assert.equal((await fs.readdir(directory)).includes('invalid'), false);
+});
+
+test('encrypted private keys can be loaded into an isolated Agent without saving the passphrase', { skip: process.platform === 'win32' }, async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'termlume-key-agent-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const socket = path.join(directory, 'agent.sock');
+  const agent = execFileSync('/usr/bin/ssh-agent', ['-s', '-a', socket], { encoding: 'utf8' });
+  const pid = Number(/SSH_AGENT_PID=(\d+)/.exec(agent)[1]);
+  t.after(() => { try { process.kill(pid); } catch {} });
+  const key = await generateKey(directory, 'fixture', 'disposable passphrase');
+  const before = await fs.readFile(key.path);
+  await assert.rejects(addAgentKey(socket, key.path, 'incorrect'), /解锁私钥/);
+  assert.equal((await agentKeys(socket)).keys.length, 0);
+  assert.equal((await addAgentKey(socket, key.path, 'disposable passphrase')).fingerprint, key.fingerprint);
+  assert.equal((await agentKeys(socket)).keys[0].fingerprint, key.fingerprint);
+  assert.deepEqual(await fs.readFile(key.path), before);
+  for (const [type, bits] of [['rsa', 2048], ['ecdsa', 521]]) {
+    const other = await generateKey(directory, type, '', type, bits);
+    await addAgentKey(socket, other.path, '');
+    assert((await agentKeys(socket)).keys.some(identity => identity.fingerprint === other.fingerprint));
+  }
+  await assert.rejects(addAgentKey(socket, `${key.path}.pub`, ''), /私钥/);
+  await assert.rejects(addAgentKey(undefined, key.path, ''), /启动 Agent/);
+});
+
+test('private key creation validates pairs, preserves encrypted bytes and never replaces existing files', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'termlume-create-key-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const source = await generateKey(directory, 'source', 'fixture passphrase');
+  const privateKey = await fs.readFile(source.path, 'utf8');
+  const saved = await createKey(directory, 'created', privateKey, source.publicKey, 'fixture passphrase');
+  assert.equal(saved.fingerprint, source.fingerprint);assert.equal(saved.encrypted, true);
+  assert.equal(await fs.readFile(saved.path, 'utf8'), privateKey);
+  assert.equal((await createKey(directory, 'derived', privateKey, '', 'fixture passphrase')).fingerprint, source.fingerprint);
+  await assert.rejects(createKey(directory, 'created', privateKey, '', 'fixture passphrase'), /同名/);
+  const other = await generateKey(directory, 'other', '');
+  await assert.rejects(createKey(directory, 'bad', privateKey, other.publicKey, 'fixture passphrase'), /不匹配/);
+  await assert.rejects(createKey(directory, 'bad', privateKey, '', 'wrong'), /口令/);
+  await assert.rejects(createKey(directory, '../escape', privateKey), /文件名/);
+  await assert.rejects(createKey(directory, 'bad', 'not a key'), /私钥/);
+  await fs.writeFile(path.join(directory, 'conflict.pub'), 'preserved');
+  await assert.rejects(createKey(directory, 'conflict', privateKey, '', 'fixture passphrase'), /同名/);
+  assert.equal(await fs.readFile(path.join(directory, 'conflict.pub'), 'utf8'), 'preserved');
+  await assert.rejects(fs.stat(path.join(directory, 'conflict')), {code:'ENOENT'});
 });
 
 test('portable vaults reject invalid credentials and altered ciphertext', async () => {

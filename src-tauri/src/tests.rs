@@ -798,6 +798,106 @@ async fn macos_host_key_passphrase_persists_connects_and_cleans_up() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
+#[ignore = "requires an isolated SSH_AUTH_SOCK"]
+async fn key_loading_into_agent_keeps_the_private_file_encrypted() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = keys::generate(directory.path(), "fixture", "disposable passphrase", "ed25519", None).unwrap();
+    let path = PathBuf::from(key["path"].as_str().unwrap());
+    let original = std::fs::read(&path).unwrap();
+    assert!(keys::read_private_key(&path, "incorrect").is_err());
+    assert!(keys::read_private_key(&path.with_extension("pub"), "").is_err());
+    let private = keys::read_private_key(&path, "disposable passphrase").unwrap();
+    let added = keys::add_to_agent(&private).await.unwrap();
+    assert_eq!(added["fingerprint"], key["fingerprint"]);
+    let identities = keys::agent_keys().await;
+    assert!(identities["keys"].as_array().unwrap().iter().any(|item| item["fingerprint"] == key["fingerprint"]));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn created_private_keys_validate_pairs_preserve_encryption_and_reject_overwrites() {
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(), None);
+    let original = call(&ws, "keys:generate", json!({"name":"source","passphrase":"fixture passphrase"})).await;
+    let private = std::fs::read_to_string(original["path"].as_str().unwrap()).unwrap();
+    let public = original["publicKey"].as_str().unwrap();
+    let request = json!({"name":"imported","privateKey":private,"publicKey":public,"passphrase":"fixture passphrase"});
+    let saved = call(&ws, "keys:create", request.clone()).await;
+    assert_eq!(saved["fingerprint"], original["fingerprint"]);
+    assert_eq!(saved["encrypted"], true);
+    assert_eq!(std::fs::read_to_string(saved["path"].as_str().unwrap()).unwrap(), private);
+    assert!(dispatch(&ws, "keys:create", request.clone()).await.is_err());
+    assert_eq!(std::fs::read_to_string(saved["path"].as_str().unwrap()).unwrap(), private);
+    let mut derived = request.clone(); derived["name"] = json!("derived"); derived["publicKey"] = json!("");
+    assert_eq!(call(&ws, "keys:create", derived).await["fingerprint"], original["fingerprint"]);
+    let other = call(&ws, "keys:generate", json!({"name":"other","passphrase":""})).await;
+    for invalid in [
+        json!({"name":"bad","privateKey":private,"publicKey":other["publicKey"],"passphrase":"fixture passphrase"}),
+        json!({"name":"bad","privateKey":private,"passphrase":"wrong"}),
+        json!({"name":"bad","privateKey":"invalid","passphrase":""}),
+        json!({"name":"../escape","privateKey":private,"passphrase":"fixture passphrase"}),
+        json!({"directory":"/not-approved","name":"bad","privateKey":private,"passphrase":"fixture passphrase"}),
+    ] { assert!(dispatch(&ws, "keys:create", invalid).await.is_err()); }
+    assert!(!home.path().join(".ssh/bad").exists());
+    let public_path = home.path().join(".ssh/conflict.pub"); std::fs::write(&public_path, "preserved").unwrap();
+    let mut conflict = request; conflict["name"] = json!("conflict");
+    assert!(dispatch(&ws, "keys:create", conflict).await.is_err());
+    assert!(!home.path().join(".ssh/conflict").exists());
+    assert_eq!(std::fs::read_to_string(public_path).unwrap(), "preserved");
+}
+
+#[tokio::test]
+async fn key_passphrase_reveal_requires_the_saved_host_key_binding() {
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(), None);
+    let mut host = json!({"name":"key reveal","address":"key.test","username":"ops","auth":"key","keyPath":home.path().join("one"),"localKeyPassphrase":"fixture secret"});
+    let saved = call(&ws, "hosts:save", host.clone()).await[0].clone();
+    let request = json!({"id":saved["id"],"keyPath":saved["keyPath"]});
+    assert_eq!(call(&ws, "hosts:reveal-key-passphrase", request.clone()).await, "fixture secret");
+    assert!(dispatch(&ws, "hosts:reveal-key-passphrase", json!({"id":saved["id"],"keyPath":home.path().join("wrong")})).await.is_err());
+    host["id"] = saved["id"].clone();host["keyPath"] = json!(home.path().join("two"));host.as_object_mut().unwrap().remove("localKeyPassphrase");
+    call(&ws, "hosts:save", host).await;
+    assert!(dispatch(&ws, "hosts:reveal-key-passphrase", request).await.is_err());
+    assert!(dispatch(&ws, "hosts:reveal-key-passphrase", json!({"id":saved["id"],"keyPath":home.path().join("two")})).await.is_err());
+}
+
+#[tokio::test]
+async fn key_generation_validates_algorithms_and_preserves_existing_files() {
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(), None);
+    for (algorithm, bits, expected) in [
+        ("ed25519", None, "ssh-ed25519"),
+        ("rsa", Some(2048), "ssh-rsa"),
+        ("rsa", Some(3072), "ssh-rsa"),
+        ("rsa", Some(4096), "ssh-rsa"),
+        ("ecdsa", Some(256), "ecdsa-sha2-nistp256"),
+        ("ecdsa", Some(384), "ecdsa-sha2-nistp384"),
+        ("ecdsa", Some(521), "ecdsa-sha2-nistp521"),
+    ] {
+        let name = format!("fixture-{algorithm}-{}", bits.unwrap_or(0));
+        let mut request = json!({"name":name,"passphrase":"fixture passphrase","type":algorithm});
+        if let Some(bits) = bits { request["bits"] = json!(bits); }
+        let result = call(&ws, "keys:generate", request.clone()).await;
+        let path = PathBuf::from(result["path"].as_str().unwrap());
+        let contents = std::fs::read(&path).unwrap();
+        let key = russh::keys::PrivateKey::from_openssh(&contents).unwrap().decrypt("fixture passphrase").unwrap();
+        assert_eq!(key.algorithm().to_string(), expected);
+        if algorithm == "rsa" {
+            assert_eq!(key.public_key().key_data().rsa().unwrap().n().as_bytes().len(), bits.unwrap() as usize / 8 + 1);
+        }
+        assert_eq!(key.public_key().fingerprint(russh::keys::HashAlg::Sha256).to_string(), result["fingerprint"]);
+        assert!(!result.as_object().unwrap().contains_key("privateKey"));
+        assert!(dispatch(&ws, "keys:generate", request).await.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), contents);
+    }
+    for (algorithm, bits) in [("dsa", 1024), ("rsa", 1024), ("rsa", 8192), ("ecdsa", 3072), ("ed25519", 256)] {
+        assert!(dispatch(&ws, "keys:generate", json!({"name":"invalid","passphrase":"","type":algorithm,"bits":bits})).await.is_err());
+    }
+    assert!(!home.path().join(".ssh/invalid").exists());
+}
+
+#[tokio::test]
 async fn vault_and_host_requests_round_trip() {
     let home = tempfile::tempdir().unwrap();
     let (profile, ws) = make_workspace(home.path(), None);
