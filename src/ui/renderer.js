@@ -1749,7 +1749,7 @@ function applyTerminalPreferences(tab) {
 function applyPreferences(fonts = false) {
   document.documentElement.dataset.theme=uiPreferences.theme==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):uiPreferences.theme;
   document.documentElement.dataset.terminalTheme=uiPreferences.terminalTheme;
-  for(const tab of tabs.values())if(tab.terminal){if(fonts){tab.terminal.options.fontFamily=uiPreferences.fontFamily;tab.terminal.options.fontSize=uiPreferences.fontSize;}applyTerminalPreferences(tab);tab.fit.fit();}
+  for(const tab of tabs.values())if(tab.terminal){if(fonts){tab.terminal.options.fontFamily=uiPreferences.fontFamily;tab.terminal.options.fontSize=uiPreferences.fontSize;}applyTerminalPreferences(tab);tab.rendering.fit();}
   if (['cards','rows','tree'].includes(uiPreferences.hostLayout)) {
     if (hostLayout.value !== uiPreferences.hostLayout) {
       hostLayout.value = uiPreferences.hostLayout;
@@ -3732,6 +3732,9 @@ function attachTerminal(tab) {
   terminal.loadAddon(fit);
   terminal.loadAddon(search);
   terminal.open(surface);
+  const rendering = createTerminalRendering(terminal, () => {
+    if (surface.clientWidth && surface.clientHeight) fit.fit();
+  });
   const paths = terminalPaths.observe(terminal, (path, text, mayProbe) => {
     void openLinkedTerminalPath(tab, path, text, mayProbe).catch((error) => status(message(error)));
   }, () => {}, () => tab.kind === 'shell' && tab.status === 'ready');
@@ -3764,10 +3767,10 @@ function attachTerminal(tab) {
   view.addEventListener('pointerdown', event => {
     if (!event.target.closest('.split-pane-header') && active !== tab && splitLayout?.panes.includes(tab.id)) selectTab(tab);
   });
-  const resizeObserver = new ResizeObserver(() => { if (surface.clientHeight) fit.fit(); });
+  const resizeObserver = new ResizeObserver(() => { if (surface.clientHeight) void rendering.fit(); });
   resizeObserver.observe(surface);
   tab.resizeObserver = resizeObserver;
-  Object.assign(tab, { view, surface, terminal, fit, search, paths });
+  Object.assign(tab, { view, surface, terminal, rendering, search, paths });
   if (tab.kind === 'shell') {
     tab.paneLabel = summaryText('span', tabTitle(tab));
     tab.paneLabel.classList.add('split-pane-title');
@@ -3857,7 +3860,7 @@ function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session'
   } else if (tab) {
     requestAnimationFrame(() => {
       if (active !== tab || tabDrag?.started) return;
-      tab.fit.fit();
+      tab.rendering.fit();
       focusTerminal(tab);
     });
   }
@@ -4375,8 +4378,9 @@ async function connect(tab, enterPassword = false, automatic = false) {
     tab.files.entries = undefined;
     tab.files.error = '';
     tab.files.loading = false;
-    if (tab.attempts++) tab.terminal.write('\r\n\x1b[90m── 正在建立新 SSH 会话 ──\x1b[0m\r\n');
-    if (tab.view.clientHeight) tab.fit.fit();
+    if (tab.attempts++) tab.rendering.write('\r\n\x1b[90m── 正在建立新 SSH 会话 ──\x1b[0m\r\n');
+    if (tab.view.clientHeight) await tab.rendering.fit();
+    if (!tabs.has(tab.id)) return;
     await api.ssh.connect({ id: tab.id, expected: tab.host, ...credentials, jump: jumpHost ? { expected: jumpHost, ...jumpCredentials } : undefined, dimensions: { rows: tab.terminal.rows, cols: tab.terminal.cols } });
   } catch (error) {
     if (tabs.has(tab.id)) updateSession(tab, 'closed', message(error));
@@ -4459,6 +4463,7 @@ function removeTab(tab) {
   refreshTransferActions(tab.id);
   for (const acknowledge of tab.pendingAcks?.values() || []) acknowledge();
   tab.resizeObserver?.disconnect();
+  tab.rendering?.dispose();
   tab.terminal?.dispose();
   tab.view?.remove();
   if (active === tab) selectTab(partner || tabs.get(tab.sessionId) || [...tabs.values()].sort((a, b) => b.used - a.used)[0]);
@@ -4501,7 +4506,7 @@ function updateSession(tab, next, detail = '') {
   } else if (next === 'closed') {
     clearTimeout(tab.stableTimer);
     tab.paths.reset();
-    tab.terminal.write(`\r\n\x1b[90m${detail.replace(/[\x00-\x1f\x7f]/g, ' ')}\x1b[0m\r\n`);
+    tab.rendering.write(`\r\n\x1b[90m${detail.replace(/[\x00-\x1f\x7f]/g, ' ')}\x1b[0m\r\n`);
   }
   if (active === tab && tab.connectionPage && !tab.connectionPage.hidden) {
     status(`${tab.host.name} · ${detail || sessionLabels[next]}`);
@@ -4723,7 +4728,7 @@ async function configureCommand(session, action, file) {
   if (!file) { fillTerminalCommand(session, details.preview, attempt); return; }
   const tab = { id: sessionId(), kind: 'command', sessionId: session.id, host: session.host, action, status: 'connecting' };
   attachTerminal(tab);
-  tab.terminal.write(`\x1b[90m$ ${details.preview}\x1b[0m\r\n`);
+  tab.rendering.write(`\x1b[90m$ ${details.preview}\x1b[0m\r\n`);
   tabs.set(tab.id, tab);
   selectTab(tab);
   try { await api.commands.start({ id: tab.id, sessionId: session.id, request: details.request }); }
@@ -5859,7 +5864,7 @@ api.onEvent((event) => {
       renderTabs();
     }
     if (tab.terminal.buffer.active.viewportY < tab.terminal.buffer.active.baseY) tab.newOutput = true;
-    tab.terminal.write(event.bytes, acknowledge);
+    tab.rendering.write(event.bytes, acknowledge);
   } else if (event.type === 'transfer') updateJob(event);
   else if (tab && event.type === 'trust') {
     tab.fingerprint = event.fingerprint;
@@ -5904,7 +5909,7 @@ api.onEvent((event) => {
   }
 });
 
-new ResizeObserver(() => active?.fit?.fit()).observe($('terminal-stage'));
+new ResizeObserver(() => active?.rendering?.fit()).observe($('terminal-stage'));
 const tabStrip = $('tabs');
 new ResizeObserver(() => revealActiveTab()).observe(tabStrip);
 tabStrip.addEventListener('scroll', updateTabEdges, { passive: true });
@@ -6162,7 +6167,7 @@ window.addEventListener('keydown', (event) => {
   if (active?.terminal && action.startsWith('zoom-')) {
     active.terminal.options.fontSize = action === 'zoom-reset' ? uiPreferences.fontSize
       : Math.min(32, Math.max(9, active.terminal.options.fontSize + (action === 'zoom-out' ? -1 : 1)));
-    active.fit.fit();
+    active.rendering.fit();
   }
 });
 api.vault.state().then((state) => { applyVaultState(state); if (!state.locked) return refreshHosts(); }).catch((error) => status(message(error)));

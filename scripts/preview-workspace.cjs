@@ -13,6 +13,7 @@ const sources = {
   '/overlays.js':'src/ui/overlays.js',
   '/shortcuts.js':'src/ui/shortcuts.js',
   '/terminal-paths.js':'src/ui/terminal-paths.js',
+  '/terminal-rendering.js':'src/ui/terminal-rendering.js',
   '/workspace-state.js':'src/ui/workspace-state.js',
   '/host-tree.js':'src/ui/host-tree.js',
   '/command-library.js':'src/ui/command-library.js',

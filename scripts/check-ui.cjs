@@ -1617,6 +1617,45 @@ async function main() {
     await run('Emulation.setUserAgentOverride', { userAgent, platform });
     await run('Page.navigate', { url: pathToFileURL(path.join(root, 'dist/ux-review/workspace.html')).href + `?platform=${platform}#shortcuts` });
     await wait(`location.hash === '#shortcuts' && navigator.platform === '${platform}' && typeof keyboard !== 'undefined' && keyboard.isMac === ${platform === 'MacIntel'} && hostsLoaded`);
+    const vimRendering = await js(`(async () => {
+      const surface = document.createElement('div');
+      surface.style.cssText = 'position:fixed;left:0;top:0;width:1100px;height:650px';
+      document.body.append(surface);
+      const terminal = new Terminal({cols:120,rows:30,allowProposedApi:true});
+      terminal.open(surface);
+      const read = () => Array.from({length:terminal.rows}, (_, row) =>
+        terminal.buffer.active.getLine(row).translateToString(true).trimEnd());
+      const write = data => new Promise(resolve => terminal.write(data, resolve));
+      const frame = '\\x1b[?1049h\\x1b[1;30r\\x1b[H\\x1b[2J' +
+        Array.from({length:28}, (_, row) => '\\x1b['+(row+1)+';1HLine '+(row+1)).join('') +
+        '\\x1b[29;1HVim status\\x1b[30;1HVim message\\x1b[H';
+      // The row delete/insert operations are how Vim scrolls without redrawing
+      // the whole screen. Exercise them after a resize races with its old frame.
+      const down = '\\x1b[1;26r\\x1b[H\\x1b[4M\\x1b[23;1HLine 29\\r\\nLine 30\\r\\nLine 31\\r\\nLine 32';
+      const up = '\\x1b[H\\x1b[2LLine 3\\r\\nLine 4\\x1b[r';
+      const expected = [];
+      await write(frame); terminal.resize(120,28); expected.push(read());
+      await write(down); expected.push(read());
+      await write(up); expected.push(read());
+      terminal.reset(); terminal.resize(120,30);
+      const actual = [];
+      const rendering = createTerminalRendering(terminal, () => {terminal.resize(120,28);actual.push(read());});
+      rendering.write(frame);
+      const fitted = rendering.fit();
+      const scrolledDown = new Promise(resolve => rendering.write(down, () => {actual.push(read());resolve();}));
+      await fitted; await scrolledDown;
+      await new Promise(resolve => rendering.write(up, () => {actual.push(read());resolve();}));
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const dom = [...surface.querySelectorAll('.xterm-rows > div')].map(row => row.textContent.trimEnd());
+      const atScreen = terminal.buffer.active.type === 'alternate' &&
+        terminal.buffer.active.baseY === 0 && terminal.buffer.active.viewportY === 0;
+      rendering.dispose(); terminal.dispose(); surface.remove();
+      return {expected,actual,dom,atScreen};
+    })()`);
+    assert.deepEqual(vimRendering.actual, vimRendering.expected, 'Vim frames must parse before fitting, with correct scroll margins afterwards');
+    assert.deepEqual(vimRendering.dom, vimRendering.actual.at(-1), 'Every displayed Vim row must match the terminal buffer after scrolling both directions');
+    assert(vimRendering.atScreen, 'Vim scrolling must stay inside the alternate screen');
+    console.log(`${platform}: PASS Vim output/resize race, scroll-region line deletion/insertion, and rendered row consistency`);
     const key = async (name, code, virtual, extra = 0) => {
       await run('Input.dispatchKeyEvent', { type: 'keyDown', key: name, code, windowsVirtualKeyCode: virtual, modifiers: modifiers | extra });
       await run('Input.dispatchKeyEvent', { type: 'keyUp', key: name, code, windowsVirtualKeyCode: virtual, modifiers: modifiers | extra });

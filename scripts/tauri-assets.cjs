@@ -15,6 +15,7 @@ const assets = {
   'overlays.js': 'src/ui/overlays.js',
   'shortcuts.js': 'src/ui/shortcuts.js',
   'terminal-paths.js': 'src/ui/terminal-paths.js',
+  'terminal-rendering.js': 'src/ui/terminal-rendering.js',
   'bridge.js': 'src/ui/tauri-bridge.js',
   'xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js',
   'xterm.css': 'node_modules/@xterm/xterm/css/xterm.css',

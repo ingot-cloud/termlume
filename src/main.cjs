@@ -259,6 +259,7 @@ const resources = new Map([
   ['/overlays.js', [path.join(rendererDir, 'overlays.js'), 'text/javascript']],
   ['/shortcuts.js', [path.join(rendererDir, 'shortcuts.js'), 'text/javascript']],
   ['/terminal-paths.js', [path.join(rendererDir, 'terminal-paths.js'), 'text/javascript']],
+  ['/terminal-rendering.js', [path.join(rendererDir, 'terminal-rendering.js'), 'text/javascript']],
   ['/xterm.js', [path.join(dependencies, 'xterm/lib/xterm.js'), 'text/javascript']],
   ['/xterm.css', [path.join(dependencies, 'xterm/css/xterm.css'), 'text/css']],
   ['/fit.js', [path.join(dependencies, 'addon-fit/lib/addon-fit.js'), 'text/javascript']],
