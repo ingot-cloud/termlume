@@ -5,156 +5,198 @@
   <img src="assets/brand/logo.svg" alt="Termlume Logo" width="300">
 </picture>
 
-Termlume 把主机列表、SSH 终端、SFTP 文件和日志输出放在同一个桌面窗口里。项目约定集中在以下文档：
+**English** | [简体中文](README.zh-CN.md)
 
-- [产品规划与跟进](PRODUCT_PLAN.md)：功能对比、当前状态、任务编号、优先级和验收条件。P1/P2 已按统一批次实现，人工验收与后续扩展见跟进表。
-- [工作台交互规范](WORKSPACE_UX.md)：主机、会话、文件和命令的操作规则。
-- [视觉与组件规范](STYLE_GUIDE.md)：深浅主题、颜色与尺寸变量、组件状态、参考图和视觉验收。
+Termlume is a desktop SSH workspace for macOS and Windows. Manage hosts, work in terminal tabs and split panes, transfer files over SFTP, and inspect server metrics in one window. Your workspace stays on your device, with optional encrypted backups and synchronization through your own private Git repository.
 
-- [统一验收清单](docs/UNIFIED_ACCEPTANCE.md)：本批功能的操作步骤、通过标准和已知边界。
-- [发版操作规范](docs/RELEASE_PLAYBOOK.md)：从版本与提交确认、Actions 跟进、产物核验到本机真实升级验收的完整流程。
-- [GitHub Release 自动打包](docs/GITHUB_RELEASES.md)：工作流、签名产物、版本同步及失败补跑机制。
-- [App 内更新](docs/APP_UPDATES.md)：签名配置、客户端行为及历史版本升级兼容提示。
+[Download](https://github.com/ingot-cloud/termlume/releases/latest) · [All releases](https://github.com/ingot-cloud/termlume/releases) · [Report an issue](https://github.com/ingot-cloud/termlume/issues) · [Documentation](#documentation)
 
-后续工作按产品规划中的任务编号继续；每次交付同步更新实现状态、验收证据和仍待验证的部分。
+- [Features](#features)
+- [Workspace pages](#workspace-pages)
+- [Install and get started](#install-and-get-started)
+- [Security and synchronization](#security-and-synchronization)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [Run from source](#run-from-source)
+- [Development and documentation](#development-and-documentation)
+- [License](#license)
 
-Windows 支持范围、使用条件和验收说明见 [Windows 兼容性审计](docs/WINDOWS_COMPATIBILITY.md)。
+## Features
 
-## macOS 试用版
+| Area | What you can do |
+| --- | --- |
+| Hosts and groups | Organize hosts in nested groups; use cards, lists or a tree; search and filter by tags; sort by name, recent connection or custom order. Reuse login profiles and inherit group defaults. |
+| SSH connections | Authenticate with a password, local private key or SSH Agent. Connect directly or through one jump host, verify server fingerprints, and configure keepalive, timeouts and optional reconnection. |
+| Terminal workspace | Open multiple tabs, drag tabs and panes to create or rearrange splits, save layouts, search output, and customize terminal colors, fonts and font size. Restored layouts create new sessions. |
+| SFTP and remote editing | Browse, upload and download files or directories; rename and delete entries; drag local files into a session to upload. Edit UTF-8 text files up to 4 MiB in the built-in editor or use an external editor with confirmed upload. |
+| Port forwarding | Save and manually start local, remote and dynamic SOCKS5 forwarding rules, including over a jump connection. Local and dynamic listeners bind to `127.0.0.1`. |
+| Commands and logs | Save reusable commands, find them in the command palette, configure optional startup commands, follow remote logs, and optionally record session output locally. |
+| Server information | View system, CPU, memory, network, storage and disk I/O metrics with five-minute charts. The panel refreshes every five seconds while visible; available metrics depend on the remote Linux or macOS system. |
+| Encrypted workspace | Protect local data, optionally enable a master password and app lock, export encrypted backups, and unlock with a recovery key or Touch ID on a supported Mac. |
+| Git synchronization | Sync hosts, groups, login profiles, commands, layouts and shared appearance preferences through a private Git repository using SSH or HTTPS. Resolve conflicts per record and optionally enable automatic sync. |
+| Import, export and updates | Import OpenSSH host configurations and CSV, export hosts and groups to CSV, and check for signed application updates from Settings. |
 
-Apple Silicon 试用包是 `dist/Termlume-macOS-arm64.zip`。解压后双击 `Termlume.app`。工作台使用 Tauri 2、Rust 和 xterm.js。应用首次打开时会复制默认位置的 Electron 工作区，沿用主机、分组、信任记录和加密保险库。用旧的主密码或恢复密钥解锁即可。旧版仅保存在本机的 SSH 密码需要输入一次并重新保存。已加入加密保险库的 SSH 密码可继续使用。
+## Workspace pages
 
-从源码运行或构建需要 Node.js 22.12 或更新版本、Rust 和 Xcode Command Line Tools。生成的 `.app` 位于 `src-tauri/target/release/bundle/macos/`。
+| Page | Purpose |
+| --- | --- |
+| Hosts | Browse groups and hosts, search, import or export, edit connection settings, and open SSH sessions. |
+| Session workspace | Work in terminal tabs or split panes. Open the file panel, remote editor, server information, command tools and forwarding controls for the current session. |
+| SSH Keys | Discover or import local keys, generate Ed25519/RSA/ECDSA keys, inspect public keys and fingerprints, and load keys into your existing SSH Agent. |
+| Transfer History | Monitor uploads and downloads, inspect progress and errors, cancel tasks, and review local transfer records. |
+| Settings | Manage appearance, groups, login profiles, the command library, saved layouts, session logs, Known Hosts, security and Git sync, and application updates. |
+
+### Hosts
+
+![Host page with groups and saved hosts](docs/assets/readme-hosts.png)
+
+### Terminal and SFTP
+
+![SSH terminal with the remote file panel](docs/assets/readme-session.png)
+
+### Settings
+
+![Appearance and terminal settings](docs/assets/readme-settings.png)
+
+Screenshots use fictional hosts and simulated session data from the current UI. Interface labels shown here are in Chinese.
+
+## Install and get started
+
+Download the package for your platform from [GitHub Releases](https://github.com/ingot-cloud/termlume/releases/latest).
+
+| Platform | Package | Installation |
+| --- | --- | --- |
+| macOS · Apple Silicon | `Termlume-<version>-macOS-arm64-offline.zip` | Extract the archive, move `Termlume.app` to Applications, and open it. |
+| Windows · x64 | `Termlume-<version>-Windows-x64-setup.exe` or `Termlume-<version>-Windows-x64-offline.zip` | Run the installer. The ZIP contains the same installer and instructions; it is not a portable app. |
+
+The **Source code** archives on GitHub contain source files, not a runnable app. Current packaged targets are macOS Apple Silicon and Windows x64.
+
+Packages include the application resources and Git tools; Windows also bundles OpenSSH and a full WebView2 offline installer. End users do not need Node.js, Rust or development tools. Installation, startup and local workspace management work offline; remote SSH, SFTP, Git synchronization and update checks require access to their servers. See [offline distribution](docs/OFFLINE_DISTRIBUTION.md) for details.
+
+Current macOS packages use ad hoc signing without Apple notarization; Windows packages do not yet have an Authenticode publisher signature. Application update packages are verified separately with the updater's signing key. See [release packaging](docs/GITHUB_RELEASES.md) and [in-app updates](docs/APP_UPDATES.md).
+
+1. Create a host with its address, port, username and authentication method, or import existing hosts from OpenSSH configuration or CSV.
+2. Open the host and verify its server fingerprint before authenticating. To use a jump host, save it first and select it in the target host's advanced connection settings.
+3. Use the session toolbar to open files, server information or command tools. Drag tabs or pane headers to arrange your workspace.
+4. Open **Settings → Security & Sync** (`设置 → 安全与同步`) to enable a master password, save your recovery key, create an encrypted backup or connect your private Git repository.
+
+Check for updates under **Settings → About & Updates** (`设置 → 关于与更新`).
+
+## Security and synchronization
+
+- The local workspace is encrypted with XChaCha20-Poly1305. Enable a master password and app lock when you want authentication before opening the workspace; without app lock, the device can unlock it automatically.
+- SSH passwords and private-key passphrases stay local by default. Only SSH passwords you explicitly choose to share enter encrypted backups and Git snapshots. Private-key files, local key paths, passphrases, Git tokens and host trust records stay on each device.
+- Git sync uses your own private repository, with `termlume-vault` as the default branch. Enable master-password protection first, then bind the repository. On another device, restore into an empty workspace using the same repository and your master password or recovery key.
+- Automatic sync is optional and runs while the app is open and unlocked. Conflicts can be resolved record by record. Keep devices sharing a vault on compatible application versions.
+- Session recording is off by default. Recorded output is stored locally as plaintext and is excluded from Git sync, along with transfer records and command history. CSV exports are also plaintext and omit passwords, private keys and trust records.
+
+## Keyboard shortcuts
+
+| Action | macOS | Windows |
+| --- | --- | --- |
+| Find hosts, sessions, commands and layouts | `⌘K` | `Ctrl+K` |
+| New / close current tab | `⌘T` / `⌘W` | `Ctrl+T` / `Ctrl+W` |
+| Find an open session | `⌘J` | `Ctrl+J` |
+| Search terminal output | `⌘F` | `Ctrl+F` |
+| Toggle files / workspace navigation | `⌘E` / `⌘B` | `Ctrl+E` / `Ctrl+B` |
+| Switch to workspace tab 1–9 | `⌘1–9` | `Ctrl+1–9` |
+| Increase / decrease / reset terminal font size | `⌘+` / `⌘-` / `⌘0` | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
+| Save in the built-in editor | `⌘S` | `Ctrl+S` |
+
+On Windows, `Ctrl+C` copies selected terminal text and sends an interrupt when nothing is selected. Multiline pastes require confirmation.
+
+## Run from source
+
+The main desktop application uses **Tauri 2, Rust, JavaScript, xterm.js and CodeMirror**.
+
+### Prerequisites
+
+- Git, **Node.js 22.12 or newer**, npm, and a current stable Rust toolchain with Cargo available in your terminal.
+- **macOS Apple Silicon:** Xcode Command Line Tools (`xcode-select --install`). The current bundled Git preparation script requires an arm64 Mac.
+- **Windows x64:** Microsoft C++ Build Tools with **Desktop development with C++** and a Windows SDK, the `x86_64-pc-windows-msvc` Rust toolchain, and WebView2 Runtime for development. See the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for platform setup.
+
+### Clone and start
 
 ```sh
+git clone https://github.com/ingot-cloud/termlume.git
+cd termlume
 npm ci
 npm start
 ```
 
-正式更新用同一 Apple 团队的 Developer ID Application 证书签名，并保留应用标识 `app.termlume.desktop`。安装证书和私钥后运行 `npm run tauri:build:signed`。若钥匙串里有多个签名身份，用 `APPLE_SIGNING_IDENTITY` 指定证书全名或指纹。正式签名属于开发构建流程，系统可能要求授权使用签名私钥，应用运行时不执行该步骤。
+If you already have a source checkout, run the last two commands from its root. `npm start` launches the native Tauri development app; `npm run tauri:dev` is equivalent. The first run downloads dependencies and prepares the bundled platform tools, so allow network access and extra build time. Frontend resources are generated automatically before development and production builds.
 
-本机试用使用临时签名。应用运行时不读取、写入或清理系统钥匙串，旧版仅保存在系统里的密码需要重新输入并保存。
+### Build a local app
+
+On macOS Apple Silicon:
 
 ```sh
-npm run tauri:build -- --bundles app -- --locked
+npm run tauri:build -- --bundles app --ci -- --locked
 codesign --force --sign - 'src-tauri/target/release/bundle/macos/Termlume.app'
+codesign --verify --deep --strict 'src-tauri/target/release/bundle/macos/Termlume.app'
 ```
 
-## 单跳跳板机
+The app is generated at `src-tauri/target/release/bundle/macos/Termlume.app`. The commands above use the project's current ad hoc signing setup. For Developer ID signing with an existing certificate, see `npm run tauri:build:signed` and the [release playbook](docs/RELEASE_PLAYBOOK.md).
 
-先保存一台可直连的跳板主机（跳板侧 SSH 服务须允许 TCP 转发），再编辑目标主机，在「SSH 连接 → 连接路径」选择「经 …」。两端可分别选择密码、本机私钥或 Agent；连接时分别核对指纹。终端、文件和日志共用此跳板路径，目标域名在跳板侧解析。已有会话保留建立时的路径，修改配置后从主机列表新建连接。
+On Windows x64, in PowerShell:
 
-当前支持一跳。被引用的跳板须先解除关联才能删除；备份或同步恢复后，缺失的跳板或本机私钥须重新配置。OpenSSH 的 ProxyJump/ProxyCommand 暂不自动转换。Electron 原型会保留跳板字段并提示使用 macOS 应用。
+```powershell
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
+npm run tauri:build -- --target x86_64-pc-windows-msvc --bundles nsis --ci -- --locked
+```
 
-## 端口转发
+The installer is generated under `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`. The build hook prepares the pinned Git, OpenSSH and WebView2 resources automatically. See [release packaging](docs/GITHUB_RELEASES.md) for distributable archives, checksums and updater artifacts.
 
-在主机的「⋯ → 端口转发…」保存规则，例如 `127.0.0.1:15432 → 127.0.0.1:5432`。左侧是本机监听端口，右侧是 SSH 主机能够访问的服务；目标地址由 SSH 主机解析。连接该主机后，从会话工具栏「更多 → 端口转发」手动启动。经跳板连接时自动复用同一路径，SSH 服务须允许 TCP 转发。
+## Development and documentation
 
-「监听中」表示本地监听已启动；服务不可达或转发被拒绝时面板会单独显示错误。停止会关闭已有的转发连接。关闭会话、断线或锁定保险库也会停止，解锁/重连后须手动启动。规则随主机加密备份和 Git 同步，运行状态不跨设备恢复。本地和动态类型仅绑定 `127.0.0.1`；动态为 SOCKS5 CONNECT。远程类型向 SSH 服务请求回环监听，再连接本机可访问的目标；服务器实际监听范围受 sshd 配置影响。三种规则均须手动启停。
-
-## 本批新增操作
-
-- **登录配置与分组**：「设置 → 登录配置」保存可复用用户名及认证方式，再从主机表单或「分组管理」引用。密码默认只存本机，主动勾选后才进入加密备份/Git。分组支持空节点、嵌套及端口/登录配置/终端配色默认值；主机逐项选择继承或覆盖。
-- **文件维护**：文件区可重命名、预览递归删除、上传目录、外部编辑文本并明确回传。外部编辑仅普通 UTF-8 文本 ≤4 MiB；远端发生变化会阻止上传。目录不跟随符号链接，同名目录可跳过或另存，删除结果可再次查看。
-- **命令与会话**：侧栏「设置 → 命令库」管理自定义命令，也可用 `⌘K` 搜索后直接粘贴或执行，粘贴不回车，执行先确认主机；主机可主动启用启动命令。标签右键改名/移动，也可拖拽排序；拖到终端窗格的左、右、上、下边缘可预览并创建分屏，不限制屏数，按可用空间继续拆分。分屏会合并为一个「工作区」Tab；可从窗格标题拖到顶部栏任意位置，看到标签占位和对齐顶部的浮动标签后松手拆成独立 Tab，悬停其他工作区标签后可继续拖入其窗格。抓手光标和半透明区域提示落点，Escape 可取消，移动保留原连接。只有分屏工作区的终端工具栏才显示「保存布局」按钮，只保存该工作区中的会话和分支比例；分屏设置入口已移除。分屏保存采用版本 2 的树形记录，继续读取旧双屏和四宫格；同一保险库的设备需一起更新，旧客户端会拒绝新格式。下次按 `⌘K` 搜索布局名称直接打开为空闲会话；「设置 → 会话布局」负责重命名和删除。
-- **日志与外观**：「设置 → 外观与终端」可选择应用主题、终端配色、字号和本机已安装的等宽字体。可选保存最近 200 条应用命令执行记录。会话「记录输出」默认关闭，开启后以本机明文记录远端输出；「会话日志」可检索/查看/导出/删除，每条最多 20 MiB、保留 50 条，锁定/断线停止。
-- **信任与连接**：「Known Hosts」查询、移除或预览导入公钥，冲突指纹不会覆盖。主机更多设置可调保活/超时与可选自动重连；重连为新 shell，已开启启动命令会再次运行，转发需手动恢复。
-- **主机迁移**：「导出 CSV」支持全部主机、单台主机或整个分组（含子组、空组），保留分组层级、实际连接信息与跳板机关系。「导入 CSV」可直接读取导出的文件，预览、勾选后创建；同路径分组复用，相同地址、端口和用户名的主机默认跳过。CSV 不包含密码、私钥、私钥路径、口令或登录配置关联，导入后需在本机单独配置；启动命令、端口转发和信任记录也不包含。CSV 为明文，每个文件最多 1000 条主机与分组记录、1 MiB。兼容原有以 `address` 为必填表头的主机 CSV。
-
-## Electron 原型
-
-原型可从 `dist/Termlume-darwin-arm64/Termlume.app` 或 `npm run electron:dev` 启动。两版各自保存工作区。旧的仅主机快照可迁移到 Tauri。本批新增 Identity、分组、命令和布局资产后，Electron 原型会拒绝读取新资产或新版连接设置快照；请将同一保险库的所有设备更新到本批 Tauri 版后同步。
-
-## 平台快捷键
-
-Windows 使用 Ctrl，macOS 使用 ⌘；按钮提示、布局说明与路径操作提示随系统变化。
-
-| 操作 | Windows | macOS |
-| --- | --- | --- |
-| 新建 / 关闭当前标签 | Ctrl+T / Ctrl+W | ⌘T / ⌘W |
-| 查找主机、会话、命令和布局 | Ctrl+K | ⌘K |
-| 搜索已打开的会话 | Ctrl+J | ⌘J |
-| 终端查找 | Ctrl+F | ⌘F |
-| 文件面板 / 工作台导航 | Ctrl+E / Ctrl+B | ⌘E / ⌘B |
-| 第 1–9 个工作区标签 | Ctrl+1–9 | ⌘1–9 |
-| 下一个 / 上一个标签 | Ctrl+Tab / Ctrl+Shift+Tab | ⌘⇧] / ⌘⇧[ |
-| 终端字号增大 / 缩小 / 重置 | Ctrl+＋ / Ctrl+－ / Ctrl+0 | ⌘＋ / ⌘－ / ⌘0 |
-| 保存内置编辑器文件 | Ctrl+S | ⌘S |
-| 打开终端中的远端路径 | Ctrl+单击 | ⌘单击 |
-
-Windows 终端中，有选中文字时 Ctrl+C 复制，没有选中文字时仍发送中断；Ctrl+V 粘贴，多行内容先确认。Ctrl+D、Ctrl+R、Ctrl+A、Ctrl+L、Ctrl+Z 等未分配给应用的 Shell 操作继续发送到终端。AltGr、输入法组合输入和 Ctrl+Alt 不触发应用快捷键。在内置编辑器中，Ctrl+F 使用编辑器查找。
-
-## 操作
-
-- **主机与终端**。主机首页分区显示分组和未分组主机。双击分组打开其主机列表，点「全部主机」返回。支持卡片和列表、搜索和标签筛选。单击主机选中，双击或按回车连接；选中后可新开会话或编辑，右键与「⋯」提供同一组操作，包含需二次确认的「删除主机」。主机仍被用作跳板机时会阻止删除。分组的「⋯」菜单与「设置 → 分组管理」均可删除分组；确认后删除该组及子组，组内主机移到未分组，保留凭据和原来继承的连接设置。组内新建主机时会预选当前分组。可粘贴 `ssh -p 2222 ops@host.example`，也可从 OpenSSH 配置预览并导入。`⌘K` 可搜索主机和命令，并用方向键选择结果；`⌘T` 新建标签、`⌘W` 关闭标签、`⌘1–9` 切换标签、`⌘J` 搜索已打开的会话。标签分别提示连接状态与后台未读输出。`⌘F` 查找输出，`⌘+`、`⌘-` 和 `⌘0` 调整或重置字号。 主机页「新建主机」旁的菜单集中提供新建分组、OpenSSH/CSV 导入和 CSV 导出。主机及分组表单在右侧浮动，不挤压后台布局；点击遮罩可关闭，有修改时先确认。分组选择框内可搜索并打开新建分组抽屉，创建后恢复原主机草稿。分组端口、登录配置和配色通过集中开关逐项跟随；跟随登录配置时隐藏单独 SSH 字段。
-- **主机排序**。主机页顶部「排序」分别设置分组和主机顺序：分组支持名称升序、降序和自定义；主机另支持最近连接。名称采用中文和数字自然排序。卡片、列表、树形共用顺序，各级分组和组内主机分别排序。自定义模式下拖动手柄，或点手柄/操作菜单上移、下移、移到最前和最后；手柄聚焦后可按 `Alt + ↑ / ↓`。搜索或筛选标签时暂停手动调整。切换自动排序会保留手动位置，新建、导入或移入的条目追加到所属范围末尾。排序模式和手动位置均进入加密备份和 Git 同步。启用共享偏好后采用版本 3 的加密格式，继续读取旧格式；同一保险库的设备需使用支持共享偏好的新客户端，旧客户端会拒绝新格式以避免丢失配置。
-- **SSH 密钥**。「SSH 密钥」可扫描 `~/.ssh` 或所选目录、粘贴或从文件创建私钥、生成 Ed25519/RSA/ECDSA 密钥并选择适用位数。创建时可自动提取公钥，保留原私钥加密状态并拒绝覆盖同名文件。创建和生成抽屉均可勾选完成后加入本机 SSH Agent；加入失败时只重试加载，已保存密钥仍可使用。主机表单通过私钥选择框选用已有文件，密码与私钥口令均支持眼睛按钮短暂查看。
-- **文件**。打开当前会话的「文件」，点目录名进入，可按文件名筛选、隐藏或显示点文件、按名称或大小排序；支持全选当前可见项。修改筛选会清空选择。勾选文件或目录后批量下载，也可用每行的下载按钮。目录下载保留子目录结构，遇到同名目录可跳过或另存。底部队列显示目标、进度和错误。上传也可通过系统文件选择器启动。
-- **终端路径与拖入上传**。按住 `⌘` 单击目录可选择在终端进入、在文件面板打开或下载。在桌面应用中按住平台修饰键（macOS 为 `⌘`，Windows 为 `Ctrl`）单击文件路径会直接打开内置编辑器，支持全屏、按格式高亮、`⌘S` / `Ctrl+S` 保存到远端和下载。编辑器支持不超过 4 MiB 的普通 UTF-8 文本。也可选中文字后右键，或用「更多 → 打开远端路径」手动输入。拖入 Finder 文件时默认使用 Shell 报告的目录，或读取 Linux SSH 前台 Shell 的当前目录。无法确认时可浏览并选择目标目录。
-- **快捷命令与日志**。终端「快捷命令」可将日志、磁盘和保存的单行命令填入当前会话。核对后按回车执行，结果留在当前终端。从文件区「所选项 ⋯」查看末尾或跟踪日志时使用独立输出标签，跟踪可单独停止。
-
-新建或编辑主机时可直接填写 SSH 密码，由 Termlume 加密保存在本机工作区，macOS 和 Windows 使用相同机制，不依赖系统钥匙串。留空可在连接时输入，或保留当前已保存的密码。编辑主机时可点密码框中的眼睛按钮，显示内容会在 20 秒后、窗口失焦或关闭抽屉时隐藏。首次连接要先确认服务器指纹才会提交密码。密码失效时，可在主机编辑面板替换，或从终端点「重新输入密码」。修改地址、端口或 SSH 用户、切换认证方式或删除主机都会清除原密码。忘记指纹会清除本机密码记录，保险库密码仍按原指纹校验。
-
-使用本机私钥时，在主机编辑表单的「私钥口令（仅保存在本机）」填写口令，由 Termlume 加密保存在本机后连接时自动使用。留空保留同一路径已保存的口令，未加密私钥可留空；可显式清除口令，修改私钥路径/认证方式或删除主机也会清理。口令不进入备份或 Git，同步到另一台设备后分别配置本机私钥和口令。每个主机卡片及列表行均提供独立的铅笔快捷编辑按钮。
-
-本机工作区默认使用 XChaCha20-Poly1305 加密，设备随机密钥保存在应用数据目录的 `workspace.key`，不内置固定密钥。未启用主密码时无需额外解锁；同时取得工作区和该密钥的进程仍能读取数据，因此需要额外访问保护时请开启主密码。启用应用锁时，整个工作区及本机凭据由主密码保险库保护，本机设备密钥不能单独解开；主动关闭应用锁后，本机加密凭据允许此设备自动解锁。迁移电脑请使用加密备份或 Git 恢复，不要单独复制或删除 `workspace.key`。本机密码和私钥口令默认不进入备份或 Git；只有主动选择共享的 SSH 密码才会同步。旧版只保存在钥匙串中的密码与私钥口令需要重新输入并保存，应用不会读取或删除旧系统记录。
-
-在「设置 → 安全与同步」可选开启「主密码保护」。主密码用于保护本机工作区、加密备份和 Git 同步快照；开启应用锁时也能用它解锁 Termlume。设置后请保存恢复密钥。在主机表单填写的新 SSH 密码仍默认仅存本机；在连接时勾选「同时加入加密备份和 Git 同步」才会随快照同步。
-
-启用保护后，「应用锁」默认开启，支持立即锁定和闲置自动锁定（默认 15 分钟，可设 1–1440 分钟或关闭）。macOS 和 Windows 均可关闭应用锁，由应用内部的加密凭据在启动时自动解锁，工作区、备份和 Git 快照仍加密；本机密钥或凭据缺失、损坏时，可用主密码或恢复密钥解锁并修复自动解锁。有触控 ID 且已录入指纹的 Mac 可在应用锁下启用指纹解锁。录入变动后，可先用主密码或恢复密钥解锁，再关闭并重新启用触控 ID。
-
-自动解锁凭据保存在本机 `startup-unlock.json`，由随机设备密钥 `workspace.key` 通过 XChaCha20-Poly1305 加密，并绑定保险库、凭据标识和工作区路径，不进入备份或 Git。开启应用锁或关闭主密码保护时移除该凭据。关闭应用锁后，同时能够读取这三份本机文件的进程具备自动解锁能力；需要启动时验证身份时请保持应用锁开启。旧版自动解锁配置需要先使用主密码或恢复密钥解锁一次，随后转换为应用内加密格式；全程不访问或删除旧系统记录。
-
-可以导出加密备份，或在空工作区用原主密码或恢复密钥从备份或 Git 恢复。关闭主密码保护需要验证凭据：本机继续由应用加密保存，清除本机的 Git 绑定和仅存在于保险库中的 SSH 密码；已在本机保存的密码和私钥口令保留。已导出的备份和 Git 历史不受影响，仍使用原凭据解锁。
-
-Git 同步使用专用私有仓库，默认分支为 `termlume-vault`。macOS 和 Windows 均可用本机配置好的 SSH，或填写 HTTPS 地址、Git 用户名和仓库访问 Token。Windows 安装器内置固定版本的 MinGit 和 Win32-OpenSSH，SSH 同步按应用安装目录中的绝对路径调用，不需要另装 Git/OpenSSH 或修改 PATH。macOS 的同步 SSH 命令显式禁用 UseKeychain 和 AddKeysToAgent。Token 加密保存在本机，只用于访问仓库。以 GitHub 为例，可使用仅授权该仓库且具有 Contents 读写权限的细粒度 Token。[GitHub Token 说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
-
-同步快照在设备上加密，请使用独立的强主密码。旧版独立同步密钥仍可读取旧快照，双向同步时会写入新版快照；直接恢复旧快照时，应用会额外提示输入旧密钥。
-
-同步内容包括主机及连接设置（跳板机、启动命令、端口转发规则等）、多级分组及默认设置、登录配置、快捷命令及其快捷状态和顺序、保存的会话布局，以及应用主题、终端配色、字体字号、主机视图、侧栏展开偏好和主机/分组排序模式。原有视图偏好会自动从本机迁入共享配置，配置冲突按记录选择保留本机或仓库版本。不同设备没有安装同名字体时由系统回退到可用字体。传输记录、会话日志、命令历史及记录开关、最近连接时间、临时标签/分屏状态不进入同步。私钥文件与本机路径、私钥口令、未共享的 SSH 密码、设备密钥、Git Token/自动同步策略、应用锁/触控 ID 和指纹信任记录继续保存在各设备；SSH 密码共享仍需原有的主动选择。
-
-绑定后，「立即同步」会拉取、合并并推送本机修改；「拉取更新」只合并仓库内容，保留本机未推送的修改。两者都允许逐条解决冲突。自动同步默认关闭，可选择启动或解锁后同步、本机资料变更后约 10 秒同步，以及每 5、15、30 或 60 分钟同步。应用运行且未锁定时才会自动同步；遇到冲突或失败会暂停，手动处理或重试成功后恢复。关闭 Git 同步会暂停操作并保留仓库绑定和策略。策略只在本机生效。
-
-「仓库连接与分支」可更新 Token、切换 SSH/HTTPS 或更改分支。新连接和分支必须包含上次同步的提交。另一台设备可在空工作区选择「从 Git 恢复」，填写同一仓库和分支、该设备的仓库授权，以及原主密码或恢复密钥。支持移动端的构建可直接使用 HTTPS。
-
-要迁到新仓库，请先让其他设备完成同步，再暂停向旧仓库写入。在「仓库连接与分支 → 迁移到新仓库」选择一个空私有仓库和分支，应用会合并改动后写入一条加密根提交。推送确认后才切换绑定；如果中途断开，可以点「继续迁移」。旧仓库的提交仍留在原处。本机私钥路径和主机信任记录由各设备分别保存。
+### Checks
 
 ```sh
 npm test
-npm run tauri:test:macos
+npm run test:ui
 ```
 
-macOS 回归命令在本机回环地址启动临时 SSH 服务，测试终端、SFTP、应用凭据加密、旧凭据重新保存、旧自动解锁配置手动转换、加密工作区迁移和 Git 冲突处理；不访问真实钥匙串。
+The UI checks use Google Chrome and isolated fictional data. On macOS they use `/Applications/Google Chrome.app` by default; set `TERMLUME_TEST_CHROME` to another Chrome executable when needed.
 
-## 本轮工作台优化与验证
+For native Rust unit tests, prepare resources first:
 
-视觉与布局以 Terminus / Tabby 为方向。顶部会话标签显示对应会话，终端/新标签页完全隐藏侧栏；主动点击「工作台」回到之前的工作台页面。侧栏不再重复显示会话和主机分组。「设置」为独立页面，右侧直接显示列表、详情与编辑表单。`⌘B` 控制工作台导航，`⌘E` 切换文件；`⌘K` 统一查找主机、会话、命令和工具。文件区保留祖先目录面包屑和「终端目录」。
+```sh
+node scripts/tauri-before-build.cjs
+cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib
+```
 
-2026 年 11 月 8 日，基于 `codex/https-vault-sync` 当前工作区生成 U-005 Apple Silicon 验收包：`dist/Termlume-macOS-arm64.zip`，解压后打开 `Termlume.app`；也可直接打开 `dist/Termlume.app`。主机第二行仅显示连接地址，编辑/更多按钮提供明显悬停高亮，主机抽屉具有开合动画并遵循系统减少动态效果设置；私钥选择改为简单列表及底部「确定 / 关闭」。本轮 `npm test` 16 项通过，`npm run test:ui` 在两种窗口尺寸各通过 44 项行为检查，并覆盖深浅主题悬停、动画及按钮溢出；原生代码未变，沿用 U-003 的 20 项 macOS 回归结果。App 签名、ZIP 校验及源码摘要见 `dist/Termlume-macOS-arm64.build.json` 和同目录 `.zip.sha256` 文件。
+On macOS, `npm run tauri:test:macos` additionally runs integration tests using temporary SSH, SFTP and Git fixtures on the loopback interface.
 
-离线界面预览运行 `node scripts/preview-workspace.cjs` 后打开 `dist/ux-review/workspace.html`（仅模拟数据，不连接服务器）。本轮浏览器截图已走查，真实原生窗口操作及双设备验收仍待完成，步骤见 [统一验收清单](docs/UNIFIED_ACCEPTANCE.md)。
+### Source layout
 
+| Path | Contents |
+| --- | --- |
+| `src/ui/` | Shared desktop interface, terminal, file editor and workspace interactions. |
+| `src-tauri/` | Rust backend, native integrations and Tauri packaging configuration. |
+| `scripts/` | Asset preparation, platform dependencies, checks and release tooling. |
+| `test/` | Node.js regression tests. |
+| `docs/` | Compatibility, distribution, update and acceptance documentation. |
+| `assets/brand/` | Logos, app icons and brand assets. |
 
-### 查看服务器信息
+The repository also retains an Electron prototype (`npm run electron:dev`). Use the Tauri app for the current feature set and workspace format.
 
-连接 SSH 后，点击终端工具栏「服务器信息」，即可查看系统/架构、CPU 型号和核心数、CPU 使用率与负载、内存/交换空间、各网卡的上下行速度与累计收发流量，以及各挂载点的存储占用。面板打开时立即采集，此后每 5 秒自动刷新；收起、切换到其他页面或断线后停止，仍可点击「刷新」立即更新；通过独立只读 SSH 命令获取，无需手动输入命令。Linux 提供完整指标，macOS 显示支持的基础指标；未获取到的字段显示暂不可用。
+### Documentation
 
+The detailed project documents are currently maintained in Chinese.
 
-CPU、内存和网络区还提供当前会话最近 5 分钟的实时曲线，每 5 秒同步追加采样，支持查看采样时间和读数。CPU、内存曲线固定使用 0–100% 刻度。收起后停止采集，重新展开保留窗口内的历史并将暂停时段留空；断线、重连或锁定后清除历史，不写入磁盘。
+| Document | Topics |
+| --- | --- |
+| [Product plan](PRODUCT_PLAN.md) | Feature status, roadmap and acceptance criteria. |
+| [Workspace interactions](WORKSPACE_UX.md) | Hosts, sessions, files, commands and workspace behavior. |
+| [Visual and component guide](STYLE_GUIDE.md) | Themes, design tokens, components and visual review. |
+| [Acceptance checklist](docs/UNIFIED_ACCEPTANCE.md) | Manual checks and known validation boundaries. |
+| [Windows compatibility](docs/WINDOWS_COMPATIBILITY.md) | Windows-specific support and verification. |
+| [Offline distribution](docs/OFFLINE_DISTRIBUTION.md) | Bundled dependencies, sources and offline behavior. |
+| [Release playbook](docs/RELEASE_PLAYBOOK.md) | Versioning, release verification and installed-app acceptance. |
+| [GitHub release packaging](docs/GITHUB_RELEASES.md) | CI workflows, packages, signatures and checksums. |
+| [In-app updates](docs/APP_UPDATES.md) | Update signing, installation and compatibility. |
 
-「磁盘读写」按块设备显示读取、写入速度和最近 5 分钟双曲线，与其他信息一起每 5 秒刷新，收起后停止。支持 Linux 和 macOS，不重复统计分区，不把多个设备加总；没有磁盘活动时显示零速度，缺失指标显示暂不可用。
+Bug reports and feature requests are welcome in [Issues](https://github.com/ingot-cloud/termlume/issues). For code contributions, follow [AGENTS.md](AGENTS.md), run the relevant checks, and use Conventional Commits such as `fix(ssh): handle reconnect timeout`.
 
-每块磁盘还显示 IOPS（每秒完成的读写次数）、I/O 利用率及各自最近 5 分钟曲线，沿用五秒刷新与收起停止。利用率曲线固定 0–100%；Linux 使用设备忙碌时间计算，macOS 可显示 IOPS，未提供忙碌时间时利用率显示暂不可用。
+## License
 
-平均读取/写入延迟以毫秒显示，并提供双曲线；平均 I/O 队列长度显示采样期内平均在途请求数及独立曲线，均保留最近 5 分钟、每 5 秒刷新、收起停止。没有对应完成请求时延迟暂无有效采样。Linux 提供完整指标；macOS 可显示延迟，未提供加权在途时间时队列长度显示暂不可用。
-
-
-Windows 已补齐 OpenSSH Agent、整目录下载、外部文本编辑回写、公钥与恢复密钥复制、系统等宽字体扫描及 Git SSH 同步。Agent 需要已启动的 Windows OpenSSH ssh-agent 服务和已加载密钥；Git SSH 使用随应用安装的 MinGit/Win32-OpenSSH 与已核验的 known_hosts。应用不访问系统密码存储。详细测试步骤见 Windows 安装包中的 README-Windows.txt。
-
-新建主机时，选定或输入分组后才显示继承选项；连接区直接填写用户名、端口、认证方式及密码/私钥。连接路径和复用登录配置在“更多设置”中配置。
-
-
-Windows 内置工具的版本、官方来源和 SHA-256 固定在 `scripts/windows-tools.lock.json`。Tauri Windows 构建会自动准备工具资源；`npm run windows:tools` 可预下载，`npm run windows:tools:verify` 校验资源摘要、x64 格式和被调用工具的 DLL 依赖。`TERMLUME_WINDOWS_TOOLS_CACHE` 可指定离线构建缓存。工具只安装在 Termlume 的 `tools/windows/`，不注册系统 Git、不修改系统 PATH、不安装或启动 SSH 服务；SSH Agent 继续连接用户已有 Agent，密码与本机私钥连接不依赖系统服务。第三方许可、通知和来源清单随组件一起保留。Windows 包附带 `Test-Bundled-Tools.ps1`，可在移除系统 Git/SSH PATH 的子进程环境中验证内置工具与 Git 对象读写。
-
-
-Windows 现在提供完整离线安装包：安装器内置 Git、OpenSSH 和完整 WebView2 离线安装器，安装及首次打开不需要下载应用依赖。Mac 试用包内置用于 SSH 保险库同步的 Git 客户端，使用 macOS 自带 WebKit、SSH 和系统库，不要求用户安装 Node、Homebrew 或 Xcode 命令行工具。界面资源均打包在应用中。安装、启动和本地工作区管理可离线使用；SSH/SFTP/远程 Git 操作需要能够访问对应服务器。离线交付与验证说明见 docs/OFFLINE_DISTRIBUTION.md。
+Termlume is licensed under the [Apache-2.0 license](https://github.com/ingot-cloud/ingot#Apache-2.0-1-ov-file). Bundled third-party components retain their own licenses and notices.
