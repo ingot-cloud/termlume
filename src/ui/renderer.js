@@ -3069,6 +3069,39 @@ function openGroup(group) {
   $('host-library').scrollTop = 0;
 }
 
+function renderHostBreadcrumb(current, groupById) {
+  const breadcrumb = $('host-breadcrumb');
+  const ancestors = [];
+  const seen = new Set([current.id]);
+  for (let group = groupById.get(current.parentId); group && !seen.has(group.id); group = groupById.get(group.parentId)) {
+    seen.add(group.id);
+    ancestors.unshift(group);
+  }
+  const home = button('全部主机', () => openGroup(''));
+  home.id = 'all-hosts';
+  const location = summaryText('span', current.name);
+  location.title = current.path;
+  location.setAttribute('aria-current', 'location');
+  location.tabIndex = -1;
+  const list = node('ol', '', node('li', '', home));
+  for (const group of ancestors) {
+    const link = button(group.name, () => {
+      openGroup(group.path);
+      breadcrumb.querySelector('[aria-current="location"]')?.focus({ preventScroll: true });
+    }, 'text-ellipsis');
+    link.title = group.path;
+    list.append(node('li', '', breadcrumbSeparator(), link));
+  }
+  list.append(node('li', '', breadcrumbSeparator(), location));
+  breadcrumb.replaceChildren(list);
+
+  function breadcrumbSeparator() {
+    const separator = node('span', '', '›');
+    separator.setAttribute('aria-hidden', 'true');
+    return separator;
+  }
+}
+
 const expandedHostGroups = new Set();
 const collapsedSettingsGroups = new Set();
 let treeSearchKey = '', expandedSearchGroups;
@@ -3179,12 +3212,13 @@ function renderHostTree(matching, query, tag, draft) {
   if (selected?.closest('[hidden]')) { selectedHostId = ''; selected.setAttribute('aria-pressed', 'false'); updateHostActions(); }
 }
 
-function groupCard(group, count) {
+function groupCard(group, count, asset) {
+  const name = asset?.name ?? group;
   const card = node('button', 'group-open', settingsIcon('group'), node('span', 'host-identity',
-    summaryText('strong', group), node('small', '', `${count} 台主机`)), node('span', 'group-arrow', '›'));
+    summaryText('strong', name), node('small', '', `${count} 台主机`)), node('span', 'group-arrow', '›'));
   card.type = 'button';
   card.dataset.group = group;
-  card.setAttribute('aria-label', `打开分组 ${group}，${count} 台主机`);
+  card.setAttribute('aria-label', `打开分组 ${name}，${count} 台主机`);
   card.setAttribute('aria-pressed', String(selectedGroup === group));
   card.title = `${group} · 双击打开分组`;
   card.addEventListener('click', (event) => {
@@ -3198,7 +3232,6 @@ function groupCard(group, count) {
     }
   });
   card.addEventListener('dblclick', () => openGroup(group));
-  const asset = groupAssets.find(g => g.path === group);
   const row = node('div', 'host-row group-row', card, ...(api.groups && asset ? [groupActions(asset)] : []));
   if (asset) decorateHostOrder(row, 'group', asset);
   return row;
@@ -3555,6 +3588,8 @@ function renderHosts() {
   $('host-sort').hidden = !api.hosts.reorder;
   $('host-sort').disabled = hostSortBusy;
   const treeLayout = workspace.dataset.hostLayout === 'tree';
+  const groupByPath = new Map(groupAssets.map(group => [group.path, group]));
+  const groupById = new Map(groupAssets.map(group => [group.id, group]));
   const groups = new Map(groupAssets.map(g=>[g.path,0]));
   for (const host of hosts) {
     if (host.group) groups.set(host.group, (groups.get(host.group) || 0) + 1);
@@ -3593,18 +3628,19 @@ function renderHosts() {
   const matchingGroups = new Set(matching.map((host) => host.group));
   const visibleGroups = [...groups]
     .filter(([group]) => {
-      const asset = groupAssets.find((item) => item.path === group);
-      const parent = groupAssets.find((item) => item.id === asset?.parentId)?.path || '';
+      const parent = groupById.get(groupByPath.get(group)?.parentId)?.path || '';
       if (currentGroup && parent !== currentGroup) return false;
       return searching ? matchingGroups.has(group) || group.toLowerCase().includes(query) : parent === currentGroup;
     })
     .sort(([a], [b]) => {
-      const first = groupAssets.find(g=>g.path===a) || {id:a,name:a}, second = groupAssets.find(g=>g.path===b) || {id:b,name:b};
+      const first = groupByPath.get(a) || {id:a,name:a}, second = groupByPath.get(b) || {id:b,name:b};
       return uiPreferences.groupSort === 'manual' ? groupPositions.get(first.id) - groupPositions.get(second.id) : window.hostTree.compare(uiPreferences.groupSort)(first,second);
     });
   if (!visibleGroups.some(([group]) => group === selectedGroup)) selectedGroup = '';
   $('host-breadcrumb').hidden = treeLayout || !currentGroup;
-  $('current-group').textContent = $('current-group').title = currentGroup;
+  if (!treeLayout && currentGroup) {
+    renderHostBreadcrumb(groupByPath.get(currentGroup) ?? { name: currentGroup, path: currentGroup }, groupById);
+  }
   const exact = query ? matching.filter((host) => target ? matchesTarget(host, target) : host.name.toLowerCase() === query) : [];
   const candidates = target || exact.length ? exact : matching;
   const saved = query && candidates.length === 1 ? candidates[0] : undefined;
@@ -3612,7 +3648,7 @@ function renderHosts() {
   hostSearchMatch = saved ? { run: () => openHost(saved) } : draft ? { draft: true, run: () => editHost(undefined, undefined, target) } : undefined;
   updateHostActions();
   if (treeLayout) { renderHostTree(matching, query, tag, draft); return; }
-  const groupEntries = visibleGroups.map(([group, count]) => groupCard(group, count));
+  const groupEntries = visibleGroups.map(([group, count]) => groupCard(group, count, groupByPath.get(group)));
   const hostEntries = visibleHosts.map(hostCard);
   if (!currentGroup && !groupEntries.length) groupEntries.push(node('p', 'muted', searching ? '没有匹配的分组' : '暂无分组'));
   if (!hostEntries.length) {
@@ -5938,7 +5974,6 @@ $('host-search-form').addEventListener('submit', (event) => {
 });
 $('library-button').addEventListener('click', () => selectTab(undefined, libraryView));
 $('tag-filter').addEventListener('change', renderHosts);
-$('all-hosts').addEventListener('click', () => openGroup(''));
 $('host-actions').addEventListener('click', showHostActions);
 for (const control of pageButtons) {
   control.addEventListener('click', () => {

@@ -97,6 +97,26 @@ async function main() {
     const { data } = await run('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync(path.join(root, 'dist/ux-review', name), Buffer.from(data, 'base64'));
   };
+  const hostCardChecks = async width => {
+    const layout = await js(`(() => {
+      const compact = { id:'card-ip', name:'腾讯云-198.51.100.85', address:'198.51.100.85', username:'ubuntu', port:22 };
+      const long = { id:'card-long', name:'生产环境-数据库备份节点-'.repeat(5), address:'database-replica-'.repeat(5)+'example.test', username:'backup', port:2222 };
+      const section = hostSection('主机', [hostCard(compact), hostCard(long)]);
+      $('host-list').replaceChildren(section);
+      const entries = section.querySelector('.host-entries');
+      const textLines = card => [...card.querySelectorAll('.host-identity > *')].map(label => {
+        const range = document.createRange();
+        range.selectNodeContents(label);
+        return { lines: new Set([...range.getClientRects()].map(rect=>rect.top)).size, fits: label.scrollWidth <= label.clientWidth };
+      });
+      return { compact:textLines(entries.firstElementChild), long:textLines(entries.lastElementChild) };
+    })()`);
+    assert(layout.compact.every(label => label.lines === 1 && label.fits), 'An IP-based name and login should fit on one line each');
+    assert(layout.long.every(label => label.lines > 1 && label.fits), 'Long names and endpoints should wrap within the card');
+    await overflow();
+    await js('renderHosts()');
+    console.log(`${width}px: PASS full host card names and endpoints, including long values`);
+  };
   const deletionChecks = async width => {
     await js(`(async()=>{window.deleteOriginalHosts=structuredClone(previewHosts);window.deleteOriginalGroups=structuredClone(previewGroups);
       previewGroups.push({id:'delete-parent',name:'删除验收'},{id:'delete-child',name:'子组',parentId:'delete-parent'});
@@ -1322,6 +1342,7 @@ async function main() {
     await inheritanceChecks(width);
     await sharedUiChecks(width);
     await hostOrderChecks(width);
+    await hostCardChecks(width);
     await hostTreeChecks(width);
     await csvChecks(width);
     await deletionChecks(width);

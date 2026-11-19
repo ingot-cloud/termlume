@@ -139,12 +139,16 @@ code, kbd { font-family: SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .host-filters :is(.dropdown-trigger, #host-sort) { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 3px 9px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--raise); }
 .host-filters :is(.dropdown-trigger, #host-sort):not(:disabled):is(:hover, [aria-expanded="true"]) { background: var(--surface-hover); }
 .host-filters #host-sort > .chrome-icon { color: var(--muted); }
-#host-breadcrumb { display: flex; align-items: center; gap: 7px; color: var(--muted); min-width: 0; margin-bottom: 12px; }
-#host-breadcrumb button { flex: none; color: var(--accent); padding: 2px 4px; }
+#host-breadcrumb { color: var(--muted); margin-bottom: 12px; }
+#host-breadcrumb ol { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 7px; list-style: none; margin: 0; padding: 0; }
+#host-breadcrumb li { display: flex; align-items: center; gap: 7px; min-width: 0; max-width: 100%; }
+#host-breadcrumb button { color: var(--accent); padding: 2px 4px; }
 .host-group { font-size: 13px; font-weight: 600; margin: 0 0 10px; }
 #host-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-5); }
 .host-entries { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
-[data-host-layout="cards"] .host-entries { grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr)); }
+[data-host-layout="cards"] .host-entries { grid-template-columns: repeat(auto-fill, minmax(min(100%, 304px), 1fr)); }
+[data-host-layout="cards"] .host-open { align-self: stretch; gap: 8px; padding-inline: 8px; }
+[data-host-layout="cards"] .host-open .host-identity > .text-ellipsis { overflow: visible; white-space: normal; overflow-wrap: anywhere; }
 .host-entries > p { grid-column: 1 / -1; margin: 0; font-size: 12px; }
 [data-host-layout="rows"] .host-entries { gap: 4px; }
 .host-row { display: flex; align-items: center; gap: 2px; min-width: 0; background: var(--bar); border-radius: var(--radius-card); }

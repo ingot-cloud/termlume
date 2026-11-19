@@ -19,16 +19,31 @@
     assert(visibleHostIds().sort().join() === 'api,db' && hostList.children.length === 1 &&
       hostList.querySelector('h2').textContent === '主机', '没有子分组时只显示组内主机区块');
     const originalGroups = groupAssets;
-    groupAssets = [...groupAssets, { id: 'prod-app', parentId: 'prod', path: '生产环境/应用', hosts: [] }];
+    const appGroup = { id: 'prod-app', parentId: 'prod', name: '应用 / 网关', path: '生产环境 / 应用 / 网关', hosts: [] };
+    const leafGroup = { id: 'prod-node', parentId: appGroup.id, name: '节点', path: `${appGroup.path} / 节点`, hosts: [] };
+    groupAssets = [...groupAssets, appGroup, leafGroup];
     renderHosts();
+    const breadcrumb = $('host-breadcrumb');
+    const trailButtons = () => [...breadcrumb.querySelectorAll('button')];
     assert(hostList.querySelector('h2').textContent === '子分组' &&
-      hostList.querySelector('.group-open')?.dataset.group === '生产环境/应用', '有子分组时可继续进入');
+      hostList.querySelector('.group-open')?.dataset.group === appGroup.path &&
+      hostList.querySelector('.group-open strong')?.textContent === appGroup.name, '子分组卡片只显示当前组名');
+    hostList.querySelector('.group-open').click();
+    hostList.querySelector('.group-open').click();
+    assert(trailButtons().map(b => b.textContent).join('|') === `全部主机|生产环境|${appGroup.name}` &&
+      breadcrumb.querySelector('[aria-current="location"]').textContent === leafGroup.name, '面包屑按实际分组层级显示，组名中的斜线属于组名');
+    trailButtons().at(-1).click();
+    assert(hostList.querySelector('.group-open')?.dataset.group === leafGroup.path &&
+      document.activeElement.textContent === appGroup.name, '点击面包屑可返回父组并聚焦新位置');
+    hostList.querySelector('.group-open').click();
+    trailButtons()[1].click();
+    assert(hostList.querySelector('.group-open')?.dataset.group === appGroup.path && visibleHostIds().sort().join() === 'api,db', '面包屑可直接跳转更高层级');
     $('host-search').value = '预发';
     $('host-search').dispatchEvent(new Event('input'));
     assert(!hostList.querySelector('.group-open') && hostList.children.length === 1, '组内搜索不会显示其他分组');
     groupAssets = originalGroups;
     $('all-hosts').click();
-    assert(!hostList.querySelector('[aria-pressed="true"]') && !$('hosts').contains(document.activeElement),
+    assert(breadcrumb.hidden && !hostList.querySelector('[aria-pressed="true"]') && !$('hosts').contains(document.activeElement),
       '返回主机首页不自动聚焦或选中分组');
     const searchInput = $('host-search');
     searchInput.value = '数据库';
@@ -44,8 +59,8 @@
     const entries = hostList.lastElementChild.querySelector('.host-entries');
     if (workspace.dataset.hostLayout === 'cards' && [1140, 550].includes(innerWidth)) {
       const firstRow = entries.firstElementChild.offsetTop;
-      assert([...entries.children].filter(card => card.offsetTop === firstRow).length === (innerWidth === 1140 ? 3 : 1),
-        '常规窗口每行三张卡片，窄窗口每行一张');
+      assert([...entries.children].filter(card => card.offsetTop === firstRow).length === (innerWidth === 1140 ? 2 : 1),
+        '1140 px 窗口每行两张卡片，550 px 窗口每行一张');
     }
     const topBefore = hostList.getBoundingClientRect().top;
     const toolbarTop = $('host-search-form').getBoundingClientRect().top;
