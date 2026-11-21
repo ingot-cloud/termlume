@@ -97,6 +97,38 @@ async function main() {
     const { data } = await run('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync(path.join(root, 'dist/ux-review', name), Buffer.from(data, 'base64'));
   };
+  const updateNoticeChecks = async width => {
+    const publish = (version, phase = 'available') => js(`previewListener({type:'update',state:{
+      currentVersion:'0.2.2',version:'${version}',phase:'${phase}',canDownload:${phase === 'available'},
+      message:'更新状态',notes:'更新说明',downloaded:0,total:null}})`);
+    const click = label => js(`[...dialog.querySelectorAll('.actions button')].find(b=>b.textContent==='${label}').click()`);
+    await js("selectTab(undefined,'hosts');$('host-search').focus()");
+    await publish('0.2.3', 'pending');
+    assert(await js('!dialog.open'), 'A release without a download must not interrupt the user');
+    await js("void confirm('正在处理的操作','操作进行中。','确定')");
+    await publish('0.2.3');
+    assert(await js("dialog.querySelector('h2').textContent==='正在处理的操作'"), 'Update notification must wait for an open dialog');
+    await click('取消');
+    await wait("dialog.open && dialog.textContent.includes('Termlume v0.2.3')");
+    assert.deepEqual(await js("[...dialog.querySelectorAll('.actions button')].map(b=>b.textContent)"), ['取消','去更新']);
+    await overflow();
+    await click('取消');
+    await wait('!dialog.open && !dialog.childElementCount');
+    await publish('0.2.3');
+    assert(await js("!dialog.open && workspace.dataset.view==='hosts' && document.activeElement===$('host-search')"),
+      'Dismissal must preserve work and repeated events must not reopen the notice');
+
+    await js("window.noticeDownload=api.updates.download;api.updates.download=async()=>{throw Error('Unexpected download')}");
+    await publish('0.2.4');
+    await click('去更新');
+    await wait("!dialog.open && $('settings-page').textContent.includes('新版本 v0.2.4')");
+    assert(await js("appUpdateState.phase==='available' && !$('settings-page').querySelector('.dialog-error').textContent && [...$('settings-page').querySelectorAll('button')].some(b=>b.textContent==='下载更新')"),
+      'Go to update must open the version details without starting a download');
+    await publish('0.2.6');
+    assert(await js("!dialog.open && $('settings-page').textContent.includes('新版本 v0.2.6')"), 'Update details must refresh in place');
+    await js("api.updates.download=noticeDownload;previewListener({type:'update',state:{...previewUpdateState,revision:undefined,phase:'idle',version:null,canDownload:false}});selectTab(undefined,'hosts')");
+    console.log(`${width}px: PASS update notification, deferral, dismiss, and direct navigation to update details`);
+  };
   const hostCardChecks = async width => {
     const layout = await js(`(() => {
       const compact = { id:'card-ip', name:'腾讯云-198.51.100.85', address:'198.51.100.85', username:'ubuntu', port:22 };
@@ -116,6 +148,50 @@ async function main() {
     await overflow();
     await js('renderHosts()');
     console.log(`${width}px: PASS full host card names and endpoints, including long values`);
+  };
+  const commandOrderChecks = async width => {
+    await js(`window.originalCommands=structuredClone(previewSnippets);window.commandSaveCount=previewCalls.filter(([type])=>type==='reorder-snippets').length;
+      previewSnippets.splice(0,previewSnippets.length,...[1,2,3,4].map(n=>({id:'q'+n,name:'命令 '+n,command:'echo '+n,tags:['qa'],pinned:n===1,order:n*10})));
+      openSettings('snippets')`);
+    await wait("document.querySelectorAll('.command-library-card').length===4");
+    const visible = () => js("[...document.querySelectorAll('.command-library-card')].map(card=>card.dataset.orderId)");
+    const desktop = width !== 550;
+    const columns = await js("getComputedStyle(document.querySelector('.command-library-grid')).gridTemplateColumns.split(' ').length");
+    assert.equal(columns, desktop ? 2 : 1);
+    const start = await js(`(() => {
+      const handle=document.querySelector('[data-order-id=${desktop ? 'q1' : 'q2'}] .order-handle');
+      const rect=handle.getBoundingClientRect();return {x:rect.x+rect.width/2,y:rect.y+rect.height/2};
+    })()`);
+    const end = await js(`(() => {
+      const rect=document.querySelector('.command-library-card[data-order-id=${desktop ? 'q3' : 'q1'}]').getBoundingClientRect();
+      return ${desktop ? '{x:rect.right-8,y:rect.top+16}' : '{x:rect.left+30,y:rect.top+8}'};
+    })()`);
+    const startDrag = async () => {
+      await run('Input.dispatchMouseEvent', { type:'mouseMoved', ...start });
+      await run('Input.dispatchMouseEvent', { type:'mousePressed', button:'left', buttons:1, clickCount:1, ...start });
+      await run('Input.dispatchMouseEvent', { type:'mouseMoved', buttons:1, ...end });
+      assert(await js('orderDrag?.started && !orderMarker.hidden'), 'Dragging a command must mark its insertion point');
+    };
+    const release = () => run('Input.dispatchMouseEvent', { type:'mouseReleased', button:'left', clickCount:1, ...end });
+    await startDrag();
+    await run('Input.dispatchKeyEvent', {type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+    await run('Input.dispatchKeyEvent', {type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+    await release();
+    assert.deepEqual(await visible(), ['q1','q2','q3','q4']);
+    await startDrag();
+    await release();
+    await wait("previewCalls.filter(([type])=>type==='reorder-snippets').length===commandSaveCount+1 && !document.querySelector('.command-library-grid[aria-busy]')");
+    const reordered = desktop ? ['q2','q3','q1','q4'] : ['q2','q1','q3','q4'];
+    assert.deepEqual(await visible(), reordered);
+    await js("openSettings('preferences');openSettings('snippets')");
+    await wait("document.querySelectorAll('.command-library-card').length===4");
+    assert.deepEqual(await visible(), reordered);
+    await js("const search=document.querySelector('[aria-label=\"搜索命令库\"]');search.value='命令 2';search.dispatchEvent(new Event('input'))");
+    assert.deepEqual(await visible(), ['q2']);
+    assert(await js("document.querySelector('.command-library-card .order-handle').disabled"));
+    await overflow();
+    await js("previewSnippets.splice(0,previewSnippets.length,...originalCommands);selectTab(undefined,'hosts')");
+    console.log(`${width}px: PASS command card columns, insertion preview, cancelled drop, persisted order, and search guard`);
   };
   const deletionChecks = async width => {
     await js(`(async()=>{window.deleteOriginalHosts=structuredClone(previewHosts);window.deleteOriginalGroups=structuredClone(previewGroups);
@@ -614,12 +690,12 @@ async function main() {
       await run('Input.dispatchMouseEvent',{type:'mouseMoved',x:start.x+8,y:start.y+8,buttons:1});
       const end = await js(`(() => {const target=document.querySelector('[data-order-id=oh1]');target.scrollIntoView({block:'nearest'});const r=target.getBoundingClientRect();return{x:r.x+(${JSON.stringify(layout)}==='cards'?3:r.width/2),y:r.y+Math.min(12,r.height/3)}})()`);
       await run('Input.dispatchMouseEvent',{type:'mouseMoved',...end,buttons:1});
-      if (!await js('!hostOrderMarker.hidden')) {
+      if (!await js('!orderMarker.hidden')) {
         await shot(`host-sort-drag-failure-${width}-${layout}.png`);
-        throw new Error(JSON.stringify({width,layout,start,end,state:await js(`({drag:hostDrag?{started:hostDrag.started,ids:hostDrag.ids,x:hostDrag.x,y:hostDrag.y}:null,hit:document.elementFromPoint(${end.x},${end.y})?.outerHTML.slice(0,400),library:$('host-library').getBoundingClientRect().toJSON()})`)}));
+        throw new Error(JSON.stringify({width,layout,start,end,state:await js(`({drag:orderDrag?{started:orderDrag.started,ids:orderDrag.nextIds,x:orderDrag.x,y:orderDrag.y}:null,hit:document.elementFromPoint(${end.x},${end.y})?.outerHTML.slice(0,400),library:$('host-library').getBoundingClientRect().toJSON()})`)}));
       }
       await run('Input.dispatchMouseEvent',{type:'mouseReleased',...end,button:'left',clickCount:1});
-      await wait('!hostSortBusy && !hostDrag');
+      await wait('!hostSortBusy && !orderDrag');
       assert.deepEqual(await visible(),['oh10','oh1','oh2']);
       assert.equal(await js("previewCalls.filter(([t])=>t==='connect').length"),connectionsBefore,'Reordering must not connect');
       await orderJS("await moveHostOrder('host',hosts.find(h=>h.id==='oh10'),2)");
@@ -1334,6 +1410,7 @@ async function main() {
     assert.match(report, /^✓/, report);
     console.log(`${width}×${height}: ${report.split('（')[0]}`);
     await js("document.getElementById('smoke-results').hidden=true");
+    await updateNoticeChecks(width);
     await hostFormChecks(width);
     await keyCreationChecks(width);
     await keyAutoAgentChecks(width);await keyAutoAgentChecks(width,true);
@@ -1343,6 +1420,7 @@ async function main() {
     await sharedUiChecks(width);
     await hostOrderChecks(width);
     await hostCardChecks(width);
+    await commandOrderChecks(width);
     await hostTreeChecks(width);
     await csvChecks(width);
     await deletionChecks(width);

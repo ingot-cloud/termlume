@@ -193,12 +193,13 @@ code, kbd { font-family: SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .host-menu [role="menuitemradio"]::after { content: ''; display: inline-block; width: 18px; float: right; }
 .host-menu [role="menuitemradio"][aria-checked="true"]::after { content: '✓'; }
 .sort-menu-help { font-size: 11px; line-height: 1.5; max-width: 270px; padding: 5px 8px; margin: 0; }
-.host-order-handle { flex: none; width: 24px; padding: 2px; min-height: 28px; color: var(--muted); cursor: grab; touch-action: none; }
-.host-order-handle:active { cursor: grabbing; }
-.host-order-source { opacity: .45; outline: 1px dashed var(--accent); }
-.host-order-drag-active, .host-order-drag-active * { cursor: grabbing !important; user-select: none !important; }
-.host-order-marker { position: fixed; z-index: 30; pointer-events: none; border-radius: 2px; background: var(--accent); }
-.host-order-ghost { position: fixed; z-index: 30; pointer-events: none; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 5px 10px; border: 1px solid var(--accent); border-radius: var(--radius-card); background: var(--raise); box-shadow: var(--popup-shadow); }
+.order-handle { flex: none; width: 24px; padding: 2px; min-height: 28px; color: var(--muted); touch-action: none; }
+.order-handle:not(:disabled) { cursor: grab; }
+.order-handle:not(:disabled):active { cursor: grabbing; }
+.order-source { opacity: .45; outline: 1px dashed var(--accent); }
+.order-drag-active, .order-drag-active * { cursor: grabbing !important; user-select: none !important; }
+.order-marker { position: fixed; z-index: 30; pointer-events: none; border-radius: 2px; background: var(--accent); }
+.order-ghost { position: fixed; z-index: 30; pointer-events: none; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 5px 10px; border: 1px solid var(--accent); border-radius: var(--radius-card); background: var(--raise); box-shadow: var(--popup-shadow); }
 .host-menu button:focus-visible { background: var(--selected); outline-offset: -2px; }
 .empty-state { display: grid; grid-template-columns: minmax(0, 1fr); justify-items: center; gap: 8px; padding: clamp(20px, 7vh, 56px) 12px; text-align: center; }
 .empty-state p { max-width: 48ch; color: var(--muted); margin: 0; }
@@ -862,15 +863,14 @@ textarea { min-width:0;width:100%;resize:vertical;color:var(--text);background:v
 .tab-status { flex: none; }
 .palette-group { margin: 10px 6px 4px; color: var(--muted); font-size: 11px; font-weight: 500; }
 .palette-target { margin: 0; font-size: 12px; }
-.command-library-toolbar { position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; padding-block: 8px; background: var(--bg); }
-.command-library-toolbar input { flex: 1; min-width: 0; }
-.command-library-toolbar > button { flex: none; }
-.command-library-help { margin: 0; }
-.command-library-list { display: grid; gap: 8px; }
-.command-library-row { min-width: 0; padding: 12px; display: grid; gap: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bar); }
-.command-library-heading { display: flex; align-items: center; gap: 8px; overflow-wrap: anywhere; }
+.command-library-help { font-size: 12px; }
+.command-library-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--resource-card-min)), 1fr)); gap: 10px; }
+.command-library-empty { grid-column: 1 / -1; }
+.command-library-card { min-width: 0; padding: 10px 12px 12px; display: grid; grid-template-rows: auto 1fr auto; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--bar); }
+.command-library-heading { display: flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
+.command-library-heading strong { min-width: 0; }
 .command-badge { flex: none; padding: 1px 6px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; font-size: 10px; }
-.command-library-code { display: block; max-height: 72px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }
+.command-library-code { display: block; min-width: 0; max-height: 72px; align-self: start; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }
 .command-library-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .command-library-actions button { min-height: 28px; padding: 3px 8px; font-size: 12px; }
 .command-pin[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); }

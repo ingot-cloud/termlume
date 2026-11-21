@@ -237,7 +237,8 @@
     const multiCommand = previewSnippets.find(s => s.id === 'multi');
     $('settings-page').querySelector(`[aria-label="设为快捷 ${multiCommand.name}"]`).click(); await tick();
     assert(previewSnippets.find(s => s.id === 'multi').pinned, '命令库列表可直接设置顶部快捷');
-    $('settings-page').querySelector(`[aria-label="上移 ${multiCommand.name}"]`).click(); await tick();
+    $('settings-page').querySelector(`[aria-label="调整命令顺序 ${multiCommand.name}"]`).click();
+    findButton(hostMenu.panel, '上移').click(); await tick();
     assert(commandLibrary.sorted(previewSnippets)[0].id === 'multi', '命令库上移操作保存用户排列');
     selectTab(production);
     const quickLibrary = openPalette('commands'); await tick();

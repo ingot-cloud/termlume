@@ -186,7 +186,13 @@ window.termlume = {
       return structuredClone(previewSnippets);
     },
     remove:async ({snippet})=>{const index=previewSnippets.findIndex(s=>s.id===snippet.id);const original=previewCommandDefaults.find(s=>s.id===snippet.id);if(original)previewSnippets[index]=structuredClone(original);else previewSnippets.splice(index,1);},
-    reorder:async ({ids})=>{ids.forEach((id,index)=>{previewSnippets.find(s=>s.id===id).order=(index+1)*10;});previewSnippets.sort((a,b)=>a.order-b.order);}},
+    reorder:async ({ids,expected})=>{
+      previewCalls.push(['reorder-snippets',{ids,expected}]);
+      if(JSON.stringify(commandLibrary.sorted(previewSnippets))!==JSON.stringify(expected)) throw new Error('命令库已变化，请刷新后重试。');
+      const ordered=ids.map((id,index)=>({...previewSnippets.find(s=>s.id===id),order:(index+1)*10}));
+      previewSnippets.splice(0,previewSnippets.length,...ordered);
+      return structuredClone(previewSnippets);
+    }},
   ssh:{jumpHosts:true,connect:async value=>{previewCalls.push(['connect',value]);queueMicrotask(()=>previewListener({type:'session',id:value.id,status:'ready'}));},input:async value=>previewCalls.push(['input',value]),resize:value=>previewResizes.push(value),ack(){},close:async()=>{},directory:async()=>'/srv/app'},
   commands:{preview:async()=> 'df -h',close:async()=>{},stop:async()=>{}},
   files:{

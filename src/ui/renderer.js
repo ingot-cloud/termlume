@@ -43,8 +43,8 @@ let selectedGroup = '';
 let selectedHostId = '';
 let hostMenu;
 let hostSortBusy = false;
-let hostDrag, hostDragFrame;
-let suppressHostOrderClickUntil = 0;
+let orderDrag, orderDragFrame;
+let suppressOrderClickUntil = 0;
 let active;
 let closingAllTabs = false;
 let splitLayout;
@@ -89,6 +89,7 @@ let settingsRun;
 let settingsSection = 'preferences';
 let appUpdateState;
 let appUpdateError = '';
+const announcedUpdateVersions = new Set();
 const sessionLabels = { idle: '等待连接', connecting: '连接中', trust: '等待核对指纹', ready: '已连接', closed: '已断开', running: '运行中', done: '已完成', stopped: '已停止', failed: '失败' };
 
 function node(tag, className, ...children) {
@@ -385,6 +386,7 @@ function closePrompt(value = '') {
 
 function prompt(title, fields, submit, onSubmit, extra = [], options = {}) {
   cancelTabDrag();
+  cancelOrderDrag();
   closeHostMenu();
   if (vaultStatus.locked) return Promise.reject(new Error('请先解锁 Termlume。'));
   if (options.settingsPage) return promptSettings(options.settingsPage, title, fields, submit, onSubmit, extra, options);
@@ -561,6 +563,7 @@ function applyVaultState(state) {
       tab.serverHistoryPaused = true;
     }
     cancelTabDrag();
+    cancelOrderDrag();
     for(const tab of tabs.values()){clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);tab.reconnectCancelled=true;}
     forwardRuns.clear(); forwardVersions.clear();recordingSessions.clear();
     historyReady = false;
@@ -587,6 +590,7 @@ function applyVaultState(state) {
   }
   if (settingsRun?.section === 'security') renderSecurityPage();
   if (refreshTouchId) void refreshTouchIdAvailability();
+  if (!state.locked) showAppUpdateNotice();
 }
 
 async function enableVault() {
@@ -918,7 +922,24 @@ async function showAppUpdates(page) {
 }
 
 function acceptAppUpdateState(next) {
-  if (!appUpdateState || (next.revision ?? 0) >= (appUpdateState.revision ?? 0)) appUpdateState = next;
+  if (appUpdateState && (next.revision ?? 0) < (appUpdateState.revision ?? 0)) return;
+  appUpdateState = next;
+  if (next.phase === 'available' && next.canDownload && next.version) {
+    status(`发现 Termlume v${next.version}，可在设置中下载更新。`);
+    showAppUpdateNotice();
+  }
+}
+
+function showAppUpdateNotice() {
+  const update = appUpdateState;
+  if (update?.phase !== 'available' || !update.canDownload || !update.version || announcedUpdateVersions.has(update.version)) return;
+  if (vaultStatus.locked !== false || document.hidden || document.querySelector('dialog[open]')) return;
+
+  announcedUpdateVersions.add(update.version);
+  if (settingsRun?.section === 'updates') return;
+  void confirm('发现新版本', `Termlume v${update.version} 已发布。前往「关于与更新」查看版本说明并下载。`, '去更新')
+    .then(accepted => { if (accepted) openSettings('updates'); })
+    .catch(error => status(message(error)));
 }
 
 function renderAppUpdates() {
@@ -2355,55 +2376,105 @@ async function manageSnippets(session, page) {
   const attempt = session?.attempts;
   let query = '';
   while (page.active && !vaultStatus.locked) {
-    const snippets = commandLibrary.sorted(await api.snippets.list());
+    let snippets = commandLibrary.sorted(await api.snippets.list());
     if (!page.active) return;
     let choice;
     const pick = value => { choice = value; close(); };
     const search = input(query, 'search');
     search.placeholder = '搜索名称、标签和命令';
     search.setAttribute('aria-label', '搜索命令库');
-    const list = node('div', 'command-library-list');
+    const create = button('新建命令', () => pick({ create: true }), 'primary');
+    const list = node('div', 'command-library-grid');
+    const help = node('p', 'muted command-library-help');
+    let savingOrder = false;
+    const saveOrder = async (ids, movedId) => {
+      if (savingOrder || !page.active || vaultStatus.locked || search.value.trim()) return;
+      if (ids.every((id, index) => id === snippets[index].id)) return;
+      savingOrder = create.disabled = list.inert = true;
+      list.setAttribute('aria-busy', 'true');
+      try {
+        snippets = commandLibrary.sorted(await api.snippets.reorder({ ids, expected: snippets }));
+        if (page.active) status('已保存命令顺序。');
+      } catch (error) {
+        await api.snippets.list().then(current => { snippets = commandLibrary.sorted(current); }).catch(() => {});
+        if (page.active) status(message(error));
+      } finally {
+        savingOrder = create.disabled = list.inert = false;
+        list.removeAttribute('aria-busy');
+        if (page.active) {
+          const restoreFocus = document.activeElement === document.body || list.contains(document.activeElement);
+          render();
+          if (restoreFocus) [...list.children].find(card => card.dataset.orderId === movedId)
+            ?.querySelector('.order-handle')?.focus({ preventScroll: true });
+        }
+      }
+    };
     const render = () => {
+      if (orderDrag && list.contains(orderDrag.source)) cancelOrderDrag();
+      if (hostMenu && list.contains(hostMenu.anchor)) closeHostMenu();
       query = search.value;
-      const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
-      const visible = snippets.filter(s => words.every(word => `${s.name} ${s.command} ${s.tags.join(' ')}`.toLowerCase().includes(word)));
+      const filtered = Boolean(query.trim());
+      help.textContent = filtered ? '清除搜索后可拖动排序。' : '拖动卡片手柄可调整顺序。';
+      const visible = snippets.filter(s => matchesQuery(query, s.name, s.command, s.tags));
+      const ids = snippets.map(s => s.id);
       list.replaceChildren(...visible.map(s => {
-        const index = snippets.indexOf(s);
-        const up = button('↑', () => pick({ move: s, delta: -1 }), 'outlined', `上移 ${s.name}`);
-        const down = button('↓', () => pick({ move: s, delta: 1 }), 'outlined', `下移 ${s.name}`);
-        up.disabled = index === 0 || Boolean(words.length);
-        down.disabled = index === snippets.length - 1 || Boolean(words.length);
         const pin = button(s.pinned ? '★ 快捷' : '☆ 设为快捷', () => pick({ pin: s }), 'outlined command-pin', `${s.pinned ? '取消快捷' : '设为快捷'} ${s.name}`);
         pin.setAttribute('aria-pressed', String(Boolean(s.pinned)));
         const heading = node('div', 'command-library-heading', node('strong', '', s.name),
           ...(s.builtin ? [node('span', 'command-badge', '内置')] : []));
-        const actions = node('div', 'command-library-actions', pin, up, down,
+        const actions = node('div', 'command-library-actions', pin,
           button('编辑', () => pick({ snippet: s }), 'outlined', `编辑 ${s.name}`),
           button(s.builtin ? '恢复默认' : '删除', () => pick({ remove: s }), 'outlined', `${s.builtin ? '恢复默认' : '删除'} ${s.name}`));
         if (readySession(session, attempt)) {
           if (!/[\r\n]/.test(s.command)) actions.append(button('填入终端', () => pick({ use: s }), 'outlined', `填入终端 ${s.name}`));
           actions.append(button('独立执行', () => pick({ run: s }), 'outlined', `独立执行 ${s.name}`));
         }
-        const row = node('section', 'command-library-row', heading, node('code', 'command-library-code', s.command), actions);
-        row.dataset.commandId = s.id;
-        return row;
+        const card = node('section', 'command-library-card', heading, node('code', 'command-library-code', s.command), actions);
+        card.dataset.orderId = s.id;
+        if (api.snippets.reorder) {
+          const index = ids.indexOf(s.id);
+          const move = delta => {
+            const target = index + delta;
+            if (target < 0 || target >= ids.length) return;
+            const ordered = ids.slice();
+            [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+            return saveOrder(ordered, s.id);
+          };
+          const handle = button('⠿', () => {
+            const up = button('上移', () => move(-1)); up.disabled = index === 0;
+            const down = button('下移', () => move(1)); down.disabled = index === ids.length - 1;
+            showActionMenu(`调整${s.name}的顺序`, handle, [up, down]);
+          }, 'order-handle', `调整命令顺序 ${s.name}`);
+          handle.title = filtered ? help.textContent : '拖动调整顺序；Alt + ↑ / ↓ 移动';
+          handle.disabled = filtered || savingOrder || ids.length < 2;
+          handle.setAttribute('aria-haspopup', 'menu');
+          handle.setAttribute('aria-expanded', 'false');
+          handle.addEventListener('keydown', event => {
+            if (!event.altKey || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            void move(event.key === 'ArrowUp' ? -1 : 1);
+          });
+          wireOrderDrag(handle, () => ({
+            source: card, ids, name: s.name, scrollArea: list.closest('.settings-fields'),
+            horizontal: getComputedStyle(list).gridTemplateColumns.split(' ').length > 1,
+            isTarget: hit => hit.parentElement === list,
+            save: ordered => saveOrder(ordered, s.id)
+          }));
+          heading.prepend(handle);
+        }
+        return card;
       }));
-      if (!visible.length) list.append(node('p', 'muted', '没有匹配的命令。'));
+      if (!visible.length) list.append(node('p', 'muted command-library-empty', '没有匹配的命令。'));
     };
     search.addEventListener('input', render); render();
-    const toolbar = node('div', 'command-library-toolbar', search, button('新建命令', () => pick({ create: true }), 'primary'));
-    await ask('命令库', [toolbar, node('p', 'muted command-library-help', '设为快捷的命令显示在顶部按钮区。使用 ↑ ↓ 调整顺序；清除搜索后可排序。'), list], '关闭', () => true);
+    const toolbar = node('div', 'settings-list-toolbar', search, create);
+    await ask('命令库', [toolbar, help, list], '关闭', () => true);
     if (!choice) break;
     if (choice.use) { await useLibraryCommand(session, choice.use, undefined, attempt); return; }
     if (choice.run) { await useLibraryCommand(session, choice.run, false, attempt); return; }
     if (choice.pin) {
       await api.snippets.save({ snippet: { ...choice.pin, pinned: !choice.pin.pinned }, expected: choice.pin });
-      continue;
-    }
-    if (choice.move) {
-      const ids = snippets.map(s => s.id), index = ids.indexOf(choice.move.id), target = index + choice.delta;
-      [ids[index], ids[target]] = [ids[target], ids[index]];
-      await api.snippets.reorder({ ids, expected: snippets });
       continue;
     }
     if (choice.remove) {
@@ -3474,7 +3545,7 @@ function decorateHostOrder(row, kind, item) {
   const handle = button('⠿', () => {
     const actions = hostOrderActions(kind, item);
     if (actions.length) showActionMenu(`调整${item.name}的顺序`, handle, actions);
-  }, 'host-order-handle', `调整${kind === 'group' ? '分组' : '主机'}顺序 ${item.name}`);
+  }, 'host-order-handle order-handle', `调整${kind === 'group' ? '分组' : '主机'}顺序 ${item.name}`);
   handle.title = hostOrderFiltered() ? '清除搜索和标签筛选后可调整顺序' : '拖动调整同级顺序；Alt + ↑ / ↓ 移动';
   handle.disabled = hostSortBusy || hostOrderFiltered();
   handle.setAttribute('aria-haspopup', 'menu'); handle.setAttribute('aria-expanded','false');
@@ -3484,98 +3555,126 @@ function decorateHostOrder(row, kind, item) {
     const scope = hostOrderScope(kind, item);
     void moveHostOrder(kind, item, scope.ids.indexOf(item.id) + (event.key === 'ArrowUp' ? -1 : 1));
   });
-  handle.addEventListener('pointerdown', event => {
-    if (event.button !== 0 || handle.disabled || dialog.open || vaultStatus.locked) return;
-    cancelHostDrag(); closeHostMenu();
+  wireOrderDrag(handle, () => {
     const scope = hostOrderScope(kind, item);
-    if (!scope || scope.ids.length < 2) return;
-    hostDrag = { kind, item, scope, source:row, handle, pointerId:event.pointerId, x:event.clientX, y:event.clientY,
-      startX:event.clientX, startY:event.clientY, expected:hostOrderState(kind), expectedMode:hostSortMode(kind) };
-    handle.setPointerCapture(event.pointerId);
+    if (!scope) return;
+    const expected = hostOrderState(kind), expectedMode = hostSortMode(kind);
+    return {
+      source: row, ids: scope.ids, name: item.name, scrollArea: $('host-library'),
+      horizontal: workspace.dataset.hostLayout === 'cards',
+      isTarget: hit => hit.dataset.orderKind === kind && hit.dataset.orderParent === row.dataset.orderParent,
+      save: ids => saveHostOrder(kind, 'manual', [{ ...scope, ids }], expected, expectedMode)
+    };
   });
-  handle.addEventListener('lostpointercapture', () => { if (hostDrag?.handle === handle) cancelHostDrag(); });
   row.prepend(handle);
 }
 
-const hostOrderMarker = node('div','host-order-marker');
-const hostOrderGhost = node('div','host-order-ghost');
-hostOrderMarker.hidden = hostOrderGhost.hidden = true;
-document.body.append(hostOrderMarker, hostOrderGhost);
+const orderMarker = node('div', 'order-marker');
+const orderGhost = node('div', 'order-ghost');
+orderMarker.hidden = orderGhost.hidden = true;
+document.body.append(orderMarker, orderGhost);
 
-function cancelHostDrag() {
-  if (!hostDrag) return;
-  const drag = hostDrag; hostDrag = undefined;
-  if (drag.started) suppressHostOrderClickUntil = performance.now() + 250;
-  cancelAnimationFrame(hostDragFrame); hostDragFrame = undefined;
-  drag.source.classList.remove('host-order-source');
-  if (drag.handle.hasPointerCapture(drag.pointerId)) drag.handle.releasePointerCapture(drag.pointerId);
-  document.body.classList.remove('host-order-drag-active');
-  hostOrderMarker.hidden = hostOrderGhost.hidden = true;
+function orderDragBlocked() {
+  return vaultStatus.locked || document.body.classList.contains('overlay-open');
 }
 
-function updateHostDrag() {
-  const drag = hostDrag;
+function wireOrderDrag(handle, prepare) {
+  handle.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || handle.disabled || orderDragBlocked()) return;
+    cancelOrderDrag();
+    closeHostMenu();
+    const options = prepare();
+    if (!options || options.ids.length < 2) return;
+    const { clientX: x, clientY: y, pointerId } = event;
+    orderDrag = { ...options, handle, pointerId, x, y, startX: x, startY: y };
+    handle.setPointerCapture(pointerId);
+  });
+  handle.addEventListener('lostpointercapture', () => { if (orderDrag?.handle === handle) cancelOrderDrag(); });
+}
+
+function cancelOrderDrag() {
+  if (!orderDrag) return;
+  const drag = orderDrag;
+  orderDrag = undefined;
+  if (drag.started) suppressOrderClickUntil = performance.now() + 250;
+  cancelAnimationFrame(orderDragFrame);
+  drag.source.classList.remove('order-source');
+  if (drag.handle.hasPointerCapture(drag.pointerId)) drag.handle.releasePointerCapture(drag.pointerId);
+  document.body.classList.remove('order-drag-active');
+  orderMarker.hidden = orderGhost.hidden = true;
+}
+
+function updateOrderDrag() {
+  const drag = orderDrag;
   if (!drag?.started) return;
-  if (vaultStatus.locked || dialog.open || !$('hosts').getClientRects().length) { cancelHostDrag(); return; }
-  const hit = document.elementFromPoint(drag.x, drag.y)?.closest('.host-row');
-  drag.ids = undefined;
-  hostOrderMarker.hidden = true;
-  hostOrderGhost.textContent = drag.item.name;
-  hostOrderGhost.hidden = false;
-  hostOrderGhost.style.left = `${Math.min(drag.x + 12, innerWidth - hostOrderGhost.offsetWidth - 8)}px`;
-  hostOrderGhost.style.top = `${Math.min(drag.y + 12, innerHeight - 36)}px`;
-  if (!hit || hit.dataset.orderKind !== drag.kind || hit.dataset.orderParent !== drag.source.dataset.orderParent || hit === drag.source) return;
-  const rect = hit.getBoundingClientRect(), cards = workspace.dataset.hostLayout === 'cards';
-  const before = cards ? drag.x < rect.left + rect.width / 2 : drag.y < rect.top + rect.height / 2;
-  const ids = drag.scope.ids.filter(id => id !== drag.item.id);
+  if (orderDragBlocked() || !drag.source.getClientRects().length) { cancelOrderDrag(); return; }
+  const hit = document.elementFromPoint(drag.x, drag.y)?.closest('[data-order-id]');
+  drag.nextIds = undefined;
+  orderMarker.hidden = true;
+  orderGhost.textContent = drag.name;
+  orderGhost.hidden = false;
+  orderGhost.style.left = `${Math.min(drag.x + 12, innerWidth - orderGhost.offsetWidth - 8)}px`;
+  orderGhost.style.top = `${Math.min(drag.y + 12, innerHeight - 36)}px`;
+  if (!hit || hit === drag.source || !drag.isTarget(hit)) return;
+  const rect = hit.getBoundingClientRect();
+  const before = drag.horizontal ? drag.x < rect.left + rect.width / 2 : drag.y < rect.top + rect.height / 2;
+  const sourceId = drag.source.dataset.orderId;
+  const ids = drag.ids.filter(id => id !== sourceId);
   const index = ids.indexOf(hit.dataset.orderId);
   if (index < 0) return;
-  ids.splice(index + (before ? 0 : 1), 0, drag.item.id); drag.ids = ids;
-  Object.assign(hostOrderMarker.style, cards
+  ids.splice(index + (before ? 0 : 1), 0, sourceId);
+  drag.nextIds = ids;
+  Object.assign(orderMarker.style, drag.horizontal
     ? {left:`${(before ? rect.left : rect.right)-2}px`,top:`${rect.top}px`,width:'3px',height:`${rect.height}px`}
     : {left:`${rect.left}px`,top:`${(before ? rect.top : rect.bottom)-2}px`,width:`${rect.width}px`,height:'3px'});
-  hostOrderMarker.hidden = false;
+  orderMarker.hidden = false;
 }
 
-function scrollHostDrag() {
-  if (!hostDrag?.started) return;
-  const library = $('host-library'), rect = library.getBoundingClientRect();
-  if (hostDrag.x >= rect.left && hostDrag.x <= rect.right) {
-    const delta = hostDrag.y < rect.top + 36 ? -10 : hostDrag.y > rect.bottom - 36 ? 10 : 0;
-    if (delta) { library.scrollTop += delta; updateHostDrag(); }
+function scrollOrderDrag() {
+  const drag = orderDrag;
+  if (!drag?.started) return;
+  const rect = drag.scrollArea.getBoundingClientRect();
+  if (drag.x >= rect.left && drag.x <= rect.right) {
+    const delta = drag.y < rect.top + 36 ? -10 : drag.y > rect.bottom - 36 ? 10 : 0;
+    if (delta) { drag.scrollArea.scrollTop += delta; updateOrderDrag(); }
   }
-  hostDragFrame = requestAnimationFrame(scrollHostDrag);
+  if (orderDrag === drag) orderDragFrame = requestAnimationFrame(scrollOrderDrag);
 }
 window.addEventListener('pointermove', event => {
-  const drag = hostDrag;
+  const drag = orderDrag;
   if (!drag || event.pointerId !== drag.pointerId) return;
   drag.x = event.clientX; drag.y = event.clientY;
   if (!drag.started && Math.hypot(drag.x-drag.startX, drag.y-drag.startY) >= 6) {
-    drag.started = true; drag.source.classList.add('host-order-source');
-    document.body.classList.add('host-order-drag-active');
-    scrollHostDrag();
+    drag.started = true;
+    drag.source.classList.add('order-source');
+    document.body.classList.add('order-drag-active');
+    scrollOrderDrag();
   }
-  updateHostDrag();
+  updateOrderDrag();
 });
-function finishHostDrag(event) {
-  const drag = hostDrag;
+function finishOrderDrag(event) {
+  const drag = orderDrag;
   if (!drag || event.pointerId != null && event.pointerId !== drag.pointerId) return;
-  if (drag.started) { event.preventDefault(); event.stopPropagation(); }
-  cancelHostDrag();
-  if (drag.started && drag.ids && drag.ids.some((id,index) => id !== drag.scope.ids[index])) {
-    void saveHostOrder(drag.kind, 'manual', [{...drag.scope,ids:drag.ids}], drag.expected, drag.expectedMode);
+  if (drag.started) {
+    event.preventDefault(); event.stopPropagation();
+    drag.x = event.clientX; drag.y = event.clientY;
+    updateOrderDrag();
   }
+  if (orderDrag !== drag) return;
+  cancelOrderDrag();
+  if (drag.nextIds?.some((id, index) => id !== drag.ids[index])) void drag.save(drag.nextIds);
 }
-window.addEventListener('pointerup', finishHostDrag, true);
+window.addEventListener('pointerup', finishOrderDrag, true);
 // WKWebView can deliver mouseup without pointerup when the pointer crosses native surfaces.
-window.addEventListener('mouseup', event => { if (hostDrag?.started) finishHostDrag(event); }, true);
+window.addEventListener('mouseup', event => { if (orderDrag?.started) finishOrderDrag(event); }, true);
 document.addEventListener('click', event => {
-  if (performance.now() < suppressHostOrderClickUntil && event.target.closest('.host-order-handle')) { event.preventDefault(); event.stopPropagation(); }
+  if (event.detail && performance.now() < suppressOrderClickUntil && event.target.closest('.order-handle')) {
+    event.preventDefault(); event.stopPropagation();
+  }
 }, true);
-window.addEventListener('pointercancel', cancelHostDrag);
-window.addEventListener('blur', cancelHostDrag);
+for (const event of ['pointercancel', 'blur', 'resize']) window.addEventListener(event, cancelOrderDrag);
 document.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && hostDrag) { event.preventDefault(); event.stopPropagation(); cancelHostDrag(); }
+  if (event.key === 'Escape' && orderDrag) { event.preventDefault(); event.stopPropagation(); cancelOrderDrag(); }
 }, true);
 
 function recentFirst(a, b) {
@@ -3583,7 +3682,7 @@ function recentFirst(a, b) {
 }
 
 function renderHosts() {
-  cancelHostDrag();
+  if (orderDrag && $('host-list').contains(orderDrag.source)) cancelOrderDrag();
   closeHostMenu();
   $('host-sort').hidden = !api.hosts.reorder;
   $('host-sort').disabled = hostSortBusy;
@@ -3834,6 +3933,7 @@ function syncTerminalSize(tab) {
 
 function selectTab(tab, view = tab?.kind === 'new' ? 'new-tab' : tab ? 'session' : 'hosts', options = {}) {
   if (!options.keepDrag) cancelTabDrag();
+  cancelOrderDrag();
   syncPendingSplitLayout();
   closeDropdown();
   closeHostMenu();
@@ -5862,7 +5962,6 @@ api.onEvent((event) => {
   if (event.type === 'update') {
     acceptAppUpdateState(event.state);
     renderAppUpdates();
-    if (event.state.phase === 'available') status(`发现 Termlume v${event.state.version}，可在设置中下载更新。`);
     return;
   }
   if (event.type === 'vault') { applyVaultState(event.state); return; }
@@ -5965,8 +6064,14 @@ document.addEventListener('focusin', (event) => {
 });
 for (const type of ['resize', 'blur']) window.addEventListener(type, () => closeHostMenu());
 $('host-library').addEventListener('scroll', () => closeHostMenu(), { passive: true });
+document.addEventListener('close', () => {
+  if (appUpdateState?.phase === 'available' && !announcedUpdateVersions.has(appUpdateState.version)) {
+    setTimeout(showAppUpdateNotice, 0);
+  }
+}, true);
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && active?.unread && !vaultStatus.locked) { active.unread = false; renderTabs(); }
+  if (!document.hidden) showAppUpdateNotice();
 });
 $('host-search-form').addEventListener('submit', (event) => {
   event.preventDefault();
