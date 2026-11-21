@@ -11,6 +11,11 @@ Termlume is a desktop SSH workspace for macOS and Windows. Manage hosts, work in
 
 [Download](https://github.com/ingot-cloud/termlume/releases/latest) · [All releases](https://github.com/ingot-cloud/termlume/releases) · [Report an issue](https://github.com/ingot-cloud/termlume/issues) · [Documentation](#documentation)
 
+<a href="docs/assets/termlume-intro.mp4?raw=true">
+  <img src="docs/assets/termlume-intro.jpg" alt="Termlume product tour" width="640"><br>
+  ▶ Watch the product tour (57 seconds, in Chinese)
+</a>
+
 - [Features](#features)
 - [Workspace pages](#workspace-pages)
 - [Install and get started](#install-and-get-started)

@@ -11,6 +11,11 @@ Termlume 是面向 macOS 和 Windows 的桌面 SSH 工作台，将主机管理�
 
 [下载应用](https://github.com/ingot-cloud/termlume/releases/latest) · [全部版本](https://github.com/ingot-cloud/termlume/releases) · [反馈问题](https://github.com/ingot-cloud/termlume/issues) · [相关文档](#相关文档)
 
+<a href="docs/assets/termlume-intro.mp4?raw=true">
+  <img src="docs/assets/termlume-intro.jpg" alt="Termlume 产品介绍视频封面" width="640"><br>
+  ▶ 观看 Termlume 产品介绍（57 秒）
+</a>
+
 - [主要功能](#主要功能)
 - [主要页面](#主要页面)
 - [安装与开始使用](#安装与开始使用)
