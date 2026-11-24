@@ -31,7 +31,7 @@ https://github.com/user-attachments/assets/7d1508ec-2bad-4319-ac6d-3c3f4bbb2834
 | Hosts and groups | Organize hosts in nested groups; use cards, lists or a tree; search and filter by tags; sort by name, recent connection or custom order. Reuse login profiles and inherit group defaults. |
 | SSH connections | Authenticate with a password, local private key or SSH Agent. Connect directly or through one jump host, verify server fingerprints, and configure keepalive, timeouts and optional reconnection. |
 | Terminal workspace | Open multiple tabs, drag tabs and panes to create or rearrange splits, save layouts, search output, and customize terminal colors, fonts and font size. Restored layouts create new sessions. |
-| SFTP and remote editing | Browse, upload and download files or directories; rename and delete entries; drag local files into a session to upload. Edit UTF-8 text files up to 4 MiB in the built-in editor or use an external editor with confirmed upload. |
+| SFTP and remote editing | Browse, upload and download files or directories; rename and delete entries; drag local files into a session to upload. Double-click a filename or focus it and press Enter to preview UTF-8 text files up to 4 MiB with syntax highlighting. Select Edit to make changes. Save or Cancel returns to the same preview. The toolbar includes search and replace, go to line, and word wrap. Format supported documents locally, then save to SFTP, or use an external editor with confirmed upload. |
 | Port forwarding | Save and manually start local, remote and dynamic SOCKS5 forwarding rules, including over a jump connection. Local and dynamic listeners bind to `127.0.0.1`. |
 | Commands and logs | Save reusable commands, find them in the command palette, configure optional startup commands, follow remote logs, and optionally record session output locally. |
 | Server information | View system, CPU, memory, network, storage and disk I/O metrics with five-minute charts. The panel refreshes every five seconds while visible; available metrics depend on the remote Linux or macOS system. |
@@ -46,7 +46,7 @@ https://github.com/user-attachments/assets/7d1508ec-2bad-4319-ac6d-3c3f4bbb2834
 | Hosts | Browse groups and hosts, search, import or export, edit connection settings, and open SSH sessions. |
 | Session workspace | Work in terminal tabs or split panes. Open the file panel, remote editor, server information, command tools and forwarding controls for the current session. |
 | SSH Keys | Discover or import local keys, generate Ed25519/RSA/ECDSA keys, inspect public keys and fingerprints, and load keys into your existing SSH Agent. |
-| Transfer History | Monitor uploads and downloads, inspect progress and errors, cancel tasks, and review local transfer records. |
+| Transfer History | Monitor uploads and downloads, inspect progress and errors, cancel tasks, and reveal completed downloads in Finder or File Explorer. |
 | Settings | Manage appearance, groups, login profiles, the command library, saved layouts, session logs, Known Hosts, security and Git sync, and application updates. |
 
 ### Hosts
@@ -105,6 +105,9 @@ Check for updates under **Settings → About & Updates** (`设置 → 关于与�
 | Switch to workspace tab 1–9 | `⌘1–9` | `Ctrl+1–9` |
 | Increase / decrease / reset terminal font size | `⌘+` / `⌘-` / `⌘0` | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
 | Save in the built-in editor | `⌘S` | `Ctrl+S` |
+| Format the document | `⇧⌥F` | `Shift+Alt+F` |
+| Find and replace in the editor | `⌘F` | `Ctrl+F` |
+| Go to line | `Ctrl+G` | `Ctrl+G` |
 
 On Windows, `Ctrl+C` copies selected terminal text and sends an interrupt when nothing is selected. Multiline pastes require confirmation.
 

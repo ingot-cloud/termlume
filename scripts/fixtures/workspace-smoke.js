@@ -568,29 +568,91 @@
     await tick();
     api.files.readText = readText;
     assert(document.activeElement.id === 'file-editor-title' &&
-      [...fileEditor.querySelectorAll('.actions button')].map(b => b.textContent).join('、') === '下载、保存、取消',
+      [...fileEditor.querySelectorAll('.actions button:not([hidden])')].map(b => b.textContent).join('、') === '下载、格式化、查找、跳行、自动换行、编辑、关闭' && findButton(fileEditor, '编辑').disabled,
       '文件无法编辑时，焦点停在标题，操作顺序一致');
-    findButton(fileEditor, '取消').click();
+    findButton(fileEditor, '关闭').click();
     await tick();
     await openLinkedTerminalPath(production, '/srv/app/config.json');
     await tick();
     assert(fileEditor.open && !dialog.open && fileEditor.querySelector('.cm-line span'), `文件直接打开，按 JSON 格式高亮（${fileEditor.querySelector('[role=status]')?.textContent || '无提示'}）`);
-    findButton(fileEditor, '全屏').click();
-    await tick();
+    assert(fileEditor.querySelector('.file-editor-heading .actions') && !findButton(fileEditor, '全屏'), '打开即进入全屏编辑，文件操作位于右上角');
     assert(fileEditor.clientWidth === innerWidth && fileEditor.clientHeight === innerHeight - 50 &&
       fileEditor.getBoundingClientRect().top === 50, '编辑器填满内容区并保留窗口标题栏');
     findButton(fileEditor, '下载').click();
     await tick();
     assert(fileEditor.open && previewCalls.at(-1)[0] === 'prepare' && previewCalls.at(-1)[1].names[0] === 'config.json', '下载绑定当前远端文件，保留编辑器');
+    const readOnly = () => fileEditor.querySelector('.cm-content').contentEditable === 'false';
+    const undoEdit = findButton(fileEditor, '撤销');
+    const redoEdit = findButton(fileEditor, '恢复');
+    assert(undoEdit.hidden && redoEdit.hidden, '预览隐藏撤销和恢复');
+    assert(readOnly() && findButton(fileEditor, '格式化').disabled, '默认只读预览，格式化不可用');
     fileEditor.querySelector('.cm-content').focus();
+    document.execCommand('insertText', false, 'blocked');
+    await tick();
+    assert(!fileEditor.querySelector('.cm-content').textContent.includes('blocked'), '预览不会修改文件');
+    findButton(fileEditor, '编辑').click();
+    const draftContent = fileEditor.querySelector('.cm-content');
+    const initialText = draftContent.textContent;
+    assert(!undoEdit.hidden && !redoEdit.hidden && undoEdit.disabled && redoEdit.disabled, '进入编辑时还没有可撤销或恢复的操作');
+    draftContent.focus();
+    document.execCommand('insertText', false, 'test');
+    await tick();
+    assert(!undoEdit.disabled && redoEdit.disabled, '输入后可以撤销');
+    undoEdit.click(); await tick();
+    assert(draftContent.textContent === initialText && undoEdit.disabled && !redoEdit.disabled &&
+      document.activeElement === draftContent, '点击撤销还原文本并把焦点送回编辑器');
     document.execCommand('insertText', false, ' ');
     await tick();
+    assert(redoEdit.disabled && !undoEdit.disabled, '撤销后输入新内容会清除恢复历史');
     findButton(fileEditor, '保存').click();
     await tick();
     assert(previewCalls.at(-1)[0] === 'save-text' && previewCalls.at(-1)[1].text.startsWith(' {\r\n') &&
-      previewCalls.at(-1)[1].revision === 'original' && findButton(fileEditor, '保存').disabled, '编辑器保存绑定初始版本并保留 CRLF');
+      previewCalls.at(-1)[1].revision === 'original' && readOnly() && findButton(fileEditor, '保存').hidden, '编辑器保存绑定初始版本并保留 CRLF');
+    const statusCenters = [...fileEditor.querySelectorAll('.file-editor-mode, .file-editor-mode svg, .file-editor-status [role=status]')]
+      .map(element => { const rect = element.getBoundingClientRect(); return rect.top + rect.height / 2; });
+    assert(Math.max(...statusCenters) - Math.min(...statusCenters) <= 1, '预览图标、模式文字和保存提示垂直居中对齐');
+    findButton(fileEditor, '编辑').click();
+    assert(undoEdit.disabled && redoEdit.disabled, '保存并重新编辑从空历史开始');
+    const saveCount = previewCalls.filter(([type]) => type === 'save-text').length;
+    fileEditor.querySelector('.cm-content').dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'F', code: 'KeyF', altKey: true, shiftKey: true, bubbles: true, cancelable: true
+    }));
+    for (let frame = 0; frame < 150 && findButton(fileEditor, '格式化').disabled; frame++) await tick();
+    assert(fileEditor.querySelector('[role=status]').textContent === '已格式化，可撤销' &&
+      !findButton(fileEditor, '保存').disabled && previewCalls.filter(([type]) => type === 'save-text').length === saveCount,
+      '格式化修改当前草稿，等待用户保存');
     findButton(fileEditor, '取消').click();
     await tick();
+    assert(dialog.open && fileEditor.open && findButton(dialog, '放弃修改'), '取消有修改的编辑时等待明确选择');
+    findButton(dialog, '继续编辑').click();
+    await tick();
+    assert(!dialog.open && fileEditor.open && !findButton(fileEditor, '保存').disabled, '继续编辑保留格式化后的草稿');
+    const originalSave = api.files.saveText;
+    const draftBeforeSave = fileEditor.querySelector('.cm-content').textContent;
+    let rejectSave;
+    api.files.saveText = () => new Promise((_, reject) => { rejectSave = reject; });
+    findButton(fileEditor, '保存').click(); await tick();
+    assert(readOnly() && findButton(fileEditor, '取消').disabled && undoEdit.disabled && redoEdit.disabled, '保存请求进行中保护正在提交的快照');
+    rejectSave(new Error('远端文件已变化'));
+    await tick();
+    api.files.saveText = originalSave;
+    assert(!readOnly() && fileEditor.dataset.mode === 'edit' &&
+      fileEditor.querySelector('.cm-content').textContent === draftBeforeSave &&
+      fileEditor.querySelector('[role=status]').textContent.includes('远端文件已变化'), '保存失败后保留完整可写草稿并显示原因');
+    fileEditor.querySelector('.cm-content').dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'z', code: 'KeyZ', metaKey: /Mac/.test(navigator.platform), ctrlKey: !/Mac/.test(navigator.platform), bubbles: true, cancelable: true
+    }));
+    await tick();
+    assert(fileEditor.querySelector('.file-editor-modified').hidden && !fileEditor.querySelector('[role=status]').textContent, '一次撤销恢复格式化之前的已保存版本并清理状态');
+    assert(undoEdit.disabled && !redoEdit.disabled, '快捷键撤销同步更新按钮状态');
+    redoEdit.click(); await tick();
+    assert(fileEditor.querySelector('.cm-content').textContent === draftBeforeSave && !undoEdit.disabled && redoEdit.disabled &&
+      !fileEditor.querySelector('.file-editor-modified').hidden, '点击恢复重新应用格式化并标记为未保存');
+    undoEdit.click(); await tick();
+    findButton(fileEditor, '取消').click();
+    await tick();
+    assert(fileEditor.open && readOnly(), '取消无更改的编辑直接返回预览');
+    findButton(fileEditor, '关闭').click(); await tick();
     toggleFiles(); await tick();
     assert(!$('files').querySelector('form') && !findButton($('files'), '编辑任务'), '文件区收起路径输入和独立编辑任务入口');
     findButton($('files'), '前往').click();
@@ -610,6 +672,71 @@
       previewCalls.at(-1)[1].directory === '/var/log/归档', '上传文件沿用当前远端目录');
     findButton($('files'), 'var').click(); await tick();
     assert(previewCalls.at(-1)[1].id === production.id && previewCalls.at(-1)[1].directory === '/var', '面包屑按原主机的绝对路径跳转');
+    const fileChoice = () => $('files').querySelector('.file-entry-file[aria-label="error.log"]');
+    const normalRead = api.files.readText;
+    api.files.readText = async ({id,path}) => {
+      assert(id === production.id && path === '/var/error.log', '文件面板编辑目标绑定主机与目录');
+      return {path,text:'2026-11-22T12:00:00Z ERROR sample',revision:'log-version'};
+    };
+    fileChoice().dispatchEvent(new MouseEvent('dblclick', {bubbles:true}));
+    await tick();
+    api.files.readText = normalRead;
+    assert(fileEditor.querySelector('.file-editor-footer select')?.value === '日志' && fileEditor.querySelector('.file-editor-format')?.textContent === 'UTF-8' &&
+      [...fileEditor.querySelectorAll('.cm-line span')].some(span => span.textContent === 'ERROR'), '双击日志使用内置编辑器高亮错误级别');
+    assert(findButton(fileEditor, '格式化').disabled, '日志保留原始排版');
+    findButton(fileEditor, '编辑').click();
+    const languageSelect = fileEditor.querySelector('.file-editor-footer select');
+    languageSelect.value = 'Python';
+    languageSelect.dispatchEvent(new Event('change', {bubbles:true}));
+    assert(!findButton(fileEditor, '格式化').disabled && fileEditor.querySelector('.file-editor-modified').hidden, '手动切换语言同步格式化能力并保持文档内容');
+    fileEditor.querySelector('.cm-content').focus();
+    document.execCommand('insertText', false, '中文'); await tick();
+    findButton(fileEditor,'保存').click(); await tick();
+    findButton(fileEditor,'关闭').click(); await tick();
+    const savedBytes = new TextEncoder().encode('中文2026-11-22T12:00:00Z ERROR sample').length;
+    assert(document.activeElement === fileChoice() && fileChoice().closest('.file-row').textContent.includes(`${savedBytes} B`), '保存更新文件大小，关闭后返回文件名');
+    for (const [path, text, format] of [
+      ['/etc/nginx/sites-available/default','server { listen 80; }','Nginx'],
+      ['/opt/run','#!/usr/bin/env bash\necho "hello"','Shell'],
+      ['/srv/app/.env.prod','PORT=443','dotenv'],
+      ['/etc/ssh/sshd_config','Port 22','OpenSSH'],
+      ['Widget.tsx','export const X = () => <main/>','TSX'],
+      ['README.md','# 标题','Markdown'], ['view.vue','<template/>','Vue'], ['main.tf','resource "a" "b" {}','Terraform'],
+      ['Makefile','build:','Makefile'], ['CMakeLists.txt','project(Test)','CMake'], ['Foo.cs','class Foo {}','C#'],
+      ['/srv/app/UNKNOWN','plain words','纯文本']
+    ]) {
+      const parent = document.createElement('div');
+      const view = window.TermlumeFileEditor.open(parent,path,text,()=>{},false);
+      assert(view.format === format, `识别 ${path} 为 ${format}`);
+      view.editor.destroy();
+    }
+    fileChoice().dispatchEvent(new MouseEvent('dblclick', {bubbles:true}));
+    await tick();
+    fileEditor.querySelector('.cm-content').focus();
+    findButton(fileEditor, '编辑').click();
+    document.execCommand('insertText', false, 'scratch');
+    await tick();
+    findButton(fileEditor, '取消').click();
+    await tick();
+    findButton(dialog, '放弃修改').click();
+    await tick();
+    assert(!dialog.open && fileEditor.open && readOnly() && !fileEditor.querySelector('.cm-content').textContent.includes('scratch'), '放弃草稿后预览原文件');
+    findButton(fileEditor, '编辑').click();
+    fileEditor.querySelector('.cm-content').dispatchEvent(new KeyboardEvent('keydown', {key:'z', metaKey:true, ctrlKey:false, bubbles:true, cancelable:true}));
+    assert(!fileEditor.querySelector('.cm-content').textContent.includes('scratch'), '再次编辑无法撤销回已放弃的草稿');
+    const writesBeforeCleanSave = previewCalls.filter(([kind]) => kind === 'save-text').length;
+    findButton(fileEditor, '保存').click(); await tick();
+    assert(readOnly() && previewCalls.filter(([kind]) => kind === 'save-text').length === writesBeforeCleanSave,
+      '保存无改动的文件直接回到预览，无需重复写入远端');
+    findButton(fileEditor, '关闭').click(); await tick();
+    for (const [direction, state, archived] of [['down','done',true],['down','done',false],['down','failed',true],['up','done',false]]) {
+      const id = `test-reveal-${direction}-${state}-${archived}`;
+      updateJob({id,direction,status:state,remote:'/remote/file',local:'/local/file (2)',size:5,bytes:5,finishedAt:1},archived);
+      const control = [...jobRows.get(id).controls.children].find(b=>b.textContent.includes('中显示'));
+      assert(Boolean(control) === (direction === 'down' && state === 'done'), '仅成功下载提供本机定位');
+      if (control) { control.click(); await tick(); assert(previewCalls.at(-1)[1] === id, '使用下载记录定位'); }
+      forgetJob(id);
+    }
     const selected = $('files').querySelector('input[aria-label="选择 error.log"]'); selected.click();
     findButton($('files'), '所选项 ⋯').click();
     assert(!findButton(hostMenu.panel, '跟踪日志').disabled && !findButton(hostMenu.panel, '重命名').disabled &&

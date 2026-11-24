@@ -22,7 +22,7 @@ const sources = {
 };
 let html = read('src/ui/index.html').replace(/\s*<meta http-equiv="Content-Security-Policy"[^>]*>/, '');
 html = html.replace(/<script defer src="([^"]+)"><\/script>/g, (_, source) => source === '/renderer.js'
-  ? script(read('scripts/fixtures/workspace-preview.js').replace('/* COMMAND_DEFAULTS */ []', read('src/command-defaults.json'))) + script(bundleFileEditor()) + script(read(sources[source]))
+  ? script(read('scripts/fixtures/workspace-preview.js').replace('/* COMMAND_DEFAULTS */ []', read('src/command-defaults.json'))) + script(bundleFileEditor.editor()) + script(read(sources[source]))
   : script(read(sources[source])));
 // Scripts run after the complete document so the fixture uses the same DOM as production.
 const scripts = html.match(/<script>[\s\S]*?<\/script>/g).join('\n');
@@ -31,4 +31,5 @@ html = html.replace('<link rel="stylesheet" href="/xterm.css">', `<style>${read(
 fs.mkdirSync(path.join(root, 'dist', 'ux-review'), {recursive:true});
 const output = path.join(root, 'dist', 'ux-review', 'workspace.html');
 fs.writeFileSync(output, html);
+fs.writeFileSync(path.join(path.dirname(output), 'file-formatter.js'), bundleFileEditor.formatter());
 console.log(`Offline UI review: ${output}`);

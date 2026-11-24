@@ -325,17 +325,6 @@ async function main() {
     await js("(async()=>{previewHosts.splice(0,previewHosts.length,...treeOriginalHosts);previewGroups.splice(0,previewGroups.length,...treeOriginalGroups);expandedHostGroups.clear();collapsedSettingsGroups.clear();localStorage.removeItem('host-tree-expanded');$('host-layout').value='cards';$('host-layout').dispatchEvent(new Event('change'));await refreshHosts()})()");
     console.log(`${width}px: PASS host/group trees, nested search/tags, keyboard, child creation, rename, cyclic parent exclusion and deep/narrow layouts`);
   };
-  const drag = async (selector, dx, dy) => {
-    const { x, y } = await js(`(() => {
-      const r = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    })()`);
-    await run('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-    await run('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
-    await run('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x + dx, y: y + dy, buttons: 1 });
-    await run('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x + dx, y: y + dy, button: 'left', clickCount: 1 });
-    await tick();
-  };
   const beginTabDrag = async (id, target, edge) => {
     let start = await js(`(() => {
       const tab = tabs.get(${JSON.stringify(id)});
@@ -1669,27 +1658,30 @@ async function main() {
         await js(`removeTab(active); selectTab(tabs.get(${JSON.stringify(shellId)}))`);
         await js("openTerminalPath(active, '/srv/app/config.json')");
         await wait("Boolean(fileEditor.querySelector('.cm-content'))");
-        const bounds = () => js('fileEditor.getBoundingClientRect().toJSON()');
-        const initial = await bounds();
-        await drag('.file-editor-grip', -100, -80);
-        const smaller = await bounds();
-        assert.equal(smaller.width, initial.width - 100);
-        assert.equal(smaller.height, initial.height - 80);
-        await drag('.file-editor-heading h2', 40, 30);
-        const moved = await bounds();
-        assert.equal(moved.x, smaller.x + 40);
-        assert.equal(moved.y, smaller.y + 30);
-        await js("fileEditor.querySelector('.file-editor-heading button').click()");
-        await tick();
-        const expanded = await bounds();
-        assert.deepEqual([expanded.x, expanded.y, expanded.width, expanded.height], [0, 50, width, height - 50]);
+        const bounds = await js('fileEditor.getBoundingClientRect().toJSON()');
+        assert.deepEqual([bounds.x, bounds.y, bounds.width, bounds.height], [0, 50, width, height - 50]);
         await windowChrome('#file-editor');
-        assert(await js("fileEditor.querySelector('h2').getBoundingClientRect().top >= parseFloat(getComputedStyle(fileEditor).getPropertyValue('--titlebar-height'))"));
+        assert(await js("fileEditor.querySelector('.file-editor-heading .actions').getBoundingClientRect().right > innerWidth - 24"));
         await overflow(); await shot(`file-editor-fullscreen-${width}.png`);
-        await js("fileEditor.querySelector('.file-editor-heading button').click()");
-        await tick();
-        assert.deepEqual(await bounds(), moved);
-        await js("[...fileEditor.querySelectorAll('button')].find(button => button.textContent === '取消').click()");
+        const wrapButton = "fileEditor.querySelector('[aria-label=自动换行]')";
+        const enableWrapHint = await js(`${wrapButton}.title`);
+        assert.match(enableWrapHint, /开启自动换行.*折行显示/);
+        await js(`${wrapButton}.click()`);
+        await wait("Boolean(fileEditor.querySelector('.cm-lineWrapping'))");
+        assert.match(await js(`${wrapButton}.title`), /关闭自动换行.*左右滚动/);
+        await js("[...fileEditor.querySelectorAll('button')].find(b => b.textContent === '查找').click()");
+        await wait("document.activeElement.name === 'search'");
+        await overflow();
+        await js("fileEditor.querySelector('[aria-label=查找]').click()");
+        await wait("!fileEditor.querySelector('.file-search-panel')");
+        await js("fileEditor.querySelector('[aria-label=跳行]').click()");
+        await wait("!fileEditor.querySelector('.file-jump-row').hidden");
+        await js("fileEditor.querySelector('[aria-label=跳行]').click()");
+        await wait("fileEditor.querySelector('.file-jump-row').hidden");
+        await js(`${wrapButton}.click()`);
+        await wait("!fileEditor.querySelector('.cm-lineWrapping')");
+        assert.equal(await js(`${wrapButton}.title`), enableWrapHint);
+        await js("[...fileEditor.querySelectorAll('button')].find(button => button.textContent === '关闭').click()");
         await tick();
       }
     }
@@ -1708,7 +1700,7 @@ async function main() {
   assert.equal(await js('getComputedStyle(dialog).animationName'),'none');
   await js("[...dialog.querySelectorAll('button')].find(b=>b.textContent==='取消').click()");
   assert.equal(await js('dialog.open'),false);
-  console.log('PASS: workspace navigation, four-pane layouts and both separators, compact file panel, and file-editor drag, resize, fullscreen and restore at both window sizes.');
+  console.log('PASS: workspace navigation, four-pane layouts and both separators, compact file panel, and fullscreen file editing, text wrapping and search at both window sizes.');
   }
   const userAgent = await js('navigator.userAgent');
   for (const [platform, modifiers, prefix] of [['Win32', 2, 'Ctrl+'], ['MacIntel', 4, '⌘']]) {
@@ -1819,12 +1811,12 @@ async function main() {
     assert.deepEqual(await js("previewCalls.filter(([type]) => type === 'input').map(([, value]) => value.data)"), ['\x03', '\x04', '\x12']);
     await js("openTerminalPath(active, '/srv/app/config.json')");
     await wait("Boolean(fileEditor.querySelector('.cm-content'))");
-    await js("fileEditor.querySelector('.cm-content').focus(); document.execCommand('insertText', false, ' ')");
+    await js("fileEditor.querySelector('[aria-label=编辑]').click(); fileEditor.querySelector('.cm-content').focus(); document.execCommand('insertText', false, ' ')");
     await key('s', 'KeyS', 83);
     assert.equal(await js("previewCalls.filter(([type]) => type === 'save-text').length"), 1);
     assert((await js("[...fileEditor.querySelectorAll('button')].find(b => b.textContent === '保存').title")).includes(`${prefix}S`));
     await overflow();
-    await js("[...fileEditor.querySelectorAll('button')].find(b => b.textContent === '取消').click()");
+    await js("[...fileEditor.querySelectorAll('button')].find(b => b.textContent === '关闭').click()");
     await js("applyVaultState({...vaultStatus, enabled:true, locked:false, startupUnlockSupported:true, startupUnlockRequired:true}); void openSettings('security')");
     await wait("Boolean(document.getElementById('vault-startup-unlock'))");
     assert(await js("document.getElementById('vault-startup-unlock').checked"));

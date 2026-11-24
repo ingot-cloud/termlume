@@ -197,10 +197,11 @@ window.termlume = {
   commands:{preview:async()=> 'df -h',close:async()=>{},stop:async()=>{}},
   files:{
     directoryDownloads:true,directoryUploads:true,mutations:true,history:async()=>[],
+    revealDownload:async id=>previewCalls.push(['reveal-download',id]),
     list:async value=>{previewCalls.push(['list',value]);return {directory:value.directory||'/var/log/应用',entries:[{name:'nginx',kind:'directory'},{name:'error.log',kind:'file',size:1240},{name:'access.log',kind:'file',size:28000},{name:'.env',kind:'file',size:40}]};},
     inspect:async ({path})=>({path,kind:path.endsWith('.json')?'file':'directory',downloadable:true}),
     readText:async ({path})=>({path,text:'{\r\n  "port": 22\r\n}\r\n',revision:'original'}),
-    saveText:async value=>{previewCalls.push(['save-text',value]);return {revision:'saved'};},
+    saveText:async value=>{previewCalls.push(['save-text',value]);return {revision:'saved',size:new TextEncoder().encode(value.text).length};},
     prepare:async value=>{previewCalls.push(['prepare',value]);return null;}
   },
   layouts:{list:async()=>previewLayouts,save:async request=>{

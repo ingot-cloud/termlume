@@ -1,5 +1,22 @@
 use std::path::PathBuf;
 
+#[cfg(any(target_os = "macos", windows))]
+pub fn reveal_download(path: &std::path::Path) -> Result<(), String> {
+    std::fs::symlink_metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => "本机文件已移动或删除。".to_owned(),
+        _ => format!("无法访问下载位置：{error}"),
+    })?;
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("/usr/bin/open").arg("-R").arg(path)
+            .status().map_err(crate::error)?;
+        if !status.success() { return Err("无法在访达中显示下载文件。".into()); }
+        Ok(())
+    }
+    #[cfg(windows)]
+    windows::select_in_explorer(path)
+}
+
 pub struct GitTools {
     pub git: PathBuf,
     pub ssh: PathBuf,
@@ -206,6 +223,26 @@ pub mod windows {
         let system = std::env::var_os("SystemRoot").ok_or("无法找到记事本。")?;
         std::process::Command::new(Path::new(&system).join("System32/notepad.exe"))
             .arg(file).spawn().map_err(|_| "无法启动文本编辑器，请检查系统编辑器或记事本。".to_owned())?;
+        Ok(())
+    }
+
+    pub fn select_in_explorer(file: &Path) -> Result<(), String> {
+        use windows_sys::Win32::UI::Shell::{SHOpenFolderAndSelectItems, SHParseDisplayName};
+        let path = wide(file.as_os_str())?;
+        unsafe {
+            let initialized = CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32);
+            if initialized < 0 && initialized != windows_sys::Win32::Foundation::RPC_E_CHANGED_MODE {
+                return Err("无法初始化资源管理器。".into());
+            }
+            let mut item = ptr::null_mut();
+            let mut result = SHParseDisplayName(path.as_ptr(), ptr::null_mut(), &mut item, 0, ptr::null_mut());
+            if result >= 0 {
+                result = SHOpenFolderAndSelectItems(item, 0, ptr::null(), 0);
+                CoTaskMemFree(item.cast());
+            }
+            if initialized >= 0 { CoUninitialize(); }
+            if result < 0 { return Err("无法在资源管理器中显示下载文件。".into()); }
+        }
         Ok(())
     }
 }

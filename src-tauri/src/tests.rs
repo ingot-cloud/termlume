@@ -2,6 +2,32 @@ use super::*;
 use tauri::ipc::InvokeResponseBody;
 use tokio::sync::mpsc;
 
+#[test]
+#[cfg(any(target_os = "macos", windows))]
+fn reveal_uses_completed_download_destination_from_saved_history() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    let path = home.path().join("配置文件 (2).json");
+    let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    {
+        let mut store = ws.store.lock().unwrap();
+        let mut data = store.data().unwrap().clone();
+        data.transfer_history = vec![
+            json!({"id":ids[0],"direction":"down","status":"done","local":path}),
+            json!({"id":ids[1],"direction":"up","status":"done","local":path}),
+            json!({"id":ids[2],"direction":"down","status":"failed","local":path}),
+        ];
+        store.update(data).unwrap();
+    }
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    assert_eq!(ws.transfers.download_location(&ws, ids[0]).unwrap(), path);
+    assert_eq!(platform::reveal_download(&path).unwrap_err(), "本机文件已移动或删除。");
+    for id in [ids[1], ids[2], Uuid::new_v4()] {
+        assert!(ws.transfers.download_location(&ws, id).is_err());
+    }
+}
+
 #[tokio::test]
 async fn master_password_changes_preserve_data_recovery_and_automatic_unlock() {
     let home = tempfile::tempdir().unwrap();

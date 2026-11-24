@@ -448,6 +448,17 @@ impl Transfers {
         self.edit_history(ws, |_| ())
     }
 
+    #[cfg(any(target_os = "macos", windows))]
+    pub fn download_location(&self, ws: &Workspace, id: Uuid) -> Result<PathBuf, String> {
+        let id = json!(id);
+        self.history(ws)?.iter()
+            .find(|record| record["id"] == id && record["direction"] == "down" && record["status"] == "done")
+            .and_then(|record| record["local"].as_str())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| "找不到这条已完成的下载记录。".into())
+    }
+
     pub fn remove_history(&self, ws: &Workspace, id: Option<Uuid>) -> Result<Vec<Value>, String> {
         let id = id.map(|id| json!(id));
         let mut removed = Vec::new();
@@ -1586,7 +1597,7 @@ pub async fn save_text(
             return Err("SSH 会话已断开。".into());
         }
         publish_remote(session, &sftp, &temporary, &path, true).await?;
-        Ok(json!({"revision": text_revision(text.as_bytes(), &staged)}))
+        Ok(json!({"revision": text_revision(text.as_bytes(), &staged), "size": text.len()}))
     }
     .await;
     if let Err(failure) = result {

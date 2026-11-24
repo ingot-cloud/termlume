@@ -28,7 +28,8 @@ mkdirSync(output, { recursive: true });
 for (const [file, source] of Object.entries(assets)) {
   copyFileSync(join(root, source), join(output, file));
 }
-writeFileSync(join(output, 'file-editor.js'), bundleFileEditor());
+writeFileSync(join(output, 'file-editor.js'), bundleFileEditor.editor());
+writeFileSync(join(output, 'file-formatter.js'), bundleFileEditor.formatter());
 const html = readFileSync(join(root, 'src/ui/index.html'), 'utf8')
   .replace(/^[ \t]*<meta http-equiv="Content-Security-Policy".*\n/m, '')
   .replace('<script defer src="/renderer.js">', '<script defer src="/bridge.js"></script>\n  <script defer src="/file-editor.js"></script>\n  <script defer src="/renderer.js">');

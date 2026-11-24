@@ -239,6 +239,15 @@ function chromeIcon(kind) {
     'new-tab': 'M4 4h16v16H4zM12 8v8m-4-4h8',
     terminal: 'M3 5h18v14H3zM7 9l3 3-3 3m6 0h4',
     settings: 'M4 7h16M4 17h16M8 4v6m8 4v6',
+    edit: 'M4 16l-1 5 5-1L21 7l-4-4zM14.5 5.5l4 4',
+    undo: 'M9 4 3 10l6 6M3 10h11a6 6 0 0 1 0 12',
+    redo: 'm15 4 6 6-6 6m6-6H10a6 6 0 0 0 0 12',
+    check: 'M4 12l5 5L21 5',
+    close: 'M6 6l12 12M18 6L6 18',
+    search: 'M16 10a6 6 0 1 1-12 0 6 6 0 0 1 12 0zm-1.5 4.5L21 21',
+    format: 'M3 5h18M7 10h10M7 15h14M3 20h12',
+    jump: 'M9 3L6 20M15 3l-3 17M3 8h13M2 15h12M16 13h6m-3-3 3 3-3 3',
+    wrap: 'M3 6h14a4 4 0 0 1 0 8H8m4-4-4 4 4 4M3 20h4',
     sync: 'M20 10a8 8 0 0 0-14-4L4 8m0-4v4h4m-4 6a8 8 0 0 0 14 4l2-2m0 4v-4h-4'
   }[kind]);
   svg.append(path);
@@ -5275,13 +5284,9 @@ async function openTerminalPath(source, candidate, inspected) {
   if (active !== source || !readySession(tab, attempt) || dialog.open || fileEditor.open) return;
 
   const detail = node('p', '', endpoint(tab.host), ' · ', node('code', '', path));
-  const downloadPath = async () => {
-    if (!readySession(tab, attempt)) return;
-    const split = path.lastIndexOf('/');
-    await prepareTransfer(tab, 'down', [path.slice(split + 1)], { directory: path.slice(0, split) || '/' });
-  };
+  const downloadPath = () => downloadRemotePath(tab, attempt, path);
   if (kind === 'file') {
-    if (api.files.readText) openRemoteFile(tab, path, downloadPath);
+    if (api.files.readText) openRemoteFile(tab, path);
     else if (await prompt('远端文件', [detail], '下载', () => true, [], { focusHeading: true, cancelLast: true })) await downloadPath();
   } else if (kind === 'directory') {
     const enter = node('button', 'outlined', '进入');
@@ -5329,98 +5334,271 @@ async function enterTerminalDirectory(tab, attempt, path) {
   tab.terminal.input(command, true);
 }
 
-function openRemoteFile(tab, path, downloadPath) {
+function downloadRemotePath(tab, attempt, path) {
+  if (!readySession(tab, attempt)) return;
+  const split = path.lastIndexOf('/');
+  return prepareTransfer(tab, 'down', [path.slice(split + 1)], { directory: path.slice(0, split) || '/' });
+}
+
+function openRemoteFile(tab, path, trigger) {
+  if (origin() !== tab || !readySession(tab) || dialog.open || fileEditor.open) return;
   const source = active;
   const attempt = tab.attempts;
-  let editor, savedDoc, revision, remotePath, busy = false;
+  const lifetime = new AbortController();
+  let view, editor, savedDoc, revision, remotePath, formatRequest;
+  let editing = false, busy = false;
   const title = summaryText('h2', path.split('/').at(-1));
   title.id = 'file-editor-title';
   title.tabIndex = -1;
   title.setAttribute('autofocus', '');
   const location = summaryText('p', `${endpoint(tab.host)} · ${path}`);
-  const notice = node('p', 'muted', '正在读取远端文件…');
-  notice.setAttribute('role', 'status');
   const content = node('div', 'file-editor-content');
   content.hidden = true;
-  const dirty = () => editor && !editor.state.doc.eq(savedDoc);
-  const refresh = () => {
-    save.disabled = busy || !dirty();
-    close.disabled = download.disabled = busy;
-  };
-  const save = button('保存', async () => {
-    if (busy || !dirty()) return;
-    busy = true;
+  const notice = node('p', 'muted', '正在读取远端文件…');
+  notice.setAttribute('role', 'status');
+  const mode = node('span', 'file-editor-mode');
+  const modified = node('span', 'file-editor-modified', '未保存');
+  const position = node('span', 'file-editor-position');
+  const format = node('span', 'file-editor-format');
+  const ending = node('span');
+  const modes = node('select');
+  const languagePicker = selectControl(modes, '文件语言', { searchable: true, align: 'end', placeholder: '搜索文件语言' });
+  languagePicker.hidden = true;
+  modes.addEventListener('change', () => { view.setFormat(modes.value); refresh(); });
+  const dirty = () => editing && !editor.state.doc.eq(savedDoc);
+  function action(icon, label, run, tooltip = label, primary = false) {
+    const control = button(label, run, primary ? 'primary' : '', label);
+    control.replaceChildren(chromeIcon(icon), node('span', '', label));
+    control.title = tooltip;
+    return control;
+  }
+  function syncMode() {
+    fileEditor.dataset.mode = editing ? 'edit' : 'preview';
+    mode.replaceChildren(chromeIcon(editing ? 'edit' : 'eye'), editing ? '编辑中' : '只读预览');
+    position.hidden = !editing;
+    edit.hidden = close.hidden = editing;
+    undo.hidden = redo.hidden = save.hidden = cancel.hidden = !editing;
+    search.title = editing ? `查找或替换 (${keyboard.label('F')})` : `查找 (${keyboard.label('F')})`;
     refresh();
+  }
+  function refresh() {
+    edit.disabled = !view || busy;
+    save.disabled = !editing || busy || Boolean(formatRequest);
+    close.disabled = cancel.disabled = busy;
+    undo.disabled = !editing || busy || !view?.canUndo;
+    redo.disabled = !editing || busy || !view?.canRedo;
+    download.disabled = busy;
+    search.disabled = go.disabled = wrap.disabled = !view;
+    prettify.disabled = !editing || busy || Boolean(formatRequest) || !view?.parser;
+    prettify.title = !editing ? '进入编辑后可格式化' : view?.parser ? '格式化当前文件 (Shift+Alt+F)' : `${view.format} 暂无可用的格式化工具`;
+    modified.hidden = !dirty();
+  }
+  function preview(messageText) {
+    formatRequest?.abort();
+    formatRequest = undefined;
+    editing = false;
+    jumpRow.hidden = true;
+    go.setAttribute('aria-pressed', 'false');
+    view.preview(savedDoc);
+    notice.textContent = messageText;
+    syncMode();
+    editor.focus();
+  }
+  const edit = action('edit', '编辑', () => {
+    if (!view || editing || busy) return;
+    view.search(false);
+    view.writable(true);
+    editing = true;
+    notice.textContent = '';
+    syncMode();
+    editor.focus();
+  }, '编辑当前文件', true);
+  const save = action('check', '保存', async () => {
+    if (!editing || busy || formatRequest) return;
+    if (!dirty()) { preview(''); return; }
     const doc = editor.state.doc;
+    busy = true;
+    view.writable(false);
+    refresh();
     notice.textContent = '正在保存…';
     try {
       if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化。请重新打开文件后合并更改。');
       const result = await api.files.saveText({ id: tab.id, path: remotePath, text: editor.state.sliceDoc(), revision });
       savedDoc = doc;
       revision = result.revision;
-      notice.textContent = dirty() ? '已保存先前版本 · 有新的未保存修改' : '已保存到远端';
+      const entry = tab.files.entries?.find(item => item.kind === 'file' && pathOf(tab, item.name) === path);
+      if (entry && Number.isFinite(result.size)) {
+        entry.size = result.size;
+        if (origin() === tab && filesOpen) {
+          renderFiles();
+          if (trigger) trigger = [...$('files').querySelectorAll('.file-entry-file')].find(row => row.getAttribute('aria-label') === entry.name);
+        }
+      }
+      preview('已保存到远端');
     } catch (error) {
+      view.writable(true);
       notice.textContent = message(error);
-    } finally {
-      busy = false;
-      refresh();
-    }
-  }, 'primary');
-  save.title = `保存到远端 (${keyboard.label('S')})`;
+      editor.focus();
+    } finally { busy = false; refresh(); }
+  }, `保存到远端 (${keyboard.label('S')})`, true);
   save.setAttribute('aria-keyshortcuts', keyboard.aria('S'));
-  const requestClose = () => {
-    if (busy || (dirty() && !window.confirm('关闭文件并放弃未保存的修改？'))) return;
-    fileEditor.close();
-  };
-  const close = button('取消', requestClose);
-  const download = button('下载', async () => {
+  const cancel = action('close', '取消', async () => {
+    if (!editing || busy || dialog.open) return;
+    // A formatter finishing while the user decides must not replace the draft.
+    formatRequest?.abort();
+    formatRequest = undefined;
+    refresh();
+    if (dirty()) {
+      const discard = await prompt('放弃未保存的修改？', [node('p', '', `「${title.textContent}」的修改尚未保存到远端。`)],
+        '放弃修改', () => true, [], { cancelLabel: '继续编辑' });
+      if (!content.isConnected) return;
+      if (!discard) { notice.textContent = ''; editor.focus(); return; }
+    }
+    preview('');
+  }, '取消编辑，返回预览');
+  const close = action('close', '关闭', () => { if (!editing && !busy) fileEditor.close(); });
+  const download = action('import', '下载', async () => {
     if (busy) return;
     busy = true;
     refresh();
-    try { await downloadPath(); }
+    try { await downloadRemotePath(tab, attempt, path); }
     catch (error) { notice.textContent = message(error); }
     finally { busy = false; refresh(); }
-  }, 'outlined');
-  const expand = button('全屏', () => {
-    const expanded = fileEditor.classList.toggle('file-editor-expanded');
-    expand.textContent = expanded ? '退出全屏' : '全屏';
-    expand.setAttribute('aria-pressed', String(expanded));
-  }, 'outlined');
-  expand.setAttribute('aria-pressed', 'false');
-  const heading = node('header', 'file-editor-heading', node('div', '', title, location), expand);
-  const grip = node('div', 'file-editor-grip');
-  grip.setAttribute('aria-hidden', 'true');
-  const format = node('span', 'muted');
-  const cancel = (event) => { event.preventDefault(); requestClose(); };
-  fileEditor.addEventListener('cancel', cancel);
+  }, '下载远端已保存的文件');
+  const prettify = action('format', '格式化', async () => {
+    if (!editing || busy || formatRequest || !view.parser) return;
+    const request = new AbortController();
+    formatRequest = request;
+    const original = editor.state.doc;
+    const text = original.toString();
+    const parser = view.parser;
+    editor.focus();
+    refresh();
+    notice.textContent = '正在格式化…';
+    try {
+      const result = await window.TermlumeFileEditor.formatDocument({
+        text, parser, path: remotePath, cursor: editor.state.selection.main.head
+      }, request.signal);
+      if (request.signal.aborted) return;
+      if (editor.state.doc !== original || view.parser !== parser) notice.textContent = '内容或语言已更改，请重新格式化';
+      else if (result.formatted === text) notice.textContent = '格式已规范';
+      else { view.applyFormat(result.formatted, result.cursor); notice.textContent = '已格式化，可撤销'; }
+    } catch (error) {
+      if (!request.signal.aborted) notice.textContent = `格式化失败 · ${message(error)}`;
+    } finally {
+      if (formatRequest === request) { formatRequest = undefined; refresh(); }
+    }
+  });
+  prettify.setAttribute('aria-keyshortcuts', 'Alt+Shift+F');
+
+  const undo = action('undo', '撤销', () => view.undo(), `撤销 (${keyboard.label('Z')})`);
+  undo.setAttribute('aria-keyshortcuts', keyboard.aria('Z'));
+  const redoKey = keyboard.isMac ? 'Z' : 'Y';
+  const redo = action('redo', '恢复', () => view.redo(), `恢复 (${keyboard.label(redoKey, keyboard.isMac)})`);
+  redo.setAttribute('aria-keyshortcuts', keyboard.aria(redoKey, keyboard.isMac));
+
+  const search = action('search', '查找', () => {
+    toggleJump(false);
+    const open = search.getAttribute('aria-pressed') !== 'true';
+    view.search(open);
+    if (!open) editor.focus();
+  });
+  search.setAttribute('aria-keyshortcuts', keyboard.aria('F'));
+  const go = action('jump', '跳行', () => toggleJump(jumpRow.hidden), '跳转到行 (Ctrl+G)');
+  const enableWrapHint = '开启自动换行，超出编辑区宽度的文字会折行显示';
+  const wrap = action('wrap', '自动换行', () => {
+    const enabled = wrap.getAttribute('aria-pressed') !== 'true';
+    wrap.setAttribute('aria-pressed', String(enabled));
+    wrap.title = enabled ? '关闭自动换行，左右滚动查看长行' : enableWrapHint;
+    view.wrap(enabled);
+  }, enableWrapHint);
+  for (const control of [search, go, wrap]) control.setAttribute('aria-pressed', 'false');
+  const jumpInput = input('');
+  jumpInput.setAttribute('aria-label', '跳转到行');
+  jumpInput.placeholder = '行号或行:列';
+  const jumpSubmit = node('button', '', '跳转');
+  jumpSubmit.type = 'submit';
+  const jumpRow = node('form', 'file-jump-row', field('跳转到行', jumpInput), jumpSubmit);
+  jumpRow.hidden = true;
+  function toggleJump(open) {
+    go.setAttribute('aria-pressed', String(open));
+    jumpRow.hidden = !open;
+    if (open) {
+      view.search(false);
+      jumpInput.setCustomValidity('');
+      jumpInput.value = String(editor.state.doc.lineAt(editor.state.selection.main.head).number);
+      jumpInput.focus();
+      jumpInput.select();
+    } else if (jumpRow.contains(document.activeElement)) editor.focus();
+  }
+  jumpInput.oninput = () => jumpInput.setCustomValidity('');
+  jumpRow.onsubmit = event => {
+    event.preventDefault();
+    if (view.jump(jumpInput.value)) { toggleJump(false); editor.focus(); }
+    else { jumpInput.setCustomValidity('请输入行号或行:列'); jumpInput.reportValidity(); }
+  };
+  const tools = node('div', 'file-editor-tools', download, prettify, search, go, wrap, undo, redo);
+  const actions = node('div', 'actions', tools, node('div', 'file-mode-actions', edit, save, close, cancel));
+  const identity = node('div', 'file-editor-identity', chromeIcon('file'), node('div', '', title, location));
+  const heading = node('header', 'file-editor-heading', identity, actions);
+  fileEditor.addEventListener('cancel', event => {
+    event.preventDefault();
+    if (!jumpRow.hidden) { toggleJump(false); editor.focus(); }
+    else if (search.getAttribute('aria-pressed') === 'true') { view.search(false); editor.focus(); }
+    else (editing ? cancel : close).click();
+  }, { signal: lifetime.signal });
+  fileEditor.addEventListener('keydown', event => {
+    if (event.isComposing || event.defaultPrevented) return;
+    const key = event.key.toLowerCase();
+    if (keyboard.primary(event) && !event.shiftKey && key === 's') { if (editing) save.click(); }
+    else if (event.altKey && event.shiftKey && !event.metaKey && !event.ctrlKey && event.code === 'KeyF') prettify.click();
+    else if (view && key === 'f' && !event.shiftKey && keyboard.primary(event)) { toggleJump(false); view.search(true); }
+    else if (view && key === 'g' && !event.shiftKey && ((event.ctrlKey && !event.metaKey && !event.altKey &&
+      !event.target.closest('.file-search-panel')) || (event.altKey && (event.metaKey || event.ctrlKey)))) toggleJump(true);
+    else return;
+    event.preventDefault();
+    event.stopPropagation();
+  }, { capture: true, signal: lifetime.signal });
   fileEditor.addEventListener('close', () => {
-    fileEditor.removeEventListener('cancel', cancel);
-    fileEditor.classList.remove('file-editor-expanded');
-    disposePlacement();
+    lifetime.abort();
+    formatRequest?.abort();
     editor?.destroy();
     fileEditor.replaceChildren();
-    focusTerminal(source);
+    if (trigger?.isConnected && origin() === tab) trigger.focus({ preventScroll: true });
+    else focusTerminal(source);
   }, { once: true });
-  fileEditor.replaceChildren(heading, content,
-    node('footer', 'file-editor-footer', node('div', 'file-editor-status', format, notice),
-      node('div', 'actions', download, save, close)), grip);
-  refresh();
+  fileEditor.replaceChildren(heading, jumpRow, content, node('footer', 'file-editor-footer',
+    node('div', 'file-editor-status', mode, modified, notice), position, languagePicker, format, ending));
+  syncMode();
   window.overlays.show(fileEditor);
   title.focus({ preventScroll: true });
-  const disposePlacement = window.TermlumeFileEditor.moveAndResize(fileEditor, heading, grip);
   void (async () => {
     try {
       const file = await api.files.readText({ id: tab.id, path });
       if (!fileEditor.open || !content.isConnected) return;
       if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化。请重新打开文件。');
       ({ path: remotePath, revision } = file);
-      const view = window.TermlumeFileEditor.open(content, remotePath, file.text, refresh, () => save.click(),
-        document.documentElement.dataset.theme === 'dark');
+      const draftChanged = () => {
+        if (!busy && !formatRequest) notice.textContent = '';
+        refresh();
+      };
+      const updatePosition = (line, column, selected) => {
+        position.textContent = `行 ${line}，列 ${column}${selected ? ` · 已选 ${selected}` : ''}`;
+      };
+      view = window.TermlumeFileEditor.open(content, remotePath, file.text, draftChanged,
+        document.documentElement.dataset.theme === 'dark', updatePosition, open => search.setAttribute('aria-pressed', String(open)));
       editor = view.editor;
       savedDoc = editor.state.doc;
       content.hidden = false;
-      format.textContent = `${view.format} · UTF-8`;
+      for (const name of window.TermlumeFileEditor.formatNames) modes.add(new Option(name, name));
+      modes.value = view.format;
+      modes.dispatchEvent(new Event('input'));
+      languagePicker.hidden = false;
+      format.textContent = 'UTF-8';
+      ending.textContent = view.lineEnding;
+      updatePosition(1, 1, 0);
       notice.textContent = '';
+      refresh();
       if (document.activeElement === title) editor.focus();
     } catch (error) { notice.textContent = message(error); }
   })();
@@ -5606,6 +5784,10 @@ function renderFiles() {
   const follow = button('跟踪日志', () => configureCommand(tab, 'follow', logPath()));
   const tail = button('查看末尾', () => configureCommand(tab, 'tail', logPath()));
   const edit=button('外部编辑',()=>externalEdit(tab,logPath()),'outlined');
+  const openSelected = button('打开文件', () => {
+    const path = logPath();
+    if (path) openRemoteFile(tab, path, selectedActions);
+  });
   const rename = button('重命名', () => mutateRemote(tab, false, selection()), 'outlined');
   const remove = button('删除', () => mutateRemote(tab, true, selection()), 'outlined danger');
   const filter = input(files.query || '', 'search');
@@ -5630,13 +5812,14 @@ function renderFiles() {
   const clear = button('清空选择', () => { files.selected.clear(); renderEntries(); });
   const selectedCount = node('small', 'muted');
   const nameHeading = node('span', '', '名称');
-  const selectedActions = menuButton('所选项 ⋯', [download, follow, tail, ...(api.editors ? [edit] : []),
+  const selectedActions = menuButton('所选项 ⋯', [...(api.files.readText ? [openSelected] : []), download, follow, tail, ...(api.editors ? [edit] : []),
     ...(api.files.mutations ? [rename, remove] : []), clear]);
   const updateSelection = () => {
     const count = selection().length;
     selectedActions.hidden = count === 0;
     nameHeading.hidden = count !== 0;
     edit.disabled=!logPath();
+    openSelected.disabled = !logPath();
     rename.disabled=count!==1;remove.disabled=count===0;
     follow.disabled = tail.disabled = !logPath();
     selectedCount.textContent = count ? `已选 ${count} 项` : '';
@@ -5672,7 +5855,23 @@ function renderFiles() {
         });
         row.classList.toggle('selected', checkbox.checked);
         row.append(checkbox);
-        if (kind === 'file') row.append(fileEntry(name, kind, () => checkbox.click()));
+        if (kind === 'file') {
+          const entry = fileEntry(name, kind, () => checkbox.click());
+          if (api.files.readText) {
+            const open = () => openRemoteFile(tab, pathOf(tab, name), entry);
+            entry.title = `${name} · 双击或按 Enter 打开`;
+            entry.addEventListener('dblclick', open);
+            entry.addEventListener('click', event => {
+              if (event.detail === 1) { entry.focus({ preventScroll: true }); return; }
+              event.stopImmediatePropagation();
+              if (event.detail === 0) open(); // Keyboard or accessibility activation.
+            }, true);
+            checkbox.addEventListener('keydown', event => {
+              if (event.key === 'Enter') { event.preventDefault(); open(); }
+            });
+          }
+          row.append(entry);
+        }
       }
       if (kind === 'directory') row.append(fileEntry(name, kind, () => loadFiles(tab, pathOf(tab, name))));
       if (kind === 'other') row.append(summaryText('span', name));
@@ -5952,6 +6151,18 @@ function renderJobActions(job, row) {
   if (retry) controls.push(button('重试', () => api.files.retry(job.id)));
   if (tab) controls.push(button('转到会话', () => { if (tabs.has(tab.id)) selectTab(tab); }));
   if (job.finishedAt && job.direction === 'down') {
+    if (job.status === 'done' && api.files.revealDownload) {
+      controls.push(button(keyboard.isMac ? '在访达中显示' : '在资源管理器中显示', async () => {
+        try {
+          await api.files.revealDownload(job.id);
+          row.error.hidden = !job.message;
+          row.error.textContent = job.message || '';
+        } catch (error) {
+          row.error.textContent = message(error);
+          row.error.hidden = false;
+        }
+      }, 'outlined'));
+    }
     controls.push(button('删除记录', () => removeDownloadHistory(job.id), '', `删除下载记录 ${job.remote}`));
   }
   row.controls.hidden = !controls.length;

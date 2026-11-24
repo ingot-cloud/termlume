@@ -722,6 +722,11 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         }
         #[cfg(desktop)]
         "files:history" => return Ok(json!(ws.transfers.history(ws)?)),
+        #[cfg(any(target_os = "macos", windows))]
+        "files:reveal-download" => {
+            let path = ws.transfers.download_location(ws, id(&value)?)?;
+            blocking(move || platform::reveal_download(&path)).await?;
+        }
         #[cfg(desktop)]
         "files:remove-history" => {
             let id = (!value.is_null()).then(|| id(&value)).transpose()?;

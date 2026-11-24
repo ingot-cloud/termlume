@@ -55,6 +55,7 @@
     commands: bind({ preview: 'commands:preview', start: 'commands:start', stop: 'commands:stop', close: 'commands:close' }),
     files: {
       mutations: true, directoryUploads:true,
+      ...(/Mac|Win/.test(navigator.platform) ? bind({ revealDownload: 'files:reveal-download' }) : {}),
       ...bind({ readText: 'files:read-text', saveText: 'files:save-text' }),
       ...bind({ mutationPreview:'files:mutation-preview',rename:'files:rename',remove:'files:remove', list: 'files:list', inspect: 'files:inspect', mkdir: 'files:mkdir', createFile: 'files:create-file', history: 'files:history', removeHistory: 'files:remove-history', prepare: 'files:prepare', enqueue: 'files:enqueue', discard: 'files:discard', cancel: 'files:cancel', retry: 'files:retry' }),
       directoryDownloads: /Mac|Linux|Win/.test(navigator.platform)
