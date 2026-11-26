@@ -2331,10 +2331,12 @@ async function openSessionLayout(saved) {
       created.push(tab);
       tab.title = layout.tabs[index].title;
     }
-    const tree = layoutState.layoutTree(layout, created.map(tab => tab.id));
+    const peers = created.map(tab => tab.id);
+    for (const tab of created) tab.layoutPeers = peers;
+    const tree = layoutState.layoutTree(layout, peers);
     splitLayout = (layout.split?.version === 2 || layout.split.length >= 2) ? installSplitLayout(splitFromTree(tree)) : undefined;
     selectTab(tabs.get(splitLayout?.panes[0]) || created[0]);
-    status(`已打开会话布局「${layout.name}」，点击各标签的「连接」即可开始。`);
+    status(`已打开会话布局「${layout.name}」，可单独连接，也可点击「连接全部」。`);
   } catch (error) {
     for (const tab of created) removeTab(tab);
     splitLayout = previousSplit;
@@ -4401,7 +4403,10 @@ function renderContext() {
   const tab = active;
   const session = origin(tab);
   const split = tab?.kind === 'shell' && visibleSplitLayout();
-  $('toolbar').hidden = !tab?.terminal || Boolean(tab.connectionPage && !tab.connectionPage.hidden && !split);
+  const peers = (tab?.layoutPeers || []).map(id => tabs.get(id)).filter(Boolean);
+  const waiting = peers.filter(peer => ['idle', 'closed'].includes(peer.status) && !peer.closing);
+  const groupConnect = peers.length > 1 && waiting.length > 0;
+  $('toolbar').hidden = !tab?.terminal || Boolean(tab.connectionPage && !tab.connectionPage.hidden && !split && !groupConnect);
   $('save-layout').hidden = !api.layouts || !split;
   $('session-notice').hidden = true;
   if ($('toolbar').hidden) return;
@@ -4410,6 +4415,11 @@ function renderContext() {
   if (session?.jumpHost) $('context').append(summaryText('small', `经 ${session.jumpHost.name}`));
   const controls = $('session-actions');
   controls.replaceChildren();
+  if (groupConnect) controls.append(button('连接全部', () => Promise.all(waiting.map(peer => {
+    if (['idle', 'closed'].includes(peer.status) && !peer.closing && !vaultStatus.locked) {
+      return connect(peer, peer.promptForPassword, false, true);
+    }
+  })), 'primary', '连接全部'));
   if (tab.pendingTransfer && readySession(tab)) {
     const label = { locate: '定位远端文件', retry: '核对传输路径', resume: '继续传输', discard: '取消传输' }[tab.pendingTransfer.action];
     controls.append(button(label, () => continueTransferAction(tab), 'outlined'));
@@ -4688,7 +4698,7 @@ function updateSession(tab, next, detail = '') {
     $('terminal-find').hidden = true;
     renderTerminalBottom();
   }
-  if (active === tab || origin() === tab) renderContext();
+  if (active === tab || origin() === tab || active?.layoutPeers?.includes(tab.id)) renderContext();
   if (next === 'ready' && tab.pendingTransfer && active === tab && !dialog.open && !fileEditor.open) void continueTransferAction(tab);
   if (filesOpen && origin() === tab) renderFiles();
   if (origin() === tab) {

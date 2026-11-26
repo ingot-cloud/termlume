@@ -915,6 +915,21 @@
       active.id === splitLayout.panes[0] &&
       beforeLayoutOpen === previewCalls.filter(([type]) => type === 'connect').length,
       '快速打开布局新建空闲标签并还原分屏，不自动发起 SSH');
+    const layoutHosts = hosts;
+    hosts = hosts.map(host => ({...host, auth:'password', jumpHostId:undefined}));
+    api.ssh.connect = async value => previewCalls.push(['connect',value]);
+    findButton($('session-actions'),'连接全部').click(); await tick();
+    assert(openedLayoutTabs.every(pane => pane.status === 'connecting' && pane.credentialForm) &&
+      !dialog.open && !findButton($('session-actions'),'连接全部'), '连接全部仅启动一次，各窗格独立等待输入密码');
+    const [firstPane, secondPane] = openedLayoutTabs;
+    firstPane.credentialForm.querySelector('input[type=password]').value = 'preview-fixture';
+    firstPane.credentialForm.requestSubmit(); await tick();
+    previewListener({type:'session', id:firstPane.id, status:'ready'});
+    assert(firstPane.status === 'ready' && secondPane.credentialForm, '一个窗格完成认证时其他窗格仍可输入');
+    findButton(secondPane.credentialForm,'取消认证').click(); await tick();
+    assert(secondPane.status === 'idle' && firstPane.status === 'ready', '取消一台主机的认证保留其他已连接窗格');
+    hosts = layoutHosts;
+    api.ssh.connect = connect;
     for (const tab of openedLayoutTabs) removeTab(tab);
     openSettings('layouts'); await tick();
     findButton($('settings-page'), '删除').click(); await tick();
