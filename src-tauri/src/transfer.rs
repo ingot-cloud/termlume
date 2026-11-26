@@ -158,6 +158,15 @@ pub struct PrepareRequest {
     drop_ticket: Option<Uuid>,
     #[serde(default)]
     folder: bool,
+    #[serde(default, rename = "chooseDirectory")]
+    choose_directory: bool,
+}
+
+fn writable_download_directory(path: &Path) -> bool {
+    // Recheck the canonical path so a moved folder replaced by a symlink
+    // cannot silently redirect a remembered download.
+    path.is_absolute() && std::fs::canonicalize(path).is_ok_and(|actual| actual == path)
+        && tempfile::Builder::new().prefix(".termlume-check-").tempfile_in(path).is_ok()
 }
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -407,6 +416,7 @@ async fn target(sftp: &SftpSession, file: &File) -> Result<Option<Stat>, String>
 struct Ticket {
     files: Vec<File>,
     time: Instant,
+    chosen_directory: Option<PathBuf>,
 }
 struct DroppedFiles {
     ticket: Uuid,
@@ -589,6 +599,7 @@ impl Transfers {
 
     pub async fn prepare(
         &self,
+        ws: &Workspace,
         session: Arc<Session>,
         request: PrepareRequest,
     ) -> Result<Value, String> {
@@ -602,6 +613,9 @@ impl Transfers {
             return Err("拖入的本机文件只能用于上传。".into());
         }
         let dialog = rfd::AsyncFileDialog::new();
+        let mut chosen_directory = None;
+        let mut quick = false;
+        let mut invalid_directory = false;
         let selections = if upload {
             let paths = if let Some(ticket) = request.drop_ticket {
                 let mut drop = self.drop.lock().unwrap();
@@ -644,27 +658,57 @@ impl Transfers {
             if names.is_empty() || names.len() > 100 {
                 return Err("每次可选择 1 至 100 个文件或目录。".into());
             }
-            let Some(folder) = dialog.set_title("选择下载目录").pick_folder().await else {
-                return Ok(Value::Null);
+            let remembered = {
+                let store = ws.store.lock().unwrap();
+                let data = store.data()?;
+                session.check_route(data)?;
+                session.places(data).download_directory
+            };
+            let folder = match remembered {
+                Some(path) if !request.choose_directory && writable_download_directory(&path) => {
+                    quick = true;
+                    path
+                }
+                other => {
+                    invalid_directory = !request.choose_directory && other.is_some();
+                    let title = if invalid_directory { "原下载目录已不可用，请重新选择" } else { "选择下载目录" };
+                    let Some(folder) = dialog.set_title(title).pick_folder().await else { return Ok(Value::Null); };
+                    let path = std::fs::canonicalize(folder.path()).map_err(error)?;
+                    if !writable_download_directory(&path) { return Err("所选下载目录不可写，请重新选择。".into()); }
+                    chosen_directory = Some(path.clone());
+                    path
+                }
             };
             names
                 .into_iter()
                 .map(|name| {
                     let name = local_name(&name)?;
-                    Ok((remote_join(&directory, name), folder.path().join(name)))
+                    Ok((remote_join(&directory, name), folder.join(name)))
                 })
                 .collect::<Result<Vec<_>, String>>()?
         };
         if selections.is_empty() || selections.len() > 100 {
             return Err("每次可传输 1 至 100 个选中的项目。".into());
         }
-        self.stage(session, upload, selections).await
+        let mut result = self.stage_with_directory(session, upload, selections, chosen_directory).await?;
+        result["quickDownload"] = json!(quick);
+        result["replaceInvalidDirectory"] = json!(invalid_directory);
+        Ok(result)
     }
     pub(crate) async fn stage(
         &self,
         session: Arc<Session>,
         upload: bool,
         selections: Vec<(String, PathBuf)>,
+    ) -> Result<Value, String> {
+        self.stage_with_directory(session, upload, selections, None).await
+    }
+    async fn stage_with_directory(
+        &self,
+        session: Arc<Session>,
+        upload: bool,
+        selections: Vec<(String, PathBuf)>,
+        chosen_directory: Option<PathBuf>,
     ) -> Result<Value, String> {
         let sftp = open(&session).await?;
         let mut files = Vec::new();
@@ -725,20 +769,22 @@ impl Transfers {
             "skipped": f.folder.as_ref().map_or(0, |folder| folder.skipped)
         })).collect();
         let mut pending = self.tickets.lock().unwrap();
+        let can_remember_directory = chosen_directory.is_some();
         pending.retain(|_, t| t.time.elapsed() < Duration::from_secs(300));
         pending.insert(
             ticket,
             Ticket {
                 files,
                 time: Instant::now(),
+                chosen_directory,
             },
         );
-        Ok(json!({"ticket":ticket,"files":summaries}))
+        Ok(json!({"ticket":ticket,"files":summaries,"canRememberDirectory":can_remember_directory}))
     }
     pub fn discard(&self, ticket: Uuid) {
         self.tickets.lock().unwrap().remove(&ticket);
     }
-    pub fn accept(&self, ws: &Workspace, ticket: Uuid, policy: Policy) -> Result<(), String> {
+    pub fn accept(&self, ws: &Workspace, ticket: Uuid, policy: Policy, remember_directory: bool) -> Result<(), String> {
         let ticket = self
             .tickets
             .lock()
@@ -746,6 +792,16 @@ impl Transfers {
             .remove(&ticket)
             .filter(|t| t.time.elapsed() < Duration::from_secs(300))
             .ok_or("传输确认已过期，请重新选择文件。")?;
+        if remember_directory {
+            let path = ticket.chosen_directory.ok_or("请先选择本机下载目录。")?;
+            let session = &ticket.files.first().ok_or("未选择文件。")?.session;
+            let mut store = ws.store.lock().unwrap();
+            let data = store.data()?;
+            session.check_route(data)?;
+            let mut places = session.places(data);
+            places.download_directory = Some(path);
+            session.set_places(&mut store, places)?;
+        }
         self.enqueue(ws, ticket.files, policy)
     }
     fn enqueue(&self, ws: &Workspace, files: Vec<File>, policy: Policy) -> Result<(), String> {

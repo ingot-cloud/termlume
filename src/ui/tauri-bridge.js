@@ -42,6 +42,7 @@
         return request('ssh:connect', value);
       },
       trust: (value) => request('ssh:trust', value),
+      saveTemporary: (id) => request('ssh:save-temporary', id),
       close(id) {
         terminalQueues.delete(id);
         return request('ssh:close', id);
@@ -56,6 +57,7 @@
     files: {
       mutations: true, directoryUploads:true,
       ...(/Mac|Win/.test(navigator.platform) ? bind({ revealDownload: 'files:reveal-download', revealLocal: 'files:reveal-local' }) : {}),
+      quickDownloads: true,
       ...bind({ remoteLocation: 'files:remote-location', readText: 'files:read-text', saveText: 'files:save-text', places: 'files:places' }),
       ...bind({ mutationPreview:'files:mutation-preview',rename:'files:rename',remove:'files:remove', list: 'files:list', inspect: 'files:inspect', mkdir: 'files:mkdir', createFile: 'files:create-file', history: 'files:history', removeHistory: 'files:remove-history', prepare: 'files:prepare', enqueue: 'files:enqueue', discard: 'files:discard', cancel: 'files:cancel', retry: 'files:retry', prepareRetry: 'files:prepare-retry', cancelPausedDownload:'files:cancel-paused-download', pending:'files:pending', pause:'files:pause', resume:'files:resume' }),
       directoryDownloads: /Mac|Linux|Win/.test(navigator.platform)

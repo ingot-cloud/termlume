@@ -80,6 +80,9 @@ let touchIdAvailable = false;
 let draggedFileCount = 0;
 let transferDirection = '';
 let transferPage = 'active';
+let transferHostsChanged = true;
+const transferStatuses = { active: '', history: '' };
+let transferClock;
 let loadingHistory;
 let historyReady = false;
 let editingHistory = false;
@@ -1879,9 +1882,90 @@ async function manageLogs(page){
     const text=await api.logs.read(choice.read.id);const search=input('','search');search.placeholder='筛选日志行';const output=node('pre','operation-results',text);search.addEventListener('input',()=>{output.textContent=search.value?text.split('\n').filter(line=>line.toLowerCase().includes(search.value.toLowerCase())).join('\n'):text;});await ask('查看会话日志',[search,output],'关闭',()=>true,[button('返回日志列表',close,'outlined')]);
   }renderContext();
 }
-async function commandHistory(session){const history=await api.history.list();let selected;const list=history.slice().reverse().map(item=>node('section','forward-rule',node('strong','',`${item.host} · ${new Date(item.at).toLocaleString()}`),node('pre','operation-results',item.command),...(session?.status==='ready'?[button('执行到当前会话',()=>{selected=item;dialog.close();},'outlined')]:[])));
-  await prompt('本机命令执行历史',list.length?list:[node('p','muted','在偏好中开启后，仅保存应用通过独立通道执行的命令。')],'关闭',()=>true,[button('清空历史',async()=>{if(window.confirm('清空本机命令历史？')){await api.history.clear();dialog.close();}},'outlined danger')]);
-  if(selected&&await confirm('再次执行',`原目标 ${selected.endpoint}\n当前目标 ${endpoint(session.host)}\n${selected.command}`,'执行')){const tab={id:sessionId(),kind:'command',sessionId:session.id,host:session.host,action:'custom',status:'connecting'};attachTerminal(tab);tabs.set(tab.id,tab);selectTab(tab);await api.commands.start({id:tab.id,sessionId:session.id,request:{action:'custom',argument:selected.command,lines:100}});}
+function historyHostKey(item) {
+  if (item.hostId) return `id:${item.hostId}`;
+  return item.endpoint ? `endpoint:${item.endpoint}` : `name:${item.host || ''}`;
+}
+
+async function fillHistoryCommand(session, command, attempt) {
+  // Shells without bracketed paste can interpret a pasted newline as pressing Enter.
+  const canPaste = text => !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(text) &&
+    (!/[\r\n\t]/.test(text) || (session.terminal.modes.bracketedPasteMode && !session.terminal.options.ignoreBracketedPasteMode));
+  if (!canPaste(command)) {
+    const draft = node('textarea');
+    draft.rows = 5;
+    draft.value = command;
+    command = await prompt('编辑后填入终端', [node('p', 'muted', `当前终端只适合填入单行文本，请保留要使用的命令。目标 ${endpoint(session.host)}`),
+      field('要填入的命令', draft)], '填入终端', () => {
+      if (!draft.value.trim() || !canPaste(draft.value)) throw new Error('请保留一行命令，将制表符替换为空格，并移除控制字符。');
+      return draft.value;
+    }, [], { focus: draft });
+    if (!command) return;
+  }
+  if (!canPaste(command)) throw new Error('终端输入模式已变化，请重新选择命令。');
+  fillTerminalCommand(session, command, attempt);
+}
+
+async function commandHistory(session) {
+  const attempt = session.attempts;
+  const history = (await api.history.list()).filter(item => typeof item?.command === 'string' && item.command.trim()).reverse();
+  if (origin() !== session || vaultStatus.locked) return;
+  const search = input('', 'search');
+  search.placeholder = '搜索命令或参数';
+  search.setAttribute('aria-label', '搜索命令或参数');
+  const host = node('select');
+  host.add(new Option('全部主机', ''));
+  const seen = new Set();
+  for (const item of history) {
+    const key = historyHostKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const option = new Option(item.host || item.endpoint || '未知主机', key);
+    option.dataset.description = item.endpoint || '';
+    host.add(option);
+  }
+  const filters = node('div', 'dialog-row', field('主机', selectControl(host, '筛选命令历史主机', {
+    searchable: true, placeholder: '搜索主机名称或地址'
+  })),
+    field('关键词', search));
+  const list = node('div', 'forward-list command-history-list');
+  let selected;
+  const choose = (action, item) => {
+    if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新打开命令历史。');
+    selected = {action, item};
+    closePrompt();
+  };
+  const render = () => {
+    const visible = history.filter(item => (!host.value || host.value === historyHostKey(item)) && matchesQuery(search.value, item.command));
+    list.replaceChildren(...visible.map(item => {
+      const heading = [item.host || '未知主机', item.endpoint, item.at && new Date(item.at).toLocaleString()].filter(Boolean).join(' · ');
+      const row = node('section', 'forward-rule', node('strong', '', heading), node('pre', 'operation-results', item.command));
+      if (readySession(session, attempt)) row.append(node('div', 'forward-actions',
+        button('填入终端', () => choose('fill', item), 'outlined'),
+        button('执行到当前会话', () => choose('run', item), 'outlined')));
+      return row;
+    }));
+    if (!visible.length) list.append(node('p', 'muted', history.length ? '没有匹配的命令。' :
+      '暂无命令历史。在偏好中开启记录后，可在这里查看通过独立通道执行的命令。'));
+    list.scrollTop = 0;
+  };
+  host.addEventListener('change', render);
+  search.addEventListener('input', render);
+  search.addEventListener('keydown', event => { if (event.key === 'Enter') event.preventDefault(); });
+  render();
+  const target = node('small', 'muted', `当前终端 ${session.host.name} · ${endpoint(session.host)}`);
+  const clear = button('清空历史', async () => {
+    if (window.confirm('清空所有主机的全部命令历史？')) { await api.history.clear(); closePrompt(); }
+  }, 'outlined danger');
+  clear.disabled = !history.length;
+  await prompt('本机命令执行历史', [filters, target, list], '关闭', () => true, [clear], {focus: search});
+  if (!selected) return;
+  const {action, item} = selected;
+  if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新打开命令历史。');
+  if (action === 'fill') return fillHistoryCommand(session, item.command, attempt);
+  if (!await confirm('再次执行', `原目标 ${item.endpoint || item.host || '未知主机'}\n当前目标 ${endpoint(session.host)}\n${item.command}`, '执行')) return;
+  if (!readySession(session, attempt)) throw new Error('SSH 会话已变化，请重新选择命令。');
+  await openCommandOutput(session, {action: 'custom', argument: item.command, lines: 100});
 }
 
 function splitGroupFor(id) {
@@ -3363,6 +3447,7 @@ function updateHostActions() {
   hostSearchAction = host ? () => openHost(host) : hostSearchMatch?.run;
   $('host-connect').disabled = !hostSearchAction;
   $('host-connect').textContent = !host && hostSearchMatch?.draft ? '填写主机' : '连接';
+  $('host-connect-once').hidden = !hostSearchMatch?.draft || !api.ssh.saveTemporary;
 }
 
 function closeHostMenu(restoreFocus = false) {
@@ -4176,7 +4261,13 @@ function renderQuickConnect(draftTab) {
   if (target && !Object.values(filters).some(Boolean) && !hosts.some(host => matchesTarget(host, target))) {
     const choice = button('', () => editHost(undefined, draftTab, target), 'tab-choice');
     choice.append(chromeIcon('new-tab'), summaryText('span', '填写新主机'), summaryText('small', text));
-    groups.push(quickConnectGroup('快速连接', [choice]));
+    const options = [];
+    if (api.ssh.saveTemporary) {
+      const once = button('', () => startTemporaryConnection(target, draftTab), 'tab-choice');
+      once.append(chromeIcon('terminal'), summaryText('span', '仅连接这一次'), summaryText('small', text));
+      options.push(once);
+    }
+    groups.push(quickConnectGroup('快速连接', [...options, choice]));
   }
   const saved = matching.filter((host) => !visited.includes(host));
   if (saved.length) groups.push(quickConnectGroup(query ? '匹配的主机' : '已保存的主机', saved.map(hostChoice)));
@@ -4371,7 +4462,7 @@ function renderConnectionPage(tab) {
     const host = tab.trustHost || tab.host;
     body.append(node('p', 'connection-fingerprint', tab.trustStage === 'jump' ? '跳板机 ' : '目标主机 ',
       endpoint(host), ' · ', node('code', '', tab.fingerprint)));
-    actions.append(button('信任并连接', () => trust(tab, true), 'primary'),
+    actions.append(button(tab.temporary ? '仅本次信任并连接' : '信任并连接', () => trust(tab, true), 'primary'),
       button('拒绝指纹', () => trust(tab, false), 'outlined'));
   } else if (tab.status === 'idle' || tab.status === 'closed') {
     if (tab.reconnectTimer) {
@@ -4385,7 +4476,7 @@ function renderConnectionPage(tab) {
       actions.append(button(tab.promptForPassword ? '重新输入密码' : tab.attempts ? '重新连接' : '连接',
         () => connect(tab, tab.promptForPassword), 'primary'));
     }
-    if (tab.status === 'closed' && tab.host.auth === 'key') {
+    if (tab.status === 'closed' && tab.host.auth === 'key' && !tab.temporary) {
       actions.append(button('编辑主机认证', () => editHost(hosts.find(host => host.id === tab.host.id) || tab.host), 'outlined'));
     }
   }
@@ -4407,7 +4498,7 @@ function renderContext() {
   const waiting = peers.filter(peer => ['idle', 'closed'].includes(peer.status) && !peer.closing);
   const groupConnect = peers.length > 1 && waiting.length > 0;
   $('toolbar').hidden = !tab?.terminal || Boolean(tab.connectionPage && !tab.connectionPage.hidden && !split && !groupConnect);
-  $('save-layout').hidden = !api.layouts || !split;
+  $('save-layout').hidden = !api.layouts || !split || split.panes.some(id => tabs.get(id)?.temporary);
   $('session-notice').hidden = true;
   if ($('toolbar').hidden) return;
   const labels = { idle: '等待连接', connecting: '连接中', trust: '核对主机指纹', ready: '已连接', closed: '已断开', running: '运行中', done: '已完成', stopped: '已停止', failed: '失败' };
@@ -4415,6 +4506,14 @@ function renderContext() {
   if (session?.jumpHost) $('context').append(summaryText('small', `经 ${session.jumpHost.name}`));
   const controls = $('session-actions');
   controls.replaceChildren();
+  if (session?.temporary) {
+    $('context').append(node('small', '', '临时连接'));
+    if (readySession(session)) {
+      const save = button('保存主机', () => saveTemporaryHost(session), 'outlined');
+      save.disabled = Boolean(session.savingTemporary);
+      controls.append(save);
+    }
+  }
   if (groupConnect) controls.append(button('连接全部', () => Promise.all(waiting.map(peer => {
     if (['idle', 'closed'].includes(peer.status) && !peer.closing && !vaultStatus.locked) {
       return connect(peer, peer.promptForPassword, false, true);
@@ -4434,13 +4533,13 @@ function renderContext() {
   const moreActions = [];
   if (readySession(session)) moreActions.push(button('打开远端路径', () => chooseTerminalPath()));
   let runningForwards = 0;
-  if (api.forwards && session) {
+  if (api.forwards && session && !session.temporary) {
     const running = [...forwardRuns.values()].filter((job) => job.sessionId === session.id && ['running', 'stopping'].includes(job.status)).length;
     runningForwards = running;
     moreActions.push(button(`端口转发${running ? ` · ${running}` : ''}`, () => manageForwards(session.host, session)));
   }
   if(api.logs&&session?.status==='ready') moreActions.push(button(recordingSessions.has(session.id)?'停止录制':'记录输出',()=>toggleRecording(session)));
-  if(api.history&&session) moreActions.push(button('历史',()=>commandHistory(session)));
+  if(api.history&&session) moreActions.push(button('命令历史',()=>commandHistory(session)));
   if (api.layouts) moreActions.push(button('管理会话布局', () => manageLayouts()));
   const shortcuts = button('快捷命令', () => openPalette('commands'));
   shortcuts.disabled = session?.status !== 'ready';
@@ -4523,7 +4622,62 @@ async function enterCredential(host, jump = false, pane) {
   }
 }
 
-async function connect(tab, enterPassword = false, automatic = false, paneCredentials = false) {
+async function temporaryLogin(host) {
+  const auth = node('select');
+  for (const [value, label] of [['password', '密码'], ['key', '本机私钥'], ['agent', 'SSH Agent']]) auth.add(new Option(label, value));
+  auth.value = host.auth || 'password';
+  const secret = input('', 'password');
+  const key = input(host.keyPath || '');
+  const chooseKey = button('选择私钥…', async () => { const path = await api.hosts.pickKey(); if (path) key.value = path; });
+  const keyField = field('私钥路径', key);
+  const secretField = field('SSH 密码', secret);
+  const update = () => {
+    keyField.hidden = chooseKey.hidden = auth.value !== 'key';
+    key.required = auth.value === 'key';
+    secretField.hidden = auth.value === 'agent';
+    secret.required = auth.value === 'password';
+    secretField.firstChild.textContent = auth.value === 'key' ? '私钥口令（未加密可留空）' : 'SSH 密码';
+    secret.value = '';
+  };
+  auth.addEventListener('change', update);
+  update();
+  try {
+    return await prompt('仅连接这一次', [node('p', '', endpoint(host)), field('认证方式', selectControl(auth, '认证方式')),
+      keyField, chooseKey, secretField], '连接', () => ({
+        auth: auth.value, keyPath: auth.value === 'key' ? key.value.trim() : undefined,
+        secret: auth.value === 'agent' ? '' : secret.value
+      }));
+  } finally { secret.value = ''; }
+}
+
+async function startTemporaryConnection(target, draftTab) {
+  if (!target) return;
+  const address = target.address.replace(/^\[(.*)\]$/, '$1');
+  const host = { id: draftTab?.id || sessionId(), name: address, address, port: Number(target.port || 22),
+    username: target.username, auth: target.auth || 'password', keyPath: target.keyPath, tags: [] };
+  if (host.port < 1 || host.port > 65535) throw new Error('端口须在 1 至 65535 之间。');
+  const login = await temporaryLogin(host);
+  if (!login || vaultStatus.locked) return;
+  return openHost(host, { draftTab, temporary: true, login });
+}
+
+async function saveTemporaryHost(tab) {
+  if (tab.savingTemporary || !tab.temporary || !readySession(tab)) return;
+  tab.savingTemporary = true;
+  renderContext();
+  try {
+    tab.host = await api.ssh.saveTemporary(tab.id);
+    tab.temporary = false;
+    await refreshHosts();
+    status(`已保存主机「${tab.host.name}」。`);
+  } finally {
+    tab.savingTemporary = false;
+    renderContext();
+    renderTabs();
+  }
+}
+
+async function connect(tab, enterPassword = false, automatic = false, paneCredentials = false, login) {
   clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);
   tab.reconnectTimer=undefined;
   if(!automatic){tab.retryCount=0;tab.reconnectCancelled=false;}
@@ -4543,6 +4697,12 @@ async function connect(tab, enterPassword = false, automatic = false, paneCreden
     tab.jumpHost = jumpHost;
     renderContext();
     const credentialFor = async (host, isJump = false) => {
+      if (tab.temporary) {
+        const entered = login || await temporaryLogin(host);
+        if (!entered) return;
+        Object.assign(host, { auth: entered.auth, keyPath: entered.keyPath });
+        return { secret: entered.secret, useSaved: false };
+      }
       const useSaved = host.auth === 'password' && !enterPassword && !tab.promptForPassword && await api.hosts.hasPassword(host.id);
       if (!tabs.has(tab.id) || tab.closing || vaultStatus.locked) return;
       if(automatic&&!automaticCredential(host.auth,useSaved)) throw new Error('自动重连需要手动输入凭据，请点击连接继续。');
@@ -4564,13 +4724,13 @@ async function connect(tab, enterPassword = false, automatic = false, paneCreden
     if (tab.attempts++) tab.rendering.write('\r\n\x1b[90m── 正在建立新 SSH 会话 ──\x1b[0m\r\n');
     if (tab.view.clientHeight) await tab.rendering.fit();
     if (!tabs.has(tab.id)) return;
-    await api.ssh.connect({ id: tab.id, expected: tab.host, ...credentials, jump: jumpHost ? { expected: jumpHost, ...jumpCredentials } : undefined, dimensions: { rows: tab.terminal.rows, cols: tab.terminal.cols } });
+    await api.ssh.connect({ id: tab.id, temporary: Boolean(tab.temporary), expected: tab.host, ...credentials, jump: jumpHost ? { expected: jumpHost, ...jumpCredentials } : undefined, dimensions: { rows: tab.terminal.rows, cols: tab.terminal.cols } });
   } catch (error) {
     if (tabs.has(tab.id)) updateSession(tab, 'closed', message(error));
   }
 }
 
-async function openHost(host, { force = false, draftTab, connectNow = true } = {}) {
+async function openHost(host, { force = false, draftTab, connectNow = true, temporary = false, login } = {}) {
   if (draftTab && (active !== draftTab || draftTab.kind !== 'new')) return;
   if (connectNow && host.auth === 'key' && !host.keyPath) { if(host.identityId){await manageIdentities();}else await editHost(host,draftTab);return; }
   const sessions = [...tabs.values()].filter((tab) => tab.kind === 'shell' && tab.host.id === host.id);
@@ -4578,13 +4738,13 @@ async function openHost(host, { force = false, draftTab, connectNow = true } = {
     && ['address', 'port', 'username', 'auth', 'keyPath', 'jumpHostId', 'identityId', 'identityVersion'].every((field) => tab.host[field] === host[field])
     && (!host.jumpHostId || ['address', 'port', 'username', 'auth', 'keyPath', 'jumpHostId', 'identityId', 'identityVersion'].every((field) => tab.jumpHost?.[field] === hosts.find((item) => item.id === host.jumpHostId)?.[field]))).sort((a, b) => b.used - a.used)[0];
   if (existing && !force && !draftTab) { selectTab(existing); return existing; }
-  const tab = draftTab || { id: sessionId() };
-  Object.assign(tab, { kind: 'shell', host, status: 'idle', number: Math.max(0, ...sessions.map((entry) => entry.number)) + 1,
+  const tab = draftTab || { id: temporary ? host.id : sessionId() };
+  Object.assign(tab, { kind: 'shell', host, temporary, status: 'idle', number: Math.max(0, ...sessions.map((entry) => entry.number)) + 1,
     attempts: 0, files: { selected: new Set() } });
   attachTerminal(tab);
   tabs.set(tab.id, tab);
   selectTab(tab);
-  if (connectNow) await connect(tab);
+  if (connectNow) await connect(tab, false, false, false, login);
   else updateSession(tab, 'idle', '点击「连接」开始 SSH 会话。');
   return tab;
 }
@@ -4673,6 +4833,7 @@ function updateSession(tab, next, detail = '') {
   if(next==='closed')recordingSessions.delete(tab.id);
   renderForwardPanel?.();
   tab.message = detail;
+  tab.editorConnectionChanged?.();
   if (tab.connectionPage) {
     addConnectionLog(tab, detail);
     renderConnectionPage(tab);
@@ -4682,8 +4843,10 @@ function updateSession(tab, next, detail = '') {
     // Resizes sent during the handshake may arrive before the remote PTY exists.
     syncTerminalSize(tab);
     clearTimeout(tab.stableTimer);tab.stableTimer=setTimeout(()=>{tab.retryCount=0;},30000);
-    recent.set(tab.host.id, Date.now());
-    void api.hosts.touch(tab.host.id).catch(() => {});
+    if (!tab.temporary) {
+      recent.set(tab.host.id, Date.now());
+      void api.hosts.touch(tab.host.id).catch(() => {});
+    }
     if (active === tab) status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
     focusTerminal(tab);
     if (active?.kind === 'new') renderQuickConnect(active);
@@ -4824,7 +4987,8 @@ async function openPalette(scope = 'all') {
         if (!multiline) add('命令库', `填入终端 · ${snippet.name}`, '按回车后执行', () => useLibraryCommand(session, snippet, true, attempt), keywords, [session.host]);
         if (multiline || scope !== 'commands') add('命令库', `独立执行 · ${snippet.name}`, session.host.name, () => useLibraryCommand(session, snippet, false, attempt), keywords, [session.host]);
       }
-      add('会话操作', '在新标签连接', session.host.name, () => openHost(session.host, {force: true}), '', [session.host]);
+      add('会话操作', '在新标签连接', session.host.name, () => session.temporary
+        ? startTemporaryConnection(session.host) : openHost(session.host, {force: true}), '', [session.host]);
     }
     if (api.snippets) add('工具', '管理命令库', '新增、编辑与整理命令', () => manageSnippets(session));
     if (scope !== 'commands') {
@@ -4912,14 +5076,14 @@ async function configureCommand(session, action, file) {
   });
   if (!details || !readySession(session, attempt)) { focusTerminal(source); return; }
   if (!file) { fillTerminalCommand(session, details.preview, attempt); return; }
-  await openFileCommandOutput(session, details.request, details.preview);
+  await openCommandOutput(session, details.request, details.preview);
 }
 
-async function openFileCommandOutput(session, request, preview) {
+async function openCommandOutput(session, request, preview) {
   const { action } = request;
   const tab = { id: sessionId(), kind: 'command', sessionId: session.id, host: session.host, action, status: 'connecting' };
   attachTerminal(tab);
-  tab.rendering.write(`\x1b[90m$ ${preview}\x1b[0m\r\n`);
+  if (preview) tab.rendering.write(`\x1b[90m$ ${preview}\x1b[0m\r\n`);
   tabs.set(tab.id, tab);
   selectTab(tab);
   try { await api.commands.start({ id: tab.id, sessionId: session.id, request }); }
@@ -5380,19 +5544,26 @@ async function enterTerminalDirectory(tab, attempt, path) {
   tab.terminal.input(command, true);
 }
 
-function downloadRemotePath(tab, attempt, path) {
+function downloadRemotePath(tab, attempt, path, chooseDirectory = false) {
   if (!readySession(tab, attempt)) return;
   const split = path.lastIndexOf('/');
-  return prepareTransfer(tab, 'down', [path.slice(split + 1)], { directory: path.slice(0, split) || '/' });
+  return prepareTransfer(tab, 'down', [path.slice(split + 1)], { directory: path.slice(0, split) || '/', chooseDirectory });
+}
+
+function recordOpenedFile(tab, attempt, path) {
+  if (!api.files.places || !readySession(tab, attempt)) return;
+  tab.files.recordOpen = api.files.places({ id: tab.id, action: 'openFile', path })
+    .catch(error => { if (readySession(tab, attempt)) status(`记录最近文件失败 · ${message(error)}`); });
 }
 
 function openRemoteFile(tab, path, trigger) {
   if (origin() !== tab || !readySession(tab) || dialog.open || fileEditor.open) return;
   const source = active;
-  const attempt = tab.attempts;
+  let attempt = tab.attempts;
   const lifetime = new AbortController();
-  let view, editor, savedFile, revision, remotePath, formatRequest;
+  let view, editor, savedFile, revision, remotePath, route, formatRequest;
   let editing = false, busy = false, conflict = false, comparison, reviewed;
+  let resumeRequested = false;
   const title = summaryText('h2', path.split('/').at(-1));
   title.id = 'file-editor-title';
   title.tabIndex = -1;
@@ -5415,7 +5586,7 @@ function openRemoteFile(tab, path, trigger) {
   const comparePanel = node('div', 'file-editor-content file-comparison');
   const compareBody = node('div', 'file-comparison-body');
   const compareNotice = node('span', '', '远端文件已更改。核对差异后可继续保存。');
-  const compareButton = button('查看差异', openComparison, 'outlined');
+  const compareButton = button('查看差异', () => openComparison(), 'outlined');
   const compareBar = node('div', 'file-conflict-bar', compareNotice, compareButton);
   function leaveComparison(accepted) {
     comparison.destroy();
@@ -5435,27 +5606,35 @@ function openRemoteFile(tab, path, trigger) {
     button('返回编辑', () => leaveComparison(false), 'outlined'), finishComparison)),
     node('div', 'file-comparison-labels', remoteLabel, draftLabel), compareBody);
   comparePanel.hidden = compareBar.hidden = true;
+  function showComparison(latest, keepCursor = false) {
+    notice.textContent = '远端版本已变化，请核对差异。';
+    view.search(false);
+    toggleJump(false);
+    comparePanel.hidden = false;
+    content.hidden = true;
+    heading.hidden = true;
+    const breaks = new Set(latest.text.match(/\r\n|\r|\n/g));
+    const ending = breaks.size > 1 ? '混合换行' : breaks.has('\r\n') ? 'CRLF' : breaks.has('\r') ? 'CR' : 'LF';
+    remoteLabel.textContent = `远端最新版本 · 只读 · ${ending}`;
+    draftLabel.textContent = `我的草稿 · 可编辑 · ${view.lineEnding}`;
+    comparison = view.compare(compareBody, latest.text, keepCursor);
+    reviewed = latest;
+  }
+  async function readLatest(sessionAttempt) {
+    const latest = await api.files.readText({ id: tab.id, path: remotePath, expectedRoute: route });
+    if (!readySession(tab, sessionAttempt) || latest.path !== remotePath) throw new Error('连接目标已变化，草稿已保留。');
+    if (latest.tooLarge) throw new Error('远端文件已超过 4 MiB，草稿已保留。');
+    return latest;
+  }
   async function openComparison() {
     if (busy || !editing || !conflict || comparison) return;
     busy = true;
     refresh();
     try {
-      if (!readySession(tab, attempt)) throw new Error('原 SSH 会话已断开，草稿仍可复制。');
-      const latest = await api.files.readText({ id: tab.id, path: remotePath });
+      if (!readySession(tab, attempt)) throw new Error('请先重连以核对远端版本。');
+      const latest = await readLatest(attempt);
       if (!content.isConnected) return;
-      if (!readySession(tab, attempt) || latest.path !== remotePath) throw new Error('连接目标已变化，草稿已保留。');
-      if (latest.tooLarge) throw new Error('远端文件已超过 4 MiB，无法就地对比。草稿已保留。');
-      view.search(false);
-      toggleJump(false);
-      comparePanel.hidden = false;
-      content.hidden = true;
-      heading.hidden = true;
-      const breaks = new Set(latest.text.match(/\r\n|\r|\n/g));
-      const ending = breaks.size > 1 ? '混合换行' : breaks.has('\r\n') ? 'CRLF' : breaks.has('\r') ? 'CR' : 'LF';
-      remoteLabel.textContent = `远端最新版本 · 只读 · ${ending}`;
-      draftLabel.textContent = `我的草稿 · 可编辑 · ${view.lineEnding}`;
-      comparison = view.compare(compareBody, latest.text);
-      reviewed = latest;
+      showComparison(latest);
     } catch (error) {
       heading.hidden = false;
       content.hidden = false;
@@ -5463,6 +5642,40 @@ function openRemoteFile(tab, path, trigger) {
       notice.textContent = message(error);
     } finally { busy = false; refresh(); }
   }
+  async function resumeEditing() {
+    if (busy || !editing || formatRequest || !tabs.has(tab.id)) return;
+    resumeRequested = true;
+    if (tab.status === 'trust') {
+      const challenge = tab.trustChallenge;
+      const accepted = await confirm('核对 SSH 指纹', `${tab.trustStage === 'jump' ? '跳板机' : '目标主机'} · ${endpoint(tab.trustHost || tab.host)}\n${tab.fingerprint}`, '信任并继续');
+      if (content.isConnected && tab.status === 'trust' && tab.trustChallenge === challenge) await trust(tab, accepted === true);
+      return;
+    }
+    if (!readySession(tab)) {
+      if (tab.status !== 'connecting') await connect(tab);
+      return;
+    }
+    resumeRequested = false;
+    const nextAttempt = tab.attempts;
+    busy = true;
+    refresh();
+    try {
+      const latest = await readLatest(nextAttempt);
+      if (!content.isConnected) return;
+      attempt = nextAttempt;
+      if (conflict || latest.revision !== (reviewed?.revision ?? revision)) {
+        conflict = true;
+        showComparison(latest, true);
+      } else {
+        notice.textContent = '已重新连接，远端版本一致，可继续编辑。';
+        editor.focus();
+      }
+    } catch (error) { notice.textContent = message(error); }
+    finally { busy = false; refresh(); }
+  }
+  const reconnect = button('重连并继续编辑', resumeEditing, 'outlined');
+  const connectionMessage = node('span');
+  const connectionBar = node('div', 'file-connection-bar', connectionMessage, reconnect);
   function action(icon, label, run, tooltip = label, primary = false) {
     const control = button(label, run, primary ? 'primary' : '', label);
     control.replaceChildren(chromeIcon(icon), node('span', '', label));
@@ -5480,13 +5693,18 @@ function openRemoteFile(tab, path, trigger) {
   }
   function refresh() {
     edit.disabled = !view || busy;
-    save.disabled = !editing || busy || conflict || Boolean(formatRequest);
-    compareBar.hidden = !editing || !conflict || Boolean(comparison);
+    const connected = readySession(tab, attempt);
+    connectionBar.hidden = !editing || connected;
+    reconnect.disabled = busy || Boolean(formatRequest) || tab.status === 'connecting';
+    reconnect.textContent = tab.status === 'trust' ? '核对指纹并继续' : '重连并继续编辑';
+    connectionMessage.textContent = tab.status === 'ready' ? 'SSH 已重连，需重新核对远端文件。' : `${tab.message || 'SSH 已断开'} · 草稿已保留`;
+    save.disabled = !editing || !connected || busy || conflict || Boolean(formatRequest);
+    compareBar.hidden = !connected || !editing || !conflict || Boolean(comparison);
     compareButton.disabled = busy || Boolean(formatRequest);
     close.disabled = cancel.disabled = busy;
     undo.disabled = !editing || busy || !view?.canUndo;
     redo.disabled = !editing || busy || !view?.canRedo;
-    download.disabled = busy;
+    download.disabled = downloadElse.disabled = busy || !connected;
     search.disabled = go.disabled = wrap.disabled = !view;
     prettify.disabled = !editing || busy || Boolean(formatRequest) || !view?.parser;
     prettify.title = !editing ? '进入编辑后可格式化' : view?.parser ? '格式化当前文件 (Shift+Alt+F)' : `${view.format} 暂无可用的格式化工具`;
@@ -5523,8 +5741,8 @@ function openRemoteFile(tab, path, trigger) {
     refresh();
     notice.textContent = '正在保存…';
     try {
-      if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化。请重新打开文件后合并更改。');
-      const result = await api.files.saveText({ id: tab.id, path: remotePath, text: view.serialize(), revision: reviewed?.revision ?? revision });
+      if (!readySession(tab, attempt)) throw new Error('请先重连并核对远端文件。');
+      const result = await api.files.saveText({ id: tab.id, path: remotePath, text: view.serialize(), revision: reviewed?.revision ?? revision, expectedRoute: route });
       if (!content.isConnected) return;
       if (result.conflict) {
         reviewed = undefined;
@@ -5569,7 +5787,7 @@ function openRemoteFile(tab, path, trigger) {
       busy = true;
       refresh();
       try {
-        const latest = await api.files.readText({id: tab.id, path: remotePath});
+        const latest = await readLatest(attempt);
         if (!content.isConnected) return;
         if (!latest.tooLarge && latest.path === remotePath) reviewed = latest;
       } catch { /* The original preview is still available offline. */ }
@@ -5586,14 +5804,16 @@ function openRemoteFile(tab, path, trigger) {
     preview(stale ? '显示打开时的版本' : '');
   }, '取消编辑，返回预览');
   const close = action('close', '关闭', () => { if (!editing && !busy) fileEditor.close(); });
-  const download = action('import', '下载', async () => {
+  async function downloadCurrent(chooseDirectory) {
     if (busy) return;
     busy = true;
     refresh();
-    try { await downloadRemotePath(tab, attempt, path); }
+    try { await downloadRemotePath(tab, attempt, path, chooseDirectory); }
     catch (error) { notice.textContent = message(error); }
     finally { busy = false; refresh(); }
-  }, '下载远端已保存的文件');
+  }
+  const download = action('import', '下载', () => downloadCurrent(false), '下载远端已保存的文件');
+  const downloadElse = button('…', () => downloadCurrent(true), '', '下载到其他位置…');
   const prettify = action('format', '格式化', async () => {
     if (!editing || busy || formatRequest || !view.parser) return;
     const request = new AbortController();
@@ -5666,7 +5886,7 @@ function openRemoteFile(tab, path, trigger) {
     if (view.jump(jumpInput.value)) { toggleJump(false); editor.focus(); }
     else { jumpInput.setCustomValidity('请输入行号或行:列'); jumpInput.reportValidity(); }
   };
-  const tools = node('div', 'file-editor-tools', download, prettify, search, go, wrap, undo, redo);
+  const tools = node('div', 'file-editor-tools', download, ...(api.files.quickDownloads ? [downloadElse] : []), prettify, search, go, wrap, undo, redo);
   const actions = node('div', 'actions', tools, node('div', 'file-mode-actions', edit, save, close, cancel));
   const identity = node('div', 'file-editor-identity', chromeIcon('file'), node('div', '', title, location));
   const heading = node('header', 'file-editor-heading', identity, actions);
@@ -5695,6 +5915,7 @@ function openRemoteFile(tab, path, trigger) {
   }, { capture: true, signal: lifetime.signal });
   fileEditor.addEventListener('close', () => {
     lifetime.abort();
+    tab.editorConnectionChanged = undefined;
     formatRequest?.abort();
     comparison?.destroy();
     editor?.destroy();
@@ -5704,7 +5925,14 @@ function openRemoteFile(tab, path, trigger) {
       else focusTerminal(source);
     }
   }, { once: true });
-  fileEditor.replaceChildren(heading, compareBar, jumpRow, content, comparePanel, node('footer', 'file-editor-footer',
+  tab.editorConnectionChanged = () => {
+    if (editing && !readySession(tab, attempt)) notice.textContent = '';
+    if (comparison && !readySession(tab, attempt)) leaveComparison(false);
+    if (!['ready', 'connecting', 'trust'].includes(tab.status)) resumeRequested = false;
+    refresh();
+    if (resumeRequested && readySession(tab)) void resumeEditing();
+  };
+  fileEditor.replaceChildren(heading, connectionBar, compareBar, jumpRow, content, comparePanel, node('footer', 'file-editor-footer',
     node('div', 'file-editor-status', mode, modified, notice), position, languagePicker, format, ending));
   syncMode();
   window.overlays.show(fileEditor);
@@ -5738,7 +5966,8 @@ function openRemoteFile(tab, path, trigger) {
       const file = await api.files.readText({ id: tab.id, path });
       if (!fileEditor.open || !content.isConnected) return;
       if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化。请重新打开文件。');
-      ({ path: remotePath, revision } = file);
+      ({ path: remotePath, revision, route } = file);
+      recordOpenedFile(tab, attempt, remotePath);
       if (file.tooLarge) {
         const largeLog = window.TermlumeFileEditor.isLogFile(remotePath) || remotePath === tab.host.logPath;
         if (!largeLog) { notice.textContent = '文件超过 4 MiB，可下载到本机查看。'; return; }
@@ -5753,7 +5982,7 @@ function openRemoteFile(tab, path, trigger) {
             if (!content.isConnected || !fileEditor.open) return;
             if (!readySession(tab, attempt) || active !== source) throw new Error('SSH 会话已变化，请重新打开日志。');
             fileEditor.close();
-            await openFileCommandOutput(tab, request, command);
+            await openCommandOutput(tab, request, command);
           } catch (error) { notice.textContent = message(error); }
           finally { busy = false; if (content.isConnected) refresh(); }
         }
@@ -5847,9 +6076,12 @@ function ensureFiles(tab) {
   }
 }
 
-async function loadFiles(tab, directory, revealName) {
+async function loadFiles(tab, directory, revealName, historyDirection) {
   const files = tab.files;
   const attempt = tab.attempts;
+  const list = origin() === tab && filesOpen && $('files').querySelector('.file-list');
+  const previous = files.directory && { directory: files.directory, query: files.query || '',
+    scrollTop: list ? list.scrollTop : files.scrollTop || 0, sort: files.sort, showHidden: files.showHidden };
   const generation = files.generation = (files.generation || 0) + 1;
   files.loading = true;
   files.error = '';
@@ -5862,10 +6094,17 @@ async function loadFiles(tab, directory, revealName) {
       files.recordVisit = api.files.places({ id: tab.id, action: 'visit', path: result.directory })
         .catch(error => { if (readySession(tab, attempt)) status(`记录最近目录失败 · ${message(error)}`); });
     }
-    if (files.directory !== result.directory) {
+    if (historyDirection || files.directory !== result.directory) {
+      const back = files.back ||= [];
+      const forward = files.forward ||= [];
+      const destination = historyDirection && files[historyDirection].pop();
+      const stack = historyDirection === 'back' ? forward : back;
+      if (previous) { stack.push(previous); if (stack.length > 100) stack.shift(); }
+      if (!historyDirection) forward.length = 0;
       files.selected.clear();
-      files.scrollTop = 0;
-      files.query = '';
+      files.scrollTop = destination?.scrollTop || 0;
+      files.query = destination?.query || '';
+      if (destination) { files.sort = destination.sort; files.showHidden = destination.showHidden; }
     }
     Object.assign(files, result);
     if (revealName) {
@@ -5912,12 +6151,12 @@ async function goToRemoteDirectory(tab) {
   const attempt = tab.attempts;
   const current = tab.files.directory || '';
   const directory = input(current);
-  directory.placeholder = api.files.places ? '输入路径或筛选已记住的目录' : '/var/log';
+  directory.placeholder = api.files.places ? '输入文件名或远端路径' : '/var/log';
   const fields = [field('远端路径', directory)];
   const choices = node('div', 'palette-list directory-places');
   const feedback = node('p', 'dialog-error');
   feedback.setAttribute('role', 'status');
-  let places, filtered = [], query = '', selected;
+  let places, loadingPlaces, filtered = [], query = '', selected;
   let savingFavorite = false;
   const pinCurrent = button('收藏当前目录', () => changeFavorite(current, !places.favorites.includes(current)), 'outlined');
   pinCurrent.disabled = true;
@@ -5937,42 +6176,62 @@ async function goToRemoteDirectory(tab) {
     choices.replaceChildren();
     filtered = [];
     const groups = [
-      ['收藏目录', places.favorites],
-      ['最近目录', places.recent.filter(path => !places.favorites.includes(path))]
+      ['最近打开的文件', places.recentFiles || [], 'file'],
+      ['收藏目录', places.favorites, 'directory'],
+      ['最近目录', places.recent.filter(path => !places.favorites.includes(path)), 'directory']
     ];
-    for (const [title, paths] of groups) {
+    for (const [title, paths, kind] of groups) {
       const matches = paths.filter(path => path.toLowerCase().includes(query.toLowerCase()));
       if (!matches.length) continue;
       choices.append(node('h3', 'palette-group', title));
       for (const path of matches) {
-        filtered.push(path);
-        const open = button('', () => { selected = path; directory.form.requestSubmit(); }, 'directory-choice', `前往 ${path}`);
+        const entry = { path, kind };
+        filtered.push(entry);
+        const open = button('', () => { selected = entry; directory.form.requestSubmit(); }, 'directory-choice', `${kind === 'file' ? '预览' : '前往'} ${path}`);
+        if (kind === 'file') {
+          open.append(node('strong', '', path.split('/').at(-1)), summaryText('small', path));
+          choices.append(node('div', 'directory-choice-row recent-file', open));
+          continue;
+        }
         open.append(summaryText('span', path));
         const favorite = places.favorites.includes(path);
         const pin = button(favorite ? '取消收藏' : '收藏', () => changeFavorite(path, !favorite), '', `${favorite ? '取消收藏' : '收藏'} ${path}`);
         choices.append(node('div', 'directory-choice-row', open, pin));
       }
     }
-    if (!filtered.length) choices.append(node('p', 'muted', query ? '没有匹配的目录，可直接输入路径。' : '暂无目录记录'));
+    if (!filtered.length) choices.append(node('p', 'muted', query ? '没有匹配记录，可直接输入目录路径。' : '暂无浏览记录'));
   }
   if (api.files.places) fields.push(pinCurrent, choices, feedback);
   directory.addEventListener('input', () => { query = directory.value.trim(); render(); });
-  const destination = prompt('前往目录', fields, '前往', () => {
-    const value = directory.value;
-    const keywordMatch = query && !value.includes('/') && !value.startsWith('.') && filtered[0];
-    const path = selected || keywordMatch || terminalPaths.resolve(value, current);
+  const destination = prompt(api.files.places ? '前往远端文件或目录' : '前往目录', fields, '前往', async () => {
+    const value = directory.value.trim();
+    if (query && !places) await loadingPlaces;
+    const match = selected || filtered.find(entry => entry.path === value);
+    if (match) return match;
+    if (query && filtered.length && !value.startsWith('.')) {
+      if (!value.startsWith('/')) return filtered[0];
+      const fileMatch = filtered.find(entry => entry.kind === 'file');
+      if (fileMatch && !value.endsWith('/')) {
+        // An absolute directory typed by the user may also prefix a recent file.
+        try { return await api.files.inspect({ id: tab.id, path: value }); }
+        catch { return fileMatch; }
+      }
+    }
+    const path = terminalPaths.resolve(value, current);
     if (!path) throw new Error('请输入有效的远端目录。');
-    return path;
+    return { kind: 'directory', path };
   });
   directory.select();
   if (api.files.places && directory.form) {
     wireSearchChoices(directory.form, directory, choices, '.directory-choice');
-    void Promise.resolve(tab.files.recordVisit).then(() => api.files.places({ id: tab.id }))
+    loadingPlaces = Promise.all([tab.files.recordVisit, tab.files.recordOpen]).then(() => api.files.places({ id: tab.id }))
       .then(result => { if (choices.isConnected) { places = result; render(); } })
       .catch(error => { feedback.textContent = message(error); });
   }
-  const path = await destination;
-  if (path && filesOpen && origin() === tab && readySession(tab, attempt)) await loadFiles(tab, path);
+  const choice = await destination;
+  if (!choice || !filesOpen || origin() !== tab || !readySession(tab, attempt)) return;
+  if (choice.kind === 'file') openRemoteFile(tab, choice.path);
+  else await loadFiles(tab, choice.path);
 }
 
 function renderFiles() {
@@ -5992,6 +6251,11 @@ function renderFiles() {
   if (tab.status !== 'ready') {
     panel.append(node('div', 'empty-state', settingsIcon('folder'), node('p', 'muted', '连接 SSH 后可浏览文件。')));
     return;
+  }
+  for (const [key, symbol, label] of [['back', '‹', '后退'], ['forward', '›', '前进']]) {
+    const go = button(symbol, () => loadFiles(tab, files[key].at(-1).directory, undefined, key), 'file-icon-button', label);
+    go.disabled = files.loading || !files[key]?.length;
+    close.before(go);
   }
   close.before(button('前往', () => goToRemoteDirectory(tab), '', '前往目录'),
     button('↻', () => loadFiles(tab, files.directory), 'file-icon-button', '刷新远端文件'));
@@ -6029,7 +6293,8 @@ function renderFiles() {
     button('上传文件', () => prepareTransfer(tab, 'up')),
     ...(api.files.directoryUploads ? [button('上传目录', () => prepareTransfer(tab, 'up', undefined, { folder: true }))] : [])
   ]);
-  const download = button('下载所选项', () => prepareTransfer(tab, 'down', selection().map(({ name }) => name)));
+  const downloadSelected = chooseDirectory => prepareTransfer(tab, 'down', selection().map(({ name }) => name), { chooseDirectory });
+  const download = button('下载所选项', () => downloadSelected(false));
   const follow = button('跟踪日志', () => configureCommand(tab, 'follow', logPath()));
   const tail = button('查看末尾', () => configureCommand(tab, 'tail', logPath()));
   const edit=button('外部编辑',()=>externalEdit(tab,logPath()),'outlined');
@@ -6061,7 +6326,8 @@ function renderFiles() {
   const clear = button('清空选择', () => { files.selected.clear(); renderEntries(); });
   const selectedCount = node('small', 'muted');
   const nameHeading = node('span', '', '名称');
-  const selectedActions = menuButton('所选项 ⋯', [...(api.files.readText ? [openSelected] : []), download, follow, tail, ...(api.editors ? [edit] : []),
+  const selectedActions = menuButton('所选项 ⋯', [...(api.files.readText ? [openSelected] : []), download,
+    ...(api.files.quickDownloads ? [button('下载到其他位置…', () => downloadSelected(true))] : []), follow, tail, ...(api.editors ? [edit] : []),
     ...(api.files.mutations ? [rename, remove] : []), clear]);
   const updateSelection = () => {
     const count = selection().length;
@@ -6125,7 +6391,11 @@ function renderFiles() {
       if (kind === 'directory') row.append(fileEntry(name, kind, () => loadFiles(tab, pathOf(tab, name))));
       if (kind === 'other') row.append(summaryText('span', name));
       row.append(node('small', '', kind === 'directory' ? '目录' : kind === 'file' ? bytes(size) : '链接或特殊文件'));
-      if (selectable(kind)) row.append(button('↓', () => prepareTransfer(tab, 'down', [name]), 'file-download', `下载 ${name}`));
+      if (selectable(kind)) {
+        const direct = button('↓', () => prepareTransfer(tab, 'down', [name]), '', `下载 ${name}`);
+        const alternate = api.files.quickDownloads ? [button('…', () => prepareTransfer(tab, 'down', [name], { chooseDirectory: true }), '', `将 ${name} 下载到其他位置…`)] : [];
+        row.append(node('div', 'file-download', direct, ...alternate));
+      }
       rows.push(row);
     }
     if (!entries.length) rows.push(node('div', 'empty-state', settingsIcon('folder'),
@@ -6163,8 +6433,12 @@ function fileEntry(name, kind, action) {
 
 async function externalEdit(tab,path) {
   if(!path) return;
+  const attempt = tab.attempts;
   if(await confirm('外部编辑',`${tab.host.name} · ${path}\n会创建本机临时副本，并用本机文本编辑器打开。保存后回到编辑任务手动上传；远端变化时拒绝覆盖。`,'打开编辑器')) {
-    await api.editors.open({id:tab.id,path});await manageEditorTasks();
+    if (!readySession(tab, attempt)) return;
+    await api.editors.open({id:tab.id,path});
+    recordOpenedFile(tab, attempt, path);
+    await manageEditorTasks();
   }
 }
 async function manageEditorTasks() {
@@ -6222,13 +6496,13 @@ async function createRemoteItem(tab, folder) {
   if (created && readySession(tab, attempt) && tab.files.directory === directory) await loadFiles(tab, directory);
 }
 
-async function prepareTransfer(tab, direction, names, { directory = tab.files.directory, dropTicket, folder } = {}) {
+async function prepareTransfer(tab, direction, names, { directory = tab.files.directory, dropTicket, folder, chooseDirectory } = {}) {
   const attempt = tab.attempts;
-  const preparing = direction === 'down' ? '正在准备下载，请选择本机保存位置…' : '正在准备上传…';
+  const preparing = direction === 'down' ? '正在准备下载…' : '正在准备上传…';
   if (origin() === tab) status(preparing);
   let prepared;
   try {
-    prepared = await api.files.prepare({ id: tab.id, direction, directory, names, dropTicket, folder });
+    prepared = await api.files.prepare({ id: tab.id, direction, directory, names, dropTicket, folder, chooseDirectory });
   } finally {
     if ($('status').textContent === preparing && origin() === tab) status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
   }
@@ -6242,6 +6516,11 @@ async function confirmTransfer(tab, attempt, direction, directory, prepared, rec
     if (!readySession(tab, attempt)) return;
     const choices = node('select');
     const conflicts = files.filter((file) => file.exists);
+    if (prepared.quickDownload && !conflicts.length && files.every(file => !file.skipped)) {
+      await api.files.enqueue({ ticket, policy: 'skip' });
+      status('已加入下载队列。');
+      return;
+    }
     for (const [value, label] of [['skip', '跳过同名文件'], ['keep', '另存为新名称'], ['replace', '覆盖已确认的同名普通文件']]) {
       if (value === 'replace' && conflicts.some((file) => !file.canReplace)) continue;
       const option = node('option', '', label);
@@ -6259,9 +6538,12 @@ async function confirmTransfer(tab, attempt, direction, directory, prepared, rec
     const skipped = files.reduce((sum, file) => sum + (file.skipped || 0), 0);
     if (skipped) fields.push(node('p', 'muted', `将跳过 ${skipped} 个链接、特殊文件或不支持的文件名。`));
     if (conflicts.length) fields.push(field('同名文件', selectControl(choices, '同名文件处理方式')));
+    const remember = input('', 'checkbox');
+    remember.checked = Boolean(prepared.replaceInvalidDirectory);
+    if (prepared.canRememberDirectory) fields.push(node('label', 'checkbox-row', remember, '记住此主机的下载目录'));
     const confirmed = await prompt(record ? '核对重试路径' : direction === 'up' ? '确认上传' : '确认下载', fields, '开始传输', async () => {
       if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化，请重新选择文件。');
-      await api.files.enqueue({ ticket, policy: choices.value });
+      await api.files.enqueue({ ticket, policy: choices.value, rememberDirectory: remember.checked });
       return true;
     });
     if (confirmed) status('已加入传输队列，可在「传输记录」查看进度。');
@@ -6289,6 +6571,7 @@ function loadTransferHistory() {
 }
 
 function forgetJob(id) {
+  transferHostsChanged = true;
   jobRows.get(id)?.element.remove();
   jobRows.delete(id);
   jobs.delete(id);
@@ -6312,7 +6595,42 @@ async function removeTransferHistory(id = null) {
   }
 }
 
+function transferHostKey(job) {
+  const id = job.route?.target?.id || job.hostId;
+  return id ? `id:${id}` : `name:${job.host || ''}`;
+}
+
+function refreshTransferFilters() {
+  const host = $('transfer-host');
+  if (transferHostsChanged) {
+    transferHostsChanged = false;
+    const entries = new Map();
+    for (const job of jobs.values()) {
+      const target = job.route?.target;
+      const address = target?.address && endpoint(target);
+      entries.set(transferHostKey(job), [job.host || '未知主机', address || '']);
+    }
+    const selected = host.value;
+    host.replaceChildren(new Option('全部主机', ''));
+    for (const [key, [label, address]] of [...entries].sort((a,b) => a[1][0].localeCompare(b[1][0]))) {
+      const option = new Option(label, key);
+      option.dataset.description = address || '仅记录了主机名称';
+      host.add(option);
+    }
+    host.value = entries.has(selected) ? selected : '';
+  }
+  const state = $('transfer-status');
+  if (state.dataset.page !== transferPage) {
+    state.dataset.page = transferPage;
+    const statuses = transferPage === 'active' ? ['queued','running','paused','verifying','committing']
+      : ['done','failed','canceled','skipped','unverified'];
+    state.replaceChildren(new Option('全部状态', ''), ...statuses.map(key => new Option(jobLabels[key], key)));
+    state.value = transferStatuses[transferPage];
+  }
+}
+
 function renderTransferSummary() {
+  refreshTransferFilters();
   let running = 0;
   let failed = 0;
   let shownActive = 0;
@@ -6322,6 +6640,8 @@ function renderTransferSummary() {
   for (const job of jobs.values()) {
     const names = [job.remote?.split('/').pop(), job.local?.split(/[\\/]/).pop()];
     const visible = (!transferDirection || job.direction === transferDirection) &&
+      (!$('transfer-host').value || $('transfer-host').value === transferHostKey(job)) &&
+      (!transferStatuses[transferPage] || transferStatuses[transferPage] === job.status) &&
       (!query || names.some(name => name?.toLocaleLowerCase().includes(query)));
     jobRows.get(job.id).element.hidden = !visible;
     if (job.finishedAt) {
@@ -6342,7 +6662,7 @@ function renderTransferSummary() {
   $('transfer-active-page').hidden = history;
   $('transfer-history-page').hidden = !history;
   $('clear-transfers').hidden = !history;
-  const filtered = query || transferDirection;
+  const filtered = query || transferDirection || $('transfer-host').value || transferStatuses[transferPage];
   $('transfer-active-empty').textContent = filtered ? '没有匹配的进行中任务。' : '暂无进行中的传输。';
   $('transfer-history-empty').textContent = filtered ? '没有匹配的历史记录。' : '暂无传输记录。';
   $('transfer-active-empty').hidden = shownActive > 0;
@@ -6350,11 +6670,40 @@ function renderTransferSummary() {
   $('clear-transfers').disabled = !historyReady || editingHistory || !canClear;
 }
 
+function updateTransferRate(row, job, now = performance.now()) {
+  row.rate.hidden = job.status !== 'running' || Boolean(job.finishedAt);
+  if (row.rate.hidden) { row.samples = []; return; }
+  const samples = row.samples;
+  if (samples.length && job.bytes < samples.at(-1).bytes) samples.length = 0;
+  while (samples.length > 1 && samples[1].time <= now - 5000) samples.shift();
+  const first = samples[0];
+  if (!samples.length || now - samples.at(-1).time >= 250) samples.push({ time: now, bytes: job.bytes });
+  const elapsed = first && now - first.time;
+  if (!elapsed || elapsed < 500) { row.rate.textContent = '正在估算速度…'; return; }
+  const speed = (job.bytes - first.bytes) * 1000 / elapsed;
+  const seconds = speed > 0 && job.size > 0 ? Math.ceil(Math.max(0, job.size - job.bytes) / speed) : undefined;
+  let eta = '待估算';
+  if (seconds !== undefined) {
+    eta = seconds < 60 ? `${seconds} 秒` : seconds < 3600 ? `${Math.ceil(seconds / 60)} 分钟` : `${(seconds / 3600).toFixed(1)} 小时`;
+  }
+  row.rate.textContent = `${bytes(Math.round(speed))}/s · 预计剩余 ${eta}`;
+}
+
+function tickTransferRates() {
+  let running = false;
+  for (const job of jobs.values()) if (job.status === 'running' && !job.finishedAt) {
+    updateTransferRate(jobRows.get(job.id), job);
+    running = true;
+  }
+  if (!running) { clearInterval(transferClock); transferClock = undefined; }
+}
+
 function updateJob(event, archived = false) {
   if (removedJobs.has(event.id)) return;
   const previous = jobs.get(event.id);
   if (previous?.finishedAt && !event.finishedAt) return;
   const job = { ...event, archived };
+  if (!previous || transferHostKey(previous) !== transferHostKey(job) || previous.host !== job.host) transferHostsChanged = true;
   const finished = Boolean(job.finishedAt);
   const firstLiveCompletion = finished && !archived && (!previous?.finishedAt || previous.archived);
   jobs.set(job.id, job);
@@ -6367,14 +6716,15 @@ function updateJob(event, archived = false) {
     const meter = node('progress');
     meter.setAttribute('aria-label', '传输进度');
     const state = node('span', 'job-state');
+    const rate = node('small', 'muted');
     const controls = node('div', 'job-actions');
     const error = node('div', 'job-error');
     const element = node('article', 'job',
       node('div', 'job-header', node('div', 'job-identity', name, meta), state),
       node('div', 'job-paths', node('small', '', '来源'), source, node('small', '', '目标'), target),
-      meter, error, controls);
+      meter, rate, error, controls);
     element.dataset.id = job.id;
-    row = { element, name, meta, source, target, meter, state, controls, error };
+    row = { element, name, meta, source, target, meter, state, rate, samples: [], controls, error };
     jobRows.set(job.id, row);
   }
   const upload = job.direction === 'up';
@@ -6388,6 +6738,8 @@ function updateJob(event, archived = false) {
   row.meter.hidden = finished;
   row.state.textContent = `${jobLabels[job.status]} · ${bytes(job.bytes)} / ${bytes(job.size)}`;
   row.state.dataset.status = job.status;
+  updateTransferRate(row, job);
+  if (!row.rate.hidden && !transferClock) transferClock = setInterval(tickTransferRates, 1000);
   row.error.textContent = job.message;
   row.error.hidden = !job.message;
   renderJobActions(job, row);
@@ -6424,7 +6776,7 @@ async function continueTransferAction(tab) {
     if (action === 'locate') {
       const {path, route} = await api.files.remoteLocation({ id: tab.id, recordId: job.id, legacyHost });
       const current = jobs.get(job.id);
-      if (current) current.route = route;
+      if (current) { current.route = route; transferHostsChanged = true; }
       if (active !== tab || !readySession(tab, attempt) || dialog.open || fileEditor.open) return;
       const split = path.lastIndexOf('/');
       filesOpen = true;
@@ -6461,7 +6813,8 @@ async function reconnectTransfer(job, action) {
   await refreshHosts();
   if (vaultStatus.locked || dialog.open) return;
   const original = job.route?.target;
-  let host = original && hosts.find(item => item.id === original.id);
+  const temporary = original && tabs.get(original.id);
+  let host = original && (hosts.find(item => item.id === original.id) || (temporary?.temporary && temporary.host));
   const matchesEndpoint = (entry, saved) => entry && entry.address.toLowerCase() === saved.address &&
     entry.port === saved.port && entry.username === saved.username;
   const jump = job.route?.jump;
@@ -6489,12 +6842,15 @@ async function reconnectTransfer(job, action) {
     !item.closing && ['ready','connecting','trust'].includes(item.status))
     .sort((a,b) => Number(readySession(b)) - Number(readySession(a)) ||
       Number(b.id === job.sessionId) - Number(a.id === job.sessionId))[0];
-  if (!tab) tab = await openHost(host, {force:true, connectNow:false});
+  if (!tab && temporary?.temporary && !temporary.closing && !temporary.pendingTransfer) {
+    tab = temporary;
+    selectTab(tab);
+  } else if (!tab) tab = await openHost(host, {force:true, connectNow:false});
   else selectTab(tab);
   if (!tab || vaultStatus.locked) return;
   tab.pendingTransfer = {job, action, legacyHost: original ? undefined : host.id};
   if (readySession(tab)) return continueTransferAction(tab);
-  if (tab.status === 'idle') await connect(tab, false, false, true);
+  if (['idle', 'closed'].includes(tab.status)) await connect(tab, false, false, true);
 }
 
 function renderJobActions(job, row) {
@@ -6584,7 +6940,8 @@ api.onEvent((event) => {
     renderConnectionPage(tab);
     if (tab === active) status(`${tab.host.name} · ${event.message}`);
   } else if (tab?.kind === 'shell' && event.type === 'session' && event.status === 'closed' && event.exited) {
-    removeTab(tab);
+    if (tab.editorConnectionChanged) updateSession(tab, 'closed', event.message || 'SSH 会话已结束。');
+    else removeTab(tab);
   } else if (tab) {
     if (event.retryWithPassword && !event.retryable) tab.promptForPassword = true;
     updateSession(tab, event.status, event.message);
@@ -6639,6 +6996,7 @@ $('host-search-form').addEventListener('submit', (event) => {
   event.preventDefault();
   hostSearchAction?.().catch((error) => status(message(error)));
 });
+$('host-connect-once').addEventListener('click', () => startTemporaryConnection(hostTarget($('host-search').value)).catch(error => status(message(error))));
 $('library-button').addEventListener('click', () => selectTab(undefined, libraryView));
 $('tag-filter').addEventListener('change', renderHosts);
 $('host-actions').addEventListener('click', showHostActions);
@@ -6816,6 +7174,13 @@ for (const control of $('transfer-pages').children) control.onclick = () => {
   renderTransferSummary();
 };
 $('transfer-search').addEventListener('input', renderTransferSummary);
+selectControl($('transfer-host'), '筛选传输主机', {searchable:true, placeholder:'搜索主机名称或地址'});
+selectControl($('transfer-status'), '筛选传输状态');
+$('transfer-host').addEventListener('change', renderTransferSummary);
+$('transfer-status').addEventListener('change', () => {
+  transferStatuses[transferPage] = $('transfer-status').value;
+  renderTransferSummary();
+});
 $('clear-transfers').addEventListener('click', () => removeTransferHistory().catch((error) => status(message(error))));
 for (const control of transferFilters) {
   control.addEventListener('click', () => {

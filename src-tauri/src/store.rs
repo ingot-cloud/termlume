@@ -340,19 +340,25 @@ impl Default for LockSettings {
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct DirectoryPlaces {
     pub recent: Vec<String>,
     pub favorites: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_directory: Option<PathBuf>,
 }
 
 impl DirectoryPlaces {
     pub fn change(&mut self, action: &str, path: String) -> Result<bool, String> {
         match action {
-            "visit" => {
-                if self.recent.first() == Some(&path) { return Ok(false); }
-                self.recent.retain(|item| item != &path);
-                self.recent.insert(0, path);
-                self.recent.truncate(12);
+            "visit" | "openFile" => {
+                let (items, limit) = if action == "visit" { (&mut self.recent, 12) } else { (&mut self.recent_files, 30) };
+                if items.first() == Some(&path) { return Ok(false); }
+                items.retain(|item| item != &path);
+                items.insert(0, path);
+                items.truncate(limit);
             }
             "pin" => {
                 if self.favorites.contains(&path) { return Ok(false); }

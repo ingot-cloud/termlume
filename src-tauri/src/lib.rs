@@ -628,6 +628,7 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             blocking(move || keys::copy(&key)).await?;
         }
         "ssh:connect" => ssh::connect(ws, parse(value)?)?,
+        "ssh:save-temporary" => return ssh::save_temporary(ws, id(&value)?),
         "forwards:list" => {
             ws.store.lock().unwrap().data()?;
             return Ok(ws.forwards.list());
@@ -693,14 +694,11 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             let mut store = ws.store.lock().unwrap();
             let data = store.data()?;
             session.check_route(data)?;
-            let host = session.host.id;
-            let mut places = data.directory_places.get(&host).cloned().unwrap_or_default();
+            let mut places = session.places(data);
             if let Some(action) = value["action"].as_str() {
                 let path = ssh::remote_path(string(&value["path"])?)?;
                 if places.change(action, path)? {
-                    let mut next = data.clone();
-                    next.directory_places.insert(host, places.clone());
-                    store.update(next)?;
+                    session.set_places(&mut store, places.clone())?;
                 }
             }
             return Ok(json!(places));
@@ -715,8 +713,14 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             ws.store.lock().unwrap().data()?;
             let session = ws.connections.connected(id(&value["id"])?)?;
             let path = string(&value["path"])?;
+            let route = session.transfer_route();
+            if value.get("expectedRoute").is_some_and(|expected| expected != &route) {
+                return Err("SSH 主机或跳板机身份已变化，草稿已保留。".into());
+            }
             return if name == "files:read-text" {
-                transfer::read_text(&session, path).await
+                let mut file = transfer::read_text(&session, path).await?;
+                file["route"] = route;
+                Ok(file)
             } else {
                 transfer::save_text(
                     ws,
@@ -822,13 +826,13 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             let request: transfer::PrepareRequest = parse(value)?;
             return ws
                 .transfers
-                .prepare(ws.connections.connected(request.id)?, request)
+                .prepare(ws, ws.connections.connected(request.id)?, request)
                 .await;
         }
         #[cfg(desktop)]
         "files:enqueue" => {
             ws.transfers
-                .accept(ws, id(&value["ticket"])?, parse(value["policy"].clone())?)?
+                .accept(ws, id(&value["ticket"])?, parse(value["policy"].clone())?, value["rememberDirectory"] == true)?
         }
         #[cfg(desktop)]
         "files:discard" => ws.transfers.discard(id(&value)?),

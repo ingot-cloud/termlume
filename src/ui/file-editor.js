@@ -269,7 +269,7 @@ export function open(parent, path, text, onChange, dark, onPosition = () => {}, 
     get parser() {
       return format === 'Shell' && otherShell ? undefined : formatters[format];
     },
-    compare(parent, remoteText) {
+    compare(parent, remoteText, keepCursor = false) {
       const syntax = [language.get(editor.state), syntaxHighlighting(highlighting), EditorView.lineWrapping,
         EditorView.theme({}, { dark }), EditorState.phrases.of(phrases)];
       const comparison = new MergeView({
@@ -283,7 +283,8 @@ export function open(parent, path, text, onChange, dark, onPosition = () => {}, 
               selection: update.state.selection, annotations: Transaction.userEvent.of('input.merge') });
           })] }
       });
-      if (comparison.chunks.length) goToNextChunk(comparison.b);
+      if (keepCursor) comparison.b.dispatch({ selection: editor.state.selection, scrollIntoView: true });
+      else if (comparison.chunks.length) goToNextChunk(comparison.b);
       comparison.b.focus();
       return comparison;
     },

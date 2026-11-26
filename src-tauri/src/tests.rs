@@ -17,6 +17,10 @@ async fn sftp_places_are_local_to_each_host_and_survive_restart() {
         for i in 0..14 { places.change("visit", format!("/dir/{i}")).unwrap(); }
         places.change("visit", "/dir/5".into()).unwrap();
         places.change("pin", "/pinned-dir".into()).unwrap();
+        for name in ["/one/nginx.conf", "/two/nginx.conf", "/one/nginx.conf"] {
+            places.change("openFile", name.into()).unwrap();
+        }
+        places.download_directory = Some(home.path().into());
         assert!(!places.change("pin", "/pinned-dir".into()).unwrap());
         assert_eq!(places.recent.len(), 12);
         assert_eq!(places.recent[0], "/dir/5");
@@ -32,6 +36,9 @@ async fn sftp_places_are_local_to_each_host_and_survive_restart() {
     assert_eq!(places[&first].favorites, ["/pinned-dir"]);
     assert_eq!(places[&second].favorites, ["/another-dir"]);
     assert!(places[&second].recent.is_empty());
+    assert_eq!(places[&first].recent_files, ["/one/nginx.conf", "/two/nginx.conf"]);
+    assert_eq!(places[&first].download_directory.as_deref(), Some(home.path()));
+    assert!(places[&second].recent_files.is_empty() && places[&second].download_directory.is_none());
 }
 
 #[test]
@@ -768,6 +775,50 @@ fn failed_legacy_auto_unlock_conversion_preserves_settings_for_manual_retry() {
     assert!(!store.startup_unlock.as_ref().unwrap().is_legacy());
     drop(store);
     assert!(Store::open(profile.path(), None).unwrap().data.is_some());
+}
+
+#[tokio::test]
+#[cfg(unix)]
+#[ignore = "requires the isolated OpenSSH fixture"]
+async fn temporary_ssh_requires_verified_login_and_explicit_save() {
+    let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
+    let port: u16 = std::fs::read_to_string(fixture.join("openssh-port")).unwrap().trim().parse().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(), None);
+    let mut rx = events(&ws);
+    for promote in [false, true] {
+        let id = Uuid::new_v4();
+        let target = json!({"id":id,"address":"127.0.0.1","port":port,"username":std::env::var("USER").unwrap(),
+            "auth":"key","keyPath":fixture.join("client")});
+        let mut request = json!({"id":id,"temporary":true,"expected":target,"secret":"","remember":true});
+        assert!(dispatch(&ws,"ssh:connect",request.clone()).await.is_err());
+        request["remember"] = json!(false);
+        call(&ws, "ssh:connect", request).await;
+        let challenge = until(&mut rx, |e| e["type"] == "trust" && e["id"] == json!(id)).await;
+        assert!(dispatch(&ws, "ssh:save-temporary", json!(id)).await.is_err());
+        call(&ws, "ssh:trust", json!({"id":id,"accepted":true,"challenge":challenge["challenge"]})).await;
+        let connected = until(&mut rx, |e| e["type"] == "session" && e["id"] == json!(id)).await;
+        assert_eq!(connected["status"], "ready", "{connected}");
+        call(&ws, "files:places", json!({"id":id,"action":"openFile","path":"/tmp/test.conf"})).await;
+        {
+            let store = ws.store.lock().unwrap();
+            let data = store.data().unwrap();
+            assert!(data.hosts.is_empty() && data.fingerprints.is_empty() && data.directory_places.is_empty() && data.recent.is_empty());
+        }
+        if promote {
+            let saved = call(&ws, "ssh:save-temporary", json!(id)).await;
+            assert_eq!(saved["id"], json!(id));
+            assert_eq!(saved["keyPath"], target["keyPath"]);
+            assert_eq!(call(&ws, "ssh:save-temporary", json!(id)).await, saved);
+            let store = ws.store.lock().unwrap();
+            let data = store.data().unwrap();
+            assert_eq!(data.hosts.len(), 1);
+            assert_eq!(data.fingerprints[0].fingerprint, challenge["fingerprint"].as_str().unwrap());
+            assert_eq!(data.directory_places[&id].recent_files, ["/tmp/test.conf"]);
+            assert!(data.recent.contains_key(&id));
+        }
+        call(&ws, "ssh:close", json!(id)).await;
+    }
 }
 
 async fn connect_tab(
@@ -2999,10 +3050,15 @@ async fn macos_remote_mutations_upload_directory_and_edit_conflicts() {
         .is_empty());
     let opened = call(&ws, "files:read-text", json!({"id":tab,"path":target})).await;
     assert_eq!(opened["text"], "approved local text");
+    let mut different_route = opened["route"].clone();
+    different_route["target"]["fingerprint"] = json!("different host key");
+    assert!(dispatch(&ws, "files:read-text", json!({"id":tab,"path":target,"expectedRoute":different_route})).await.is_err());
+    assert!(dispatch(&ws, "files:save-text", json!({"id":tab,"path":target,"expectedRoute":different_route,
+        "revision":opened["revision"],"text":"wrong host"})).await.is_err());
     let saved = call(
         &ws,
         "files:save-text",
-        json!({"id":tab,"path":opened["path"],"revision":opened["revision"],"text":"新内容\r\n"}),
+        json!({"id":tab,"path":opened["path"],"revision":opened["revision"],"text":"新内容\r\n","expectedRoute":opened["route"]}),
     )
     .await;
     assert_eq!(std::fs::read(&target).unwrap(), "新内容\r\n".as_bytes());
@@ -3036,6 +3092,28 @@ async fn macos_remote_mutations_upload_directory_and_edit_conflicts() {
     assert_eq!(places, json!({"recent":["/var/log"],"favorites":["/var/log"]}));
     let places = call(&ws, "files:places", json!({"id":tab,"action":"unpin","path":"/var/log"})).await;
     assert_eq!(places["favorites"], json!([]));
+    let downloads = tempfile::tempdir().unwrap();
+    let directory = downloads.path().canonicalize().unwrap();
+    let host_id = ws.connections.connected(tab).unwrap().host.id;
+    {
+        let mut store = ws.store.lock().unwrap();
+        let mut data = store.data().unwrap().clone();
+        data.directory_places.entry(host_id).or_default().download_directory = Some(directory.clone());
+        store.update(data).unwrap();
+    }
+    let name = target.file_name().unwrap().to_str().unwrap();
+    let download = json!({"id":tab,"direction":"down","directory":target.parent(),"names":[name]});
+    let fresh = call(&ws, "files:prepare", download.clone()).await;
+    assert_eq!(fresh["quickDownload"], true);
+    assert_eq!(fresh["files"][0]["exists"], false);
+    call(&ws, "files:enqueue", json!({"ticket":fresh["ticket"],"policy":"skip"})).await;
+    let result = until(&mut rx, |e| e["type"] == "transfer" && e["direction"] == "down"
+        && matches!(e["status"].as_str(), Some("done" | "failed"))).await;
+    assert_eq!(result["status"], "done", "{result}");
+    assert_eq!(std::fs::read(directory.join(name)).unwrap(), b"edit\n");
+    let duplicate = call(&ws, "files:prepare", download).await;
+    assert_eq!(duplicate["files"][0]["canReplace"], true);
+    call(&ws, "files:discard", duplicate["ticket"].clone()).await;
     std::fs::write(&target, b"binary\0").unwrap();
     assert!(dispatch(&ws, "files:read-text", json!({"id":tab,"path":target}))
         .await

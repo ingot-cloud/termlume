@@ -538,6 +538,52 @@
     assert(dialog.querySelectorAll('.palette-choice').length === 1 && dialog.querySelector('.palette-choice').textContent.startsWith('独立执行'), '多行命令保留独立执行预览');
     dialog.close(); await multi;
     const beforeShortcut = tabs.size;
+    {
+      const listHistory = api.history.list;
+      const rows = [
+        {hostId:'api', host:'API', endpoint:'ops@prod:22', command:'journalctl -u api --lines 10', at:1},
+        {host:'旧主机', endpoint:'ops@old:22', command:'pwd\ndate', at:2},
+        {hostId:'stage', host:'API', endpoint:'ops@stage:22', command:'journalctl -u api --lines 80', at:3}
+      ];
+      api.history.list = async () => rows;
+      const sent = () => previewCalls.filter(([type]) => type === 'input' || type === 'command-start');
+      const start = sent().length;
+      const opened = commandHistory(production); await tick();
+      const host = dialog.querySelector('select');
+      const search = dialog.querySelector('input[type=search]');
+      const cards = () => [...dialog.querySelectorAll('.command-history-list section')];
+      assert(cards()[0].textContent.includes(rows[2].command) && host.options.length === 4, '同名主机按 ID 区分，旧记录可筛选，命令按最近时间展示');
+      host.value='id:stage'; host.dispatchEvent(new Event('change'));
+      search.value='80 JOURNAL'; search.dispatchEvent(new Event('input'));
+      assert(cards().length === 1 && cards()[0].textContent.includes('ops@stage:22'), '组合主机和多个关键词，匹配命令与参数，不区分大小写');
+      search.value='no-match'; search.dispatchEvent(new Event('input'));
+      assert(!cards().length && dialog.textContent.includes('没有匹配的命令'), '历史筛选为空时保留筛选条件');
+      search.value=''; search.dispatchEvent(new Event('input'));
+      findButton(cards()[0], '填入终端').click(); await opened;
+      const [[kind, payload]] = sent().slice(start);
+      assert(sent().length === start+1 && kind==='input' && payload.id===production.id && payload.data===rows[2].command &&
+        active===production && tabs.size===beforeShortcut, '填入其他主机的历史只向当前终端发送原文，不发送回车或启动独立执行');
+      const multiline = commandHistory(production); await tick();
+      findButton(cards()[1], '填入终端').click(); await tick();
+      assert(dialog.querySelector('textarea')?.value===rows[1].command && sent().length===start+1, '终端不支持多行粘贴时先编辑，原文不发送');
+      dialog.querySelector('textarea').value='date -u';
+      findButton(dialog,'填入终端').click(); await multiline;
+      assert(sent().at(-1)[1].data==='date -u', '多行历史可提取成可编辑的单行输入');
+      const bracketed = sequence => new Promise(resolve => production.terminal.write(sequence, resolve));
+      await bracketed('\x1b[?2004h');
+      const batch = commandHistory(production); await tick(); findButton(cards()[1], '填入终端').click(); await batch;
+      assert(sent().at(-1)[1].data==='\x1b[200~pwd\rdate\x1b[201~', '支持括号粘贴时，多行历史作为完整粘贴内容发送，结尾不附加回车');
+      await bracketed('\x1b[?2004l');
+      const repeat = commandHistory(production); await tick(); findButton(cards()[0], '执行到当前会话').click(); await tick();
+      assert(dialog.textContent.includes('再次执行') && dialog.textContent.includes('ops@stage:22'), '独立再次执行保留原目标和当前目标的确认');
+      const beforeReconnect = sent().length;
+      production.attempts++;
+      findButton(dialog,'执行').click();
+      const failure = await repeat.catch(error=>error.message);
+      assert(failure?.includes('会话已变化') && sent().length===beforeReconnect, '重连后旧确认不能把命令发送给新的会话');
+      production.attempts--;
+      api.history.list = listHistory;
+    }
     const shortcut = configureCommand(production, 'disk');
     findButton(dialog, '填入终端').click();
     await shortcut;
@@ -568,7 +614,7 @@
     await tick();
     api.files.readText = readText;
     assert(document.activeElement.id === 'file-editor-title' &&
-      [...fileEditor.querySelectorAll('.actions button:not([hidden])')].map(b => b.textContent).join('、') === '下载、格式化、查找、跳行、自动换行、编辑、关闭' && findButton(fileEditor, '编辑').disabled,
+      [...fileEditor.querySelectorAll('.actions button:not([hidden])')].map(b => b.textContent).join('、') === '下载、…、格式化、查找、跳行、自动换行、编辑、关闭' && findButton(fileEditor, '编辑').disabled,
       '文件无法编辑时，焦点停在标题，操作顺序一致');
     findButton(fileEditor, '关闭').click();
     await tick();
@@ -670,6 +716,23 @@
     assert(findButton(dialog, '前往 /var/log/归档') && findButton(dialog, `取消收藏 ${priorDirectory}`), '上次收藏和本次访问都可在前往弹窗找到');
     findButton(dialog, `取消收藏 ${priorDirectory}`).click(); await tick();
     findButton(dialog, '取消').click(); await tick();
+    {
+      const filter = $('files').querySelector('input[type=search]');
+      filter.value = 'nginx'; filter.dispatchEvent(new Event('input'));
+      findButton($('files'), 'nginx').click(); await tick();
+      findButton($('files'), '后退').click(); await tick();
+      assert(production.files.query === 'nginx' && production.files.directory === '/var/log/归档', '后退恢复目录筛选词');
+      findButton($('files'), '前进').click(); await tick();
+      assert(production.files.query === '' && production.files.directory.endsWith('/nginx'), '前进恢复子目录视图');
+      findButton($('files'), '后退').click(); await tick();
+      findButton($('files'), '前往').click(); await tick();
+      const search = dialog.querySelector('input');
+      search.value = 'config.json'; search.dispatchEvent(new Event('input'));
+      search.form.requestSubmit(); await tick();
+      assert(fileEditor.open && fileEditor.querySelector('.file-editor-heading p').textContent.endsWith('/srv/app/config.json'),
+        '文件名匹配到最近文件，回车直接预览完整路径');
+      findButton(fileEditor, '关闭').click(); await tick();
+    }
     findButton($('files'), '新建 / 上传').click();
     assert([...hostMenu.panel.querySelectorAll('button')].map(b => b.textContent).join('、') === '新建文件、新建目录、上传文件、上传目录',
       '新建和上传共用一个菜单');
@@ -773,11 +836,20 @@
     findButton(fileEditor, '编辑').click();
     fileEditor.querySelector('.cm-content').focus();
     document.execCommand('insertText', false, 'draft'); await tick();
+    const draftEditor = fileEditor.querySelector('.cm-content');
+    const caret = fileEditor.querySelector('.file-editor-position').textContent;
+    previewListener({ type:'session', id:production.id, status:'closed', message:'连接中断' });
+    assert(findButton(fileEditor, '保存').disabled && !fileEditor.querySelector('.file-connection-bar').hidden, '断线保留编辑器并提供重连入口');
+    findButton(fileEditor, '重连并继续编辑').click(); await tick();
+    assert(!findButton(fileEditor, '保存').disabled && draftEditor === fileEditor.querySelector('.cm-content') &&
+      draftEditor.textContent.includes('draft') && fileEditor.querySelector('.file-editor-position').textContent === caret, '原主机重连后草稿和光标保留在原位置');
     api.files.saveText = async () => ({conflict:true});
     api.files.readText = async ({path}) => ({path,text:'Remote change\r\n',revision:'review-2'});
-    findButton(fileEditor, '保存').click(); await tick();
-    assert(!fileEditor.querySelector('.file-conflict-bar').hidden && findButton(fileEditor, '保存').disabled, '发生冲突时暂停保存并提供就地对比');
-    findButton(fileEditor, '查看差异').click(); await tick();
+    previewListener({ type:'session', id:production.id, status:'closed', message:'连接中断' });
+    findButton(fileEditor, '重连并继续编辑').click(); await tick();
+    assert(findButton(fileEditor, '保存').disabled && !fileEditor.querySelector('.file-comparison').hidden &&
+      fileEditor.querySelector('[role=status]').textContent.includes('远端版本已变化'),
+      '重连发现远端改动会直接打开并排对比并阻止保存');
     const theirs = fileEditor.querySelector('[aria-label="远端最新内容"]');
     const mine = fileEditor.querySelector('[aria-label="我的草稿"]');
     assert(theirs.textContent.includes('Remote change') && !theirs.isContentEditable && mine.isContentEditable && mine.textContent.includes('draft'), '差异并排显示只读远端和可写草稿');
@@ -812,6 +884,16 @@
     api.files.prepareRetry = async value => {previewCalls.push(['prepare-retry',value]); return {ticket:'retry-ticket',files:[{exists:true,canReplace:true}]};};
     api.files.discard = async ticket => previewCalls.push(['discard-ticket',ticket]);
     api.files.enqueue = async request => previewCalls.push(['enqueue',request]);
+    {
+      const ticket = 'quick-download';
+      await confirmTransfer(production, production.attempts, 'down', '/var', {ticket, quickDownload:true, files:[{target:'/local/new.log'}]});
+      assert(!dialog.open && previewCalls.some(([action, request]) => action === 'enqueue' && request.ticket === ticket && request.policy === 'skip'),
+        '记住目录后无同名文件直接入队');
+      const conflict = confirmTransfer(production, production.attempts, 'down', '/var', {ticket:'duplicate', quickDownload:true,
+        files:[{target:'/local/new.log',exists:true,canReplace:true}]});
+      assert(dialog.open && dialog.querySelector('select').options.length === 3, '快捷下载遇到同名文件仍展示三种处理方式');
+      findButton(dialog, '取消').click(); await conflict;
+    }
     updateJob(record,true);
     findButton(jobRows.get(record.id).controls,'重新传输').click(); await tick();
     assert(dialog.open && dialog.textContent.includes(record.local) && dialog.textContent.includes(record.remote) &&
@@ -838,8 +920,8 @@
     await loadFiles(production,directoryBeforeLocate);
     forgetJob(record.id);
     const displayJobs = [
-      {id:'pages-down',direction:'down',remote:'/log/Reports.ZIP',local:'/tmp/Reports (2).ZIP',status:'done',finishedAt:8},
-      {id:'pages-up',direction:'up',remote:'/log/app.log',local:'/tmp/App.log',status:'done',finishedAt:9},
+      {id:'pages-down',host:'生产机',route:{target:production.host},direction:'down',remote:'/log/Reports.ZIP',local:'/tmp/Reports (2).ZIP',status:'failed',finishedAt:8},
+      {id:'pages-up',host:'预发机',direction:'up',remote:'/log/app.log',local:'/tmp/App.log',status:'done',finishedAt:9},
       {id:'pages-paused',direction:'up',remote:'/log/job.bin',local:'/tmp/job.bin',status:'paused'}
     ];
     for (const row of displayJobs) updateJob({...row,size:100,bytes:50},true);
@@ -850,6 +932,21 @@
     assert($('transfer-active-page').hidden && !$('transfer-history-page').hidden && !$('clear-transfers').disabled &&
       findButton(jobRows.get('pages-up').controls,'删除记录'), '历史页同时支持上传下载记录清理');
     const query=$('transfer-search');
+    const setFilter=(id,value)=>{const element=$(id);element.value=value;element.dispatchEvent(new Event('change'));};
+    setFilter('transfer-host', 'id:'+production.host.id); setFilter('transfer-status','failed');
+    assert(!jobRows.get('pages-down').element.hidden && jobRows.get('pages-up').element.hidden, '历史记录同时筛选主机和失败状态');
+    setFilter('transfer-host','name:预发机');
+    assert(!$('transfer-history-empty').hidden, '仅有主机名的旧记录参与筛选且无匹配时有反馈');
+    setFilter('transfer-host',''); setFilter('transfer-status','');
+    const rateRow={rate:node('small'),samples:[]};
+    const progress={status:'running',bytes:0,size:4096};
+    updateTransferRate(rateRow, progress, 0);
+    progress.bytes=1024; updateTransferRate(rateRow,progress,1000);
+    assert(rateRow.rate.textContent==='1.0 KiB/s · 预计剩余 3 秒','以采样窗口计算速率和剩余时间');
+    for(let second=2;second<=7;second++)updateTransferRate(rateRow,progress,second*1000);
+    assert(rateRow.rate.textContent.includes('0 B/s') && rateRow.rate.textContent.includes('待估算'),'长时间无进度时移除过时的预计时间');
+    updateTransferRate(rateRow,{...progress,status:'paused'},8000); updateTransferRate(rateRow, progress, 10000);
+    assert(rateRow.rate.textContent.includes('正在估算'),'恢复时重新采样，排除暂停时长');
     query.value='REPORTS (2)'; query.dispatchEvent(new Event('input'));
     assert(!jobRows.get('pages-down').element.hidden && jobRows.get('pages-up').element.hidden, '文件名搜索忽略大小写并匹配本机另存名称');
     let clearedAll=false;
@@ -1063,6 +1160,22 @@
 
     const resourceHostCount = previewHosts.length;
     const resourceIdentityCount = previewIdentities.length;
+    {
+      await addNewTab();
+      const draft = active;
+      const input = $('quick-connect-search');
+      input.value='audit@temporary.test:2222'; input.dispatchEvent(new Event('input'));
+      const openOnce=()=>[...$('quick-connect-results').querySelectorAll('button')].find(item=>item.textContent.includes('仅连接这一次')).click();
+      openOnce(); await tick(); findButton(dialog,'取消').click(); await tick();
+      assert(active===draft && draft.kind==='new' && !hosts.some(host=>host.address==='temporary.test'),'取消临时认证保留搜索且不创建主机');
+      openOnce(); await tick();
+      dialog.querySelector('input[type=password]').value='temporary-fixture';
+      findButton(dialog,'连接').click(); await tick(); await tick();
+      assert(active===draft && draft.temporary && readySession(draft) && !recent.has(draft.id) && !hosts.some(host=>host.id===draft.id),'临时 SSH 连接成功后保持为未保存主机');
+      findButton($('session-actions'),'保存主机').click(); await tick();
+      assert(!draft.temporary && hosts.some(host=>host.id===draft.id) && readySession(draft),'显式保存临时主机且保留原会话');
+      await closeTab(draft); await api.hosts.remove(draft.id); await refreshHosts(); selectTab(production);
+    }
     const resourceHosts = Array.from({ length: 120 }, (_, index) => ({
       id: `resource-host-${index}`, name: index > 116 ? '同名主机' : `批量资源 ${index}`,
       address: `resource-${index}.example.test`, port: 2222, username: `operator-${index}`, auth: 'agent',

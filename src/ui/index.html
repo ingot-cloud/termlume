@@ -77,6 +77,7 @@
             <svg class="chrome-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4 4"/></svg>
             <input id="host-search" type="search" placeholder="搜索主机，或输入 user@host" aria-label="搜索主机和分组" autocomplete="off">
             <button id="host-connect" type="submit" class="toolbar-button" disabled>连接</button>
+            <button id="host-connect-once" type="button" class="toolbar-button" hidden>仅连接这一次</button>
           </form>
           <div class="toolbar-row">
             <div class="toolbar-actions">
@@ -150,6 +151,8 @@
           </nav>
           <div class="toolbar-actions">
             <input type="search" id="transfer-search" placeholder="搜索文件名" aria-label="搜索文件名">
+            <select id="transfer-host" aria-label="筛选传输主机"><option value="">全部主机</option></select>
+            <select id="transfer-status" aria-label="筛选传输状态"><option value="">全部状态</option></select>
             <div id="transfer-filters" role="group" aria-label="筛选传输类型">
               <button type="button" data-direction="" aria-pressed="true">全部</button>
               <button type="button" data-direction="down" aria-pressed="false">下载</button>

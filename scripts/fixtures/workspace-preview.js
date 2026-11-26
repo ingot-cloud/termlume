@@ -194,14 +194,19 @@ window.termlume = {
       previewSnippets.splice(0,previewSnippets.length,...ordered);
       return structuredClone(previewSnippets);
     }},
-  ssh:{jumpHosts:true,connect:async value=>{previewCalls.push(['connect',value]);queueMicrotask(()=>previewListener({type:'session',id:value.id,status:'ready'}));},input:async value=>previewCalls.push(['input',value]),resize:value=>previewResizes.push(value),ack(){},close:async()=>{},directory:async()=>'/srv/app'},
+  ssh:{jumpHosts:true,connect:async value=>{previewCalls.push(['connect',value]);queueMicrotask(()=>previewListener({type:'session',id:value.id,status:'ready'}));},
+    saveTemporary:async id=>{
+      const [,request]=previewCalls.findLast(([type,value])=>type==='connect' && value.id===id);
+      const host={...request.expected}; previewHosts.push(host); return host;
+    },input:async value=>previewCalls.push(['input',value]),resize:value=>previewResizes.push(value),ack(){},close:async()=>{},directory:async()=>'/srv/app'},
   commands:{preview:async()=> 'df -h',start:async value=>previewCalls.push(['command-start',value]),close:async()=>{},stop:async()=>{}},
   files:{
-    directoryDownloads:true,directoryUploads:true,mutations:true,history:async()=>[],
+    quickDownloads:true,directoryDownloads:true,directoryUploads:true,mutations:true,history:async()=>[],
     places:async ({id,action,path})=>{
       const host = tabs.get(id).host.id;
-      const places = previewDirectoryPlaces.get(host) || {recent:[], favorites:[]};
+      const places = previewDirectoryPlaces.get(host) || {recent:[], recentFiles:[], favorites:[]};
       if(action==='visit') places.recent=[path,...places.recent.filter(p=>p!==path)].slice(0,12);
+      if(action==='openFile') places.recentFiles=[path,...places.recentFiles.filter(p=>p!==path)].slice(0,30);
       if(action==='pin') places.favorites=[path,...places.favorites.filter(p=>p!==path)];
       if(action==='unpin') places.favorites=places.favorites.filter(p=>p!==path);
       previewDirectoryPlaces.set(host,places);

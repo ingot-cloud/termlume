@@ -385,7 +385,7 @@ body.vault-locked #workspace #files { visibility: hidden; transition: none; }
 .file-toolbar input[type="search"] { flex: 1; width: auto; min-height: var(--control-compact); padding-block: 3px; }
 .file-tools { flex-wrap: wrap; gap: 4px; }
 .file-tools button { flex: none; min-height: var(--control-compact); white-space: nowrap; padding-block: 3px; }
-.file-columns, .file-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) 88px 25px; align-items: center; gap: 5px; }
+.file-columns, .file-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) 75px 44px; align-items: center; gap: 5px; }
 .file-columns { min-height: 31px; padding: 0 13px; border-bottom: 1px solid var(--border); font-size: 11px; }
 .file-columns > input { justify-self: center; }
 .file-column-name { display: flex; align-items: center; min-width: 0; gap: 5px; }
@@ -397,7 +397,8 @@ body.vault-locked #workspace #files { visibility: hidden; transition: none; }
 .file-row > input { grid-column: 1; justify-self: center; }
 .file-row > :is(.file-entry, .text-ellipsis) { grid-column: 2; }
 .file-row > .text-ellipsis { color: var(--muted); }
-.file-row > .file-download { grid-column: 4; text-align: center; color: var(--accent); }
+.file-row > .file-download { grid-column: 4; display: flex; justify-content: flex-end; }
+.file-download button { flex: 1; color: var(--accent); }
 .file-row button { padding: 2px 4px; text-align: left; }
 .file-entry { display: flex; align-items: center; gap: 6px; }
 .file-entry .chrome-icon { width: 14px; height: 14px; color: var(--muted); }
@@ -653,6 +654,9 @@ dialog .actions button { flex: 0 1 auto; min-height: var(--control-height); whit
 .palette-list button > * { min-width: 0; }
 .directory-choice-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px; align-items: center; }
 .directory-choice-row .directory-choice { min-width: 0; }
+.directory-choice-row.recent-file { grid-template-columns: minmax(0, 1fr); }
+.directory-places .recent-file button { display: grid; gap: 2px; }
+.directory-places .recent-file button small { text-align: left; white-space: normal; overflow-wrap: anywhere; color: var(--muted); }
 .dialog-fields > button:has(+ .directory-places) { align-self: flex-start; }
 .directory-places + [role=status]:empty { display: none; }
 .palette-list button small { flex: 0 1 46%; text-align: right; white-space: normal; }
@@ -690,6 +694,7 @@ dialog .actions button { flex: 0 1 auto; min-height: var(--control-height); whit
 #transfer-pages button[aria-current] { border-color: var(--accent); color: var(--text); }
 .transfer-toolbar .toolbar-actions { width: 100%; gap: 8px; flex-wrap: wrap; }
 #transfer-search { flex: 1; min-width: 96px; }
+.transfer-toolbar .dropdown { flex: 0 1 auto; min-width: 88px; max-width: 170px; }
 #transfer-filters button { min-width: 40px; }
 .settings-form { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
 .settings-fields { display: grid; align-content: start; justify-content: center; grid-template-columns: minmax(0, var(--settings-width)); gap: 14px; flex: 1; min-height: 0; overflow: auto; scrollbar-gutter: stable; padding: 20px var(--page-gutter); }
@@ -833,6 +838,7 @@ body.vault-locked > :not(#vault-lock, .titlebar), body.vault-locked .titlebar > 
 }
 
 .forward-list { display: grid; gap: 10px; }
+.command-history-list { align-content: start; grid-template-columns: minmax(0, 1fr); overflow-wrap: anywhere; }
 .forward-rule, .forward-editor { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bar); }
 .forward-rule code, .forward-status { overflow-wrap: anywhere; }
 .forward-rule code { font-size: 12px; }
@@ -946,11 +952,11 @@ body.tab-drag-active, body.tab-drag-active * { cursor: grabbing !important; user
 .tab-drag-ghost.in-tab-bar { width: 220px; height: 30px; padding: 4px 10px; border: 0; border-radius: 8px; background: var(--selected); color: var(--text); opacity: .85; box-shadow: none; }
 .terminal-view.drag-source-pane { opacity: .4; }
 
-.file-conflict-bar, .file-comparison-actions, .file-comparison-labels {
+.file-connection-bar, .file-conflict-bar, .file-comparison-actions, .file-comparison-labels {
   display: flex; align-items: center; gap: 12px; padding: 7px 16px;
   background: var(--bar); border-bottom: 1px solid var(--border);
 }
-.file-conflict-bar { color: var(--warning); }
+.file-connection-bar, .file-conflict-bar { color: var(--warning); }
 .file-comparison, .file-comparison-body { min-height: 0; display: flex; flex-direction: column; }
 .file-comparison-actions { justify-content: space-between; font-weight: 600; }
 .file-comparison-labels { display: grid; grid-template-columns: 1fr 1fr; font-size: 12px; }

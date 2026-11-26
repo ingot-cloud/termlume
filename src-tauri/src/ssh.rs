@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     error, keys,
-    store::{Data, Fingerprint, Host, LocalPassword, Password},
+    store::{Data, DirectoryPlaces, Fingerprint, Host, LocalPassword, Password, Store},
     vault::bounded_read,
     Workspace,
 };
@@ -29,6 +29,8 @@ pub type Client = client::Handle<Verifier>;
 pub struct ConnectRequest {
     pub id: Uuid,
     expected: Host,
+    #[serde(default)]
+    temporary: bool,
     #[serde(flatten)]
     credentials: Credentials,
     #[serde(default)]
@@ -83,6 +85,7 @@ impl Size {
 pub struct Session {
     pub id: Uuid,
     pub host: Host,
+    temporary_places: Mutex<Option<DirectoryPlaces>>,
     jump_host: Option<Host>,
     pub fingerprint: OnceLock<String>,
     pub client: OnceLock<Arc<Client>>,
@@ -95,6 +98,27 @@ pub struct Session {
     input: OnceLock<mpsc::Sender<TerminalControl>>,
 }
 impl Session {
+    pub fn temporary(&self) -> bool {
+        self.temporary_places.lock().unwrap().is_some()
+    }
+
+    // Call while holding the workspace store lock, also used when saving a temporary host.
+    pub fn places(&self, data: &Data) -> DirectoryPlaces {
+        self.temporary_places.lock().unwrap().clone()
+            .or_else(|| data.directory_places.get(&self.host.id).cloned()).unwrap_or_default()
+    }
+
+    pub fn set_places(&self, store: &mut Store, places: DirectoryPlaces) -> Result<(), String> {
+        let mut temporary = self.temporary_places.lock().unwrap();
+        if temporary.is_some() {
+            *temporary = Some(places);
+            return Ok(());
+        }
+        let mut data = store.data()?.clone();
+        data.directory_places.insert(self.host.id, places);
+        store.update(data)
+    }
+
     pub(crate) fn transfer_route(&self) -> Value {
         let endpoint = |host: &Host, fingerprint: &OnceLock<String>| json!({
             "id": host.id, "address": host.address.to_ascii_lowercase(), "port": host.port,
@@ -105,6 +129,10 @@ impl Session {
     }
 
     pub(crate) fn check_route(&self, data: &Data) -> Result<(), String> {
+        if self.temporary() {
+            if data.hosts.iter().any(|host| host.id == self.host.id) { return Err("临时主机标识已被占用。".into()); }
+            return Ok(());
+        }
         if !data
             .connection_host(self.host.id)?
             .same_connection(&self.host)
@@ -152,6 +180,7 @@ impl Connections {
         id: Uuid,
         host: Host,
         jump_host: Option<Host>,
+        temporary: bool,
     ) -> Result<Arc<Session>, String> {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.contains_key(&id) || sessions.len() >= 64 {
@@ -160,6 +189,7 @@ impl Connections {
         let session = Arc::new(Session {
             id,
             host,
+            temporary_places: Mutex::new(temporary.then(DirectoryPlaces::default)),
             jump_host,
             fingerprint: OnceLock::new(),
             client: OnceLock::new(),
@@ -269,12 +299,6 @@ impl Verifier {
             crate::ensure_epoch(&store, self.epoch)?;
             let data = store.data()?;
             self.session.check_route(data)?;
-            if !data
-                .connection_host(self.host.id)?
-                .same_connection(&self.host)
-            {
-                return Err("主机配置已变更，请重新连接。".into());
-            }
             Ok(data.fingerprint(&self.host).map(str::to_owned))
         };
         let saved = current()?;
@@ -299,14 +323,12 @@ impl Verifier {
             let mut data = store.data()?.clone();
             self.session.check_route(&data)?;
             let host = &self.host;
-            if !data.connection_host(host.id)?.same_connection(host) {
-                return Err("主机配置已变更，请重新连接。".into());
-            }
             match data.fingerprint(host) {
                 Some(fp) if fp != actual => {
                     return Err("另一条连接已信任不同指纹，请重新核对。".into())
                 }
                 Some(_) => {}
+                None if self.session.temporary() => {}
                 None => {
                     data.fingerprints.push(Fingerprint {
                         address: host.address.clone(),
@@ -374,14 +396,51 @@ pub fn valid_fingerprint(fp: &str) -> bool {
     })
 }
 
+pub fn save_temporary(ws: &Workspace, id: Uuid) -> Result<Value, String> {
+    let session = ws.connections.connected(id)?;
+    let mut store = ws.store.lock().unwrap();
+    let mut data = store.data()?.clone();
+    session.check_route(&data)?;
+    let mut temporary = session.temporary_places.lock().unwrap();
+    let Some(places) = temporary.as_ref() else {
+        return Ok(json!(data.connection_host(session.host.id)?));
+    };
+    let mut host = session.host.clone();
+    let fingerprint = session.fingerprint.get().ok_or("尚未完成主机指纹核验。")?;
+    match data.fingerprint(&host) {
+        Some(saved) if saved != fingerprint => return Err("主机指纹已变化，请重新连接并核对。".into()),
+        Some(_) => {}
+        None => data.fingerprints.push(Fingerprint {
+            address: host.address.clone(),
+            port: host.port,
+            fingerprint: fingerprint.clone(),
+        }),
+    }
+    host.sort_order = crate::host_order::next(&data, "host", None);
+    data.directory_places.insert(host.id, places.clone());
+    data.recent.insert(host.id, crate::now());
+    data.hosts.push(host.clone());
+    store.update(data)?;
+    *temporary = None;
+    Ok(json!(host))
+}
+
 pub fn connect(ws: &Workspace, req: ConnectRequest) -> Result<(), String> {
     let (host, jump_host, epoch) = {
         let store = ws.store.lock().unwrap();
         let data = store.data()?;
-        let host = data.connection_host(req.expected.id)?.clone();
-        if !host.same_connection(&req.expected)
+        let host = if req.temporary {
+            if req.id.is_nil() || req.expected.id != req.id || data.hosts.iter().any(|host| host.id == req.id)
+                || req.credentials.use_saved || req.credentials.remember || req.credentials.share_password || req.jump.is_some() {
+                return Err("临时连接参数无效。".into());
+            }
+            Host { id: req.id, address: req.expected.address.clone(), username: req.expected.username.clone(),
+                port: req.expected.port, auth: req.expected.auth.clone(), key_path: req.expected.key_path.clone(),
+                ..Host::default() }.normalized(false)?
+        } else { data.connection_host(req.expected.id)? };
+        if !req.temporary && (!host.same_connection(&req.expected)
             || host.startup_command != req.expected.startup_command
-            || host.startup_enabled != req.expected.startup_enabled
+            || host.startup_enabled != req.expected.startup_enabled)
         {
             return Err("主机配置已变更，请从主机列表新建会话。".into());
         }
@@ -400,7 +459,7 @@ pub fn connect(ws: &Workspace, req: ConnectRequest) -> Result<(), String> {
         let jump = jump.cloned();
         (host, jump, store.epoch)
     };
-    let session = ws.connections.begin(req.id, host, jump_host)?;
+    let session = ws.connections.begin(req.id, host, jump_host, req.temporary)?;
     let ws = ws.clone();
     tauri::async_runtime::spawn(async move {
         let use_saved =
@@ -674,14 +733,7 @@ async fn connect_peer(
         crate::ensure_epoch(&store, epoch)?;
         let data = store.data()?;
         session.check_route(data)?;
-        if !data.connection_host(host.id)?.same_connection(host)
-            || !data
-                .connection_host(session.host.id)?
-                .same_connection(&session.host)
-        {
-            return Err("主机配置已变更，请重新连接。".into());
-        }
-        let previous = password_source(data, host);
+        let previous = (!session.temporary()).then(|| password_source(data, host)).flatten();
         (
             if credentials.use_saved {
                 Some(previous.as_ref().ok_or("此主机没有已保存的密码。")?)
@@ -690,9 +742,7 @@ async fn connect_peer(
             }
             .cloned(),
             previous,
-            credentials
-                .secret
-                .is_empty()
+            (credentials.secret.is_empty() && !session.temporary())
                 .then(|| saved_key_passphrase(data, host))
                 .flatten(),
         )
@@ -754,12 +804,8 @@ async fn connect_peer(
         crate::ensure_epoch(&store, epoch)?;
         let data = store.data()?;
         session.check_route(data)?;
-        if !data.connection_host(host.id)?.same_connection(host)
-            || !data
-                .connection_host(session.host.id)?
-                .same_connection(&session.host)
-            || data.fingerprint(host) != Some(fingerprint)
-        {
+        let trusted = data.fingerprint(host);
+        if trusted != Some(fingerprint) && !(session.temporary() && trusted.is_none()) {
             return Err("主机或信任记录已变化，请重新连接。".into());
         }
         if let Some((_, source)) = &saved {
