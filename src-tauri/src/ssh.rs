@@ -4,7 +4,7 @@ use russh::{
     Channel, ChannelMsg, Disconnect,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
@@ -95,6 +95,15 @@ pub struct Session {
     input: OnceLock<mpsc::Sender<TerminalControl>>,
 }
 impl Session {
+    pub(crate) fn transfer_route(&self) -> Value {
+        let endpoint = |host: &Host, fingerprint: &OnceLock<String>| json!({
+            "id": host.id, "address": host.address.to_ascii_lowercase(), "port": host.port,
+            "username": host.username, "fingerprint": fingerprint.get()
+        });
+        json!({"target": endpoint(&self.host, &self.fingerprint),
+            "jump": self.jump_host.as_ref().map(|jump| endpoint(jump, &self.jump_fingerprint))})
+    }
+
     pub(crate) fn check_route(&self, data: &Data) -> Result<(), String> {
         if !data
             .connection_host(self.host.id)?

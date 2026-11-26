@@ -340,6 +340,37 @@ impl Default for LockSettings {
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
+pub struct DirectoryPlaces {
+    pub recent: Vec<String>,
+    pub favorites: Vec<String>,
+}
+
+impl DirectoryPlaces {
+    pub fn change(&mut self, action: &str, path: String) -> Result<bool, String> {
+        match action {
+            "visit" => {
+                if self.recent.first() == Some(&path) { return Ok(false); }
+                self.recent.retain(|item| item != &path);
+                self.recent.insert(0, path);
+                self.recent.truncate(12);
+            }
+            "pin" => {
+                if self.favorites.contains(&path) { return Ok(false); }
+                if self.favorites.len() >= 100 { return Err("每台主机最多收藏 100 个目录。".into()); }
+                self.favorites.insert(0, path);
+            }
+            "unpin" => {
+                let count = self.favorites.len();
+                self.favorites.retain(|item| item != &path);
+                return Ok(count != self.favorites.len());
+            }
+            _ => return Err("未知的目录操作。".into()),
+        }
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Data {
     pub hosts: Vec<Host>,
@@ -357,6 +388,8 @@ pub struct Data {
     pub command_history: Vec<Value>,
     pub fingerprints: Vec<Fingerprint>,
     pub recent: BTreeMap<Uuid, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub directory_places: BTreeMap<Uuid, DirectoryPlaces>,
     pub local_passwords: BTreeMap<Uuid, LocalPassword>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub local_secrets: BTreeMap<Uuid, Secret>,
@@ -366,6 +399,8 @@ pub struct Data {
     pub lock_settings: LockSettings,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub transfer_history: Vec<Value>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub transfer_checkpoints: BTreeMap<Uuid, Value>,
     pub sync: Option<Binding>,
     pub git_settings: GitSettings,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -801,6 +836,7 @@ impl Store {
     }
     pub fn update(&mut self, mut data: Data) -> Result<(), String> {
         self.data()?;
+        data.directory_places.retain(|id, _| data.hosts.iter().any(|host| host.id == *id));
         let valid_keys: HashSet<_> = data
             .key_passphrases
             .iter()

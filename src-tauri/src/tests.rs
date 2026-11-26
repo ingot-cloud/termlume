@@ -2,6 +2,38 @@ use super::*;
 use tauri::ipc::InvokeResponseBody;
 use tokio::sync::mpsc;
 
+#[tokio::test]
+async fn sftp_places_are_local_to_each_host_and_survive_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, ws) = make_workspace(home.path(), None);
+    for name in ["first.test", "second.test"] {
+        call(&ws, "hosts:save", json!({"address":name,"username":"ops","auth":"agent"})).await;
+    }
+    let (first, second) = {
+        let mut store = ws.store.lock().unwrap();
+        let mut data = store.data().unwrap().clone();
+        let (first, second) = (data.hosts[0].id, data.hosts[1].id);
+        let places = data.directory_places.entry(first).or_default();
+        for i in 0..14 { places.change("visit", format!("/dir/{i}")).unwrap(); }
+        places.change("visit", "/dir/5".into()).unwrap();
+        places.change("pin", "/pinned-dir".into()).unwrap();
+        assert!(!places.change("pin", "/pinned-dir".into()).unwrap());
+        assert_eq!(places.recent.len(), 12);
+        assert_eq!(places.recent[0], "/dir/5");
+        data.directory_places.entry(second).or_default().change("pin", "/another-dir".into()).unwrap();
+        assert!(!serde_json::to_string(&data.snapshot()).unwrap().contains("/pinned-dir"));
+        store.update(data).unwrap();
+        (first, second)
+    };
+    drop(ws);
+    let ws = Workspace::new(profile.path().into(), home.path().into(), None).unwrap();
+    let store = ws.store.lock().unwrap();
+    let places = &store.data().unwrap().directory_places;
+    assert_eq!(places[&first].favorites, ["/pinned-dir"]);
+    assert_eq!(places[&second].favorites, ["/another-dir"]);
+    assert!(places[&second].recent.is_empty());
+}
+
 #[test]
 #[cfg(any(target_os = "macos", windows))]
 fn reveal_uses_completed_download_destination_from_saved_history() {
@@ -26,6 +58,15 @@ fn reveal_uses_completed_download_destination_from_saved_history() {
     for id in [ids[1], ids[2], Uuid::new_v4()] {
         assert!(ws.transfers.download_location(&ws, id).is_err());
     }
+    for id in ids {
+        assert_eq!(ws.transfers.record_for_location(&ws, id).unwrap()["local"], json!(path));
+    }
+    assert!(ws.transfers.record_for_location(&ws, Uuid::new_v4()).is_err());
+    assert_eq!(platform::transfer_location(&path).unwrap(), (home.path(), false));
+    std::fs::write(&path, b"test").unwrap();
+    assert_eq!(platform::transfer_location(&path).unwrap(), (path.as_path(), true));
+    assert!(platform::transfer_location(&home.path().join("missing/file")).is_err());
+    assert!(platform::transfer_location(std::path::Path::new("relative")).is_err());
 }
 
 #[tokio::test]
@@ -1280,19 +1321,21 @@ async fn macos_transport_migration_and_sync() {
     assert!(records
         .iter()
         .all(|record| record["finishedAt"].as_u64().is_some()));
+    for record in records {
+        let session = &record["sessionId"];
+        assert!(record["route"]["target"]["fingerprint"].is_string());
+        let location = call(&ws, "files:remote-location", json!({"id":session, "recordId":record["id"]})).await;
+        assert_eq!(location["path"], record["remote"]);
+        assert_eq!(location["route"], record["route"]);
+    }
     let removed = call(&ws, "files:remove-history", result["id"].clone()).await;
     assert_eq!(removed, json!([result["id"]]));
     let cleared = call(&ws, "files:remove-history", Value::Null).await;
-    assert_eq!(cleared.as_array().unwrap().len(), 2);
+    assert_eq!(cleared.as_array().unwrap().len(), 5);
     assert!(downloaded.join("nested/with spaces.txt").is_file());
     assert!(output.is_file());
     let remaining = call(&ws, "files:history", Value::Null).await;
-    assert_eq!(remaining.as_array().unwrap().len(), 3);
-    assert!(remaining
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|record| record["direction"] == "up"));
+    assert!(remaining.as_array().unwrap().is_empty());
     let reopened = Store::open(profile.path(), None).unwrap();
     assert!(reopened.data().is_err());
     let persisted: Data = reopened
@@ -1301,6 +1344,49 @@ async fn macos_transport_migration_and_sync() {
         .decode(ws.store.lock().unwrap().key.as_ref().unwrap(), "local")
         .unwrap();
     assert_eq!(json!(persisted.transfer_history), remaining);
+
+    // Lose a source after confirming, then prepare again from the persisted record.
+    let retry_source = remote_dir.join(&folder).join("retry.txt");
+    let retry_local = fixture.join("local").join("retried.txt");
+    std::fs::write(&retry_source, b"original").unwrap();
+    let prepared = ws.transfers.stage(ws.connections.connected(second).unwrap(), false,
+        vec![(retry_source.to_str().unwrap().into(), retry_local.clone())]).await.unwrap();
+    std::fs::remove_file(&retry_source).unwrap();
+    call(&ws, "files:enqueue", json!({"ticket":prepared["ticket"],"policy":"skip"})).await;
+    let failed = until(&mut rx, |e| e["type"] == "transfer" && e["status"] == "failed").await;
+    let retry = json!({"recordId":failed["id"],"id":second});
+    {
+        let mut store = ws.store.lock().unwrap();
+        let mut data = store.data().unwrap().clone();
+        let row = data.transfer_history.iter_mut().find(|r| r["id"] == failed["id"]).unwrap();
+        row.as_object_mut().unwrap().remove("route");
+        store.update(data).unwrap();
+    }
+    assert!(dispatch(&ws, "files:remote-location", retry.clone()).await.is_err());
+    let mut confirm_host = retry.clone();
+    confirm_host["legacyHost"] = host2["id"].clone();
+    let first_location = call(&ws, "files:remote-location", confirm_host).await;
+    assert_eq!(first_location["path"], failed["remote"]);
+    assert_eq!(call(&ws, "files:remote-location", retry.clone()).await, first_location);
+    assert!(dispatch(&ws, "files:prepare-retry", retry.clone()).await.is_err());
+    std::fs::write(&retry_source, b"fresh").unwrap();
+    std::fs::write(&retry_local, b"existing").unwrap();
+    let prepared = call(&ws, "files:prepare-retry", retry.clone()).await;
+    assert_eq!(prepared["files"][0]["exists"], true);
+    call(&ws, "files:enqueue", json!({"ticket":prepared["ticket"],"policy":"keep"})).await;
+    until(&mut rx, |e| e["type"] == "transfer" && e["status"] == "done").await;
+    assert_eq!(std::fs::read(&retry_local).unwrap(), b"existing");
+    assert_eq!(std::fs::read(retry_local.with_file_name("retried (2).txt")).unwrap(), b"fresh");
+    {
+        let mut store = ws.store.lock().unwrap();
+        let mut data = store.data().unwrap().clone();
+        let row = data.transfer_history.iter_mut().find(|r| r["id"] == failed["id"]).unwrap();
+        row["route"]["target"]["fingerprint"] = json!("another fingerprint");
+        store.update(data).unwrap();
+    }
+    assert!(dispatch(&ws, "files:remote-location", retry.clone()).await.unwrap_err().contains("指纹"));
+    assert!(dispatch(&ws, "files:prepare-retry", retry).await.unwrap_err().contains("指纹"));
+
     let password_attempts_before = std::fs::read(fixture.join("password-attempts"))
         .unwrap_or_default()
         .len();
@@ -2621,6 +2707,141 @@ async fn groups_preserve_empty_nodes_inheritance_and_legacy_mapping() {
 #[tokio::test]
 #[ignore = "requires isolated OpenSSH SFTP fixture"]
 #[cfg(unix)]
+async fn macos_transfer_checkpoints_resume_files_and_directories_both_ways() {
+    let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
+    let home = tempfile::tempdir().unwrap();
+    let root = fixture.join("remote/checkpoint-test");
+    std::fs::create_dir(&root).unwrap();
+    let port: u16 = std::fs::read_to_string(fixture.join("openssh-port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let data: Vec<u8> = (0..8 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
+    for (upload, folder) in [(true, false), (false, false), (true, true), (false, true)] {
+        let (profile, ws) = make_workspace(home.path(), None);
+        let host = call(&ws,"hosts:save",json!({"address":"127.0.0.1","port":port,"username":std::env::var("USER").unwrap(),"auth":"agent"})).await[0].clone();
+        let mut rx = events(&ws);
+        let tab = connect_tab(&ws, &mut rx, &host, "", false, false).await;
+        let remote = root.join(format!("round ' trip-{upload}-{folder}"));
+        let local = home.path().join(format!("local-{upload}-{folder}"));
+        let (source, destination) = if upload {
+            (&local, &remote)
+        } else {
+            (&remote, &local)
+        };
+        let contents = |path: &std::path::Path| {
+            if folder {
+                path.join("nested/data.bin")
+            } else {
+                path.to_path_buf()
+            }
+        };
+        if folder {
+            std::fs::create_dir_all(source.join("nested")).unwrap();
+            std::fs::write(source.join("empty"), b"").unwrap();
+        }
+        std::fs::write(contents(source), &data).unwrap();
+        let prepared = ws
+            .transfers
+            .stage(
+                ws.connections.connected(tab).unwrap(),
+                upload,
+                vec![(remote.to_str().unwrap().into(), local.clone())],
+            )
+            .await
+            .unwrap();
+        call(
+            &ws,
+            "files:enqueue",
+            json!({"ticket":prepared["ticket"],"policy":"skip"}),
+        )
+        .await;
+        let running = until(&mut rx, |e| {
+            e["type"] == "transfer"
+                && e["status"] == "running"
+                && e["bytes"].as_u64().unwrap_or(0) > 0
+        })
+        .await;
+        if upload && !folder {
+            ws.connections.connected(tab).unwrap().cancel.cancel();
+        } else {
+            call(&ws, "files:pause", running["id"].clone()).await;
+        }
+        let paused = until(&mut rx, |e| {
+            e["id"] == running["id"] && e["status"] == "paused"
+        })
+        .await;
+        let offset = paused["bytes"].as_u64().unwrap();
+        assert!(offset > 0 && offset < data.len() as u64, "{paused}");
+        assert!(!destination.exists());
+        assert!(call(&ws, "files:remove-history", Value::Null)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
+        call(&ws, "ssh:close", json!(tab)).await;
+        drop(rx);
+        drop(ws);
+        // The test process still owns async SSH cleanup tasks. Load exactly the
+        // persisted bytes in a new profile to simulate a separate process.
+        let restored = tempfile::tempdir().unwrap();
+        for name in ["workspace.json", "workspace.key"] {
+            std::fs::copy(profile.path().join(name), restored.path().join(name)).unwrap();
+        }
+        let ws = Workspace::new(restored.path().into(), home.path().into(), None).unwrap();
+        let mut rx = events(&ws);
+        let pending = call(&ws, "files:pending", Value::Null).await;
+        assert_eq!(pending[0]["bytes"], offset);
+        let fresh = connect_tab(&ws, &mut rx, &host, "", false, false).await;
+        assert_eq!(call(&ws, "files:remote-location", json!({"id":fresh, "recordId":paused["id"]})).await["path"], json!(remote));
+        let request = json!({"sessionId":fresh,"id":paused["id"]});
+        if !folder && !upload {
+            use std::io::Write;
+            let part =
+                local.with_file_name(format!(".termlume-{}.part", paused["id"].as_str().unwrap()));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&part)
+                .unwrap()
+                .write_all(b"changed")
+                .unwrap();
+            call(&ws, "files:resume", request.clone()).await;
+            let rejected = until(&mut rx, |e| {
+                e["id"] == paused["id"] && e["status"] == "paused"
+            })
+            .await;
+            assert!(rejected["message"].as_str().unwrap().contains("校验"));
+            assert!(!destination.exists());
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&part)
+                .unwrap()
+                .write_all(&data[..7])
+                .unwrap();
+        }
+        call(&ws, "files:resume", request).await;
+        let result = until(&mut rx, |e| {
+            e["id"] == paused["id"] && (e.get("finishedAt").is_some() || e["status"] == "paused")
+        })
+        .await;
+        assert_eq!(result["status"], "done", "{result}");
+        assert_eq!(std::fs::read(contents(destination)).unwrap(), data);
+        if folder {
+            assert!(destination.join("empty").is_file());
+        }
+        assert!(call(&ws, "files:pending", Value::Null)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
+        call(&ws, "ssh:close", json!(fresh)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated OpenSSH SFTP fixture"]
+#[cfg(unix)]
 async fn macos_remote_mutations_upload_directory_and_edit_conflicts() {
     let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
     let home = tempfile::tempdir().unwrap();
@@ -2796,15 +3017,25 @@ async fn macos_remote_mutations_upload_directory_and_edit_conflicts() {
     )
     .await;
     std::fs::write(&target, b"edit\n").unwrap();
-    assert!(dispatch(
+    assert_eq!(call(
         &ws,
         "files:save-text",
         json!({"id":tab,"path":opened["path"],"revision":saved["revision"],"text":"overwrite"}),
     )
-    .await
-    .unwrap_err()
-    .contains("远端文件已改变"));
+    .await["conflict"], true);
     assert_eq!(std::fs::read(&target).unwrap(), b"edit\n");
+    let large_log = target.with_extension("log");
+    std::fs::File::create(&large_log).unwrap().set_len(4 * 1024 * 1024 + 1).unwrap();
+    let large = call(&ws, "files:read-text", json!({"id":tab,"path":large_log})).await;
+    assert_eq!(large["tooLarge"], true);
+    assert!(large.get("text").is_none());
+    let visit = json!({"id":tab, "action":"visit", "path":"/var/log"});
+    call(&ws, "files:places", visit.clone()).await;
+    call(&ws, "files:places", visit).await;
+    let places = call(&ws, "files:places", json!({"id":tab,"action":"pin","path":"/var/log"})).await;
+    assert_eq!(places, json!({"recent":["/var/log"],"favorites":["/var/log"]}));
+    let places = call(&ws, "files:places", json!({"id":tab,"action":"unpin","path":"/var/log"})).await;
+    assert_eq!(places["favorites"], json!([]));
     std::fs::write(&target, b"binary\0").unwrap();
     assert!(dispatch(&ws, "files:read-text", json!({"id":tab,"path":target}))
         .await

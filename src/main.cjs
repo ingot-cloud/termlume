@@ -1,11 +1,11 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, protocol } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, protocol, shell } = require('electron');
 const { randomUUID } = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { isIP } = require('node:net');
-const { WorkspaceSSH, commandFor } = require('./ssh.cjs');
-const { Transfers } = require('./transfers.cjs');
+const { WorkspaceSSH, commandFor, remotePath } = require('./ssh.cjs');
+const { Transfers, transferRoute } = require('./transfers.cjs');
 const { scanKeys, generateKey, agentKeys, addAgentKey, createKey } = require('./keys.cjs');
 const { importSSHConfig } = require('./ssh-config.cjs');
 const vault = require('./vault.cjs');
@@ -307,6 +307,16 @@ function publishTransfer(event) {
     }
   }
   emit(event);
+}
+
+function transferLocationRecord(id) {
+  const live = transfers.jobs.get(checkId(id));
+  if (live && ['queued', 'running', 'committing'].includes(live.status)) {
+    return { local: live.local, remote: live.remote, route: transferRoute(live.session) };
+  }
+  const record = transferHistory().find(item => item.id === id);
+  if (!record) throw new Error('找不到这条传输记录。');
+  return record;
 }
 
 function createWindow() {
@@ -790,11 +800,41 @@ function registerHandlers() {
   handle('files:mkdir', ({ id, directory, name }) => ssh.mkdir(id, directory, name));
   handle('files:create-file', ({ id, directory, name }) => ssh.createFile(id, directory, name));
   handle('files:history', () => transferHistory());
+  handle('files:remote-location', ({ id, recordId, legacyHost }) => {
+    const record = transferLocationRecord(recordId);
+    const session = ssh.connected(id).identity;
+    const { target } = transferRoute(session);
+    const saved = record.route?.target;
+    const configured = store.host(target.id);
+    if (configured.address.toLowerCase() !== target.address || configured.port !== target.port || configured.username !== target.username ||
+        (saved ? record.route.jump || Object.keys(target).some(key => saved[key] !== target[key]) : legacyHost !== target.id)) {
+      throw new Error('原主机的连接目标或指纹已变化，请核对主机配置。');
+    }
+    const remote = remotePath(record.remote);
+    const route = transferRoute(session);
+    if (!saved) transferHistory(records => records.map(item => item.id === recordId ? { ...item, route } : item));
+    return { path: remote, route };
+  });
+  handle('files:reveal-local', async id => {
+    const { local } = transferLocationRecord(id);
+    if (typeof local !== 'string' || !path.isAbsolute(local) || !path.basename(local)) throw new Error('记录中的本机路径无效。');
+    try { await fs.promises.lstat(local); }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      const parent = path.dirname(local);
+      if (!(await fs.promises.stat(parent)).isDirectory()) throw new Error('找不到本机目录。');
+      const failure = await shell.openPath(parent);
+      if (failure) throw new Error(failure);
+      return { selected: false };
+    }
+    shell.showItemInFolder(local);
+    return { selected: true };
+  });
   handle('files:remove-history', (value) => {
     const id = value === null ? null : checkId(value);
     const removed = [];
     transferHistory((records) => records.filter((record) => {
-      if (record.direction !== 'down' || (id !== null && id !== record.id)) return true;
+      if (id !== null && id !== record.id) return true;
       removed.push(record.id);
       return false;
     }));

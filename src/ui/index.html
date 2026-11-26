@@ -144,24 +144,27 @@
       <section id="keys-page" class="settings-page" aria-label="SSH 密钥" hidden></section>
       <section id="transfers-page" class="settings-page" aria-label="传输记录" hidden>
         <header class="page-toolbar transfer-toolbar">
+          <nav id="transfer-pages" aria-label="传输页面">
+            <button type="button" data-transfer-page="active" aria-current="page">进行中</button>
+            <button type="button" data-transfer-page="history">历史记录</button>
+          </nav>
           <div class="toolbar-actions">
+            <input type="search" id="transfer-search" placeholder="搜索文件名" aria-label="搜索文件名">
             <div id="transfer-filters" role="group" aria-label="筛选传输类型">
               <button type="button" data-direction="" aria-pressed="true">全部</button>
               <button type="button" data-direction="down" aria-pressed="false">下载</button>
               <button type="button" data-direction="up" aria-pressed="false">上传</button>
             </div>
-            <button id="clear-downloads" type="button" class="toolbar-button" disabled>清空下载记录</button>
+            <button id="clear-transfers" type="button" class="toolbar-button" hidden disabled>清空全部历史</button>
           </div>
         </header>
         <div class="page-body">
           <p id="transfer-feedback" class="muted" role="status" hidden></p>
-          <section class="transfer-group" aria-labelledby="transfer-active-title">
-            <h2 id="transfer-active-title">进行中</h2>
+          <section class="transfer-group" id="transfer-active-page" aria-label="进行中">
             <div id="transfer-active"></div>
             <p id="transfer-active-empty" class="muted">暂无进行中的传输。</p>
           </section>
-          <section class="transfer-group" aria-labelledby="transfer-history-title">
-            <h2 id="transfer-history-title">历史记录</h2>
+          <section class="transfer-group" id="transfer-history-page" aria-label="历史记录" hidden>
             <div id="transfer-history"></div>
             <p id="transfer-history-empty" class="muted" hidden>暂无传输记录。</p>
           </section>

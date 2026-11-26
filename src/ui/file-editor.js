@@ -1,10 +1,11 @@
 import { basicSetup } from 'codemirror';
 import { HighlightStyle, LanguageDescription, StreamLanguage, syntaxHighlighting } from '@codemirror/language';
-import { Compartment, EditorState, Text, Transaction } from '@codemirror/state';
+import { Compartment, EditorState, StateEffect, StateField, Text, Transaction } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
+import { MergeView, goToNextChunk } from '@codemirror/merge';
 import { tags } from '@lezer/highlight';
 import { languages } from '@codemirror/language-data';
-import { isolateHistory, redo, redoDepth, undo, undoDepth } from '@codemirror/commands';
+import { invertedEffects, isolateHistory, redo, redoDepth, undo, undoDepth } from '@codemirror/commands';
 import { closeSearchPanel, getSearchQuery, openSearchPanel, search, searchPanelOpen, setSearchQuery } from '@codemirror/search';
 import { fileSearchPanel } from './file-search-panel.js';
 import { properties } from '@codemirror/legacy-modes/mode/properties';
@@ -102,8 +103,10 @@ const custom = { '日志': log, OpenSSH: sshConfig, dotenv: properties, systemd:
   INI: properties, Makefile: makefile, Terraform: configCode, GraphQL: configCode, CSV: csv, TSV: csv,
   'Git Ignore': { token(stream) { const comment = stream.peek() === '#'; stream.skipToEnd(); return comment ? 'comment' : 'string'; } } };
 const aliases = { JSONC: 'JSON', JSON5: 'JavaScript', JSONL: 'JSON', MDX: 'Markdown' };
+const logFile = /\.log(?:[.-]\d[\d-]*)?$|\/var\/log\/(?:syslog|messages|secure|auth|kern|cron|maillog)(?:\.\d+)?$|(?:^|\/)(?:catalina|nohup)\.out$/i;
+export const isLogFile = path => logFile.test(path);
 const specialFiles = [
-  ['日志', /\.log(?:\.\d+)?$|\/var\/log\/(?:syslog|messages|secure|auth)(?:\.\d+)?$/],
+  ['日志', logFile],
   ['OpenSSH', /(?:^|\/)(?:sshd?_config|\.ssh\/config|sshd?_config\.d\/[^/]+\.conf)$/],
   ['Nginx', /(?:^|\/)nginx\.conf$|\/nginx\/(?:.*\.conf|sites-(?:enabled|available)\/[^/]+)$/],
   ['dotenv', /(?:^|\/)\.env(?:\.[^/]*)?$|\.env$/],
@@ -154,6 +157,66 @@ export const formatNames = [...new Set([plain, ...Object.keys(custom), ...Object
 const phrases = { Find: '查找', Replace: '替换为', next: '下一处', previous: '上一处', all: '全选匹配',
   'match case': '区分大小写', regexp: '正则', 'by word': '全词', replace: '替换', 'replace all': '全部替换',
   close: '关闭查找', 'Go to line': '跳转到行', go: '跳转', 'Fold line': '折叠行', 'Unfold line': '展开行' };
+
+// CodeMirror represents every logical break with one character. In mixed files
+// keep a parallel marker per break, so offsets and selections remain native.
+const endings = { L: '\n', W: '\r\n', R: '\r' };
+const restoreBreaks = StateEffect.define();
+const mixedBreaks = StateField.define({
+  create: () => '',
+  update(markers, tr) {
+    for (let i = tr.effects.length - 1; i >= 0; i--) {
+      if (tr.effects[i].is(restoreBreaks)) return tr.effects[i].value;
+    }
+    if (!tr.docChanged) return markers;
+    let offset = 0;
+    const parts = [];
+    tr.changes.iterChanges((from, to, _fromB, _toB, inserted) => {
+      const first = tr.startState.doc.lineAt(from).number - 1;
+      const last = tr.startState.doc.lineAt(to).number - 1;
+      const count = inserted.lines - 1;
+      if (last - first === count) return;
+      // Reused breaks keep their spelling. New breaks inherit the nearest line.
+      const reused = Math.min(last - first, count);
+      const adjacent = markers[first + reused] || markers[first + reused - 1] || 'L';
+      parts.push(markers.slice(offset, first + reused), adjacent.repeat(count - reused));
+      offset = last;
+    });
+    return parts.length ? parts.join('') + markers.slice(offset) : markers;
+  }
+});
+const trackBreakHistory = invertedEffects.of(tr =>
+  tr.docChanged ? [restoreBreaks.of(tr.startState.field(mixedBreaks))] : []);
+
+// Formatters return a complete string. Keep unchanged lines as anchors so an
+// insertion near the top cannot shift the original endings of later lines.
+function mixedFormatChanges(doc, formatted) {
+  const lines = formatted.split('\n');
+  const positions = new Map();
+  for (let i = lines.length - 2; i >= 0; i--) {
+    if (!positions.has(lines[i])) positions.set(lines[i], []);
+    positions.get(lines[i]).push(i);
+  }
+  const changes = [];
+  let from = 0, nextLine = 0;
+  function replace(to, insert) {
+    if (from !== to || insert) changes.push({ from, to, insert: Text.of(insert.split('\n')) });
+  }
+  for (let i = 1; i < doc.lines; i++) {
+    const line = doc.line(i);
+    const matches = positions.get(line.text);
+    if (!matches) continue;
+    while (matches.length && matches.at(-1) < nextLine) matches.pop();
+    if (!matches.length) continue;
+    const match = matches.pop();
+    replace(line.from, match > nextLine ? lines.slice(nextLine, match).join('\n') + '\n' : '');
+    from = line.to + 1;
+    nextLine = match + 1;
+  }
+  replace(doc.length, lines.slice(nextLine).join('\n'));
+  return changes;
+}
+
 export function open(parent, path, text, onChange, dark, onPosition = () => {}, onSearch = () => {}) {
   let format = detectFormat(path, text);
   const otherShell = /^(?:\.z(?:shrc|profile|shenv)|.*\.(?:zsh|ksh))$/i.test(path.split('/').at(-1)) || /^#![^\n]*\b(?:zsh|ksh)\b/.test(text);
@@ -161,6 +224,10 @@ export function open(parent, path, text, onChange, dark, onPosition = () => {}, 
   const wrapping = new Compartment();
   const lineBreaks = text.match(/\r\n|\r|\n/g);
   const separator = lineBreaks?.[0];
+  const mixed = lineBreaks?.some(ending => ending !== separator);
+  const breakExtensions = mixed
+    ? [mixedBreaks, trackBreakHistory]
+    : separator ? [EditorState.lineSeparator.of(separator)] : [];
   const access = new Compartment();
   const permission = writable => [EditorState.readOnly.of(!writable), EditorView.editable.of(writable),
     EditorView.contentAttributes.of({ tabindex: '0', 'aria-readonly': String(!writable) })];
@@ -169,7 +236,7 @@ export function open(parent, path, text, onChange, dark, onPosition = () => {}, 
       EditorState.transactionFilter.of(tr => tr.docChanged && tr.startState.readOnly ? [] : tr),
       search({ top: true, createPanel: fileSearchPanel }), basicSetup, wrapping.of([]), EditorState.phrases.of(phrases),
       language.of([]),
-      ...(separator && lineBreaks.every(ending => ending === separator) ? [EditorState.lineSeparator.of(separator)] : []),
+      breakExtensions,
       EditorView.theme({}, { dark }), syntaxHighlighting(highlighting),
       EditorView.contentAttributes.of({ 'aria-label': '远端文件内容', spellcheck: 'false' }),
       EditorView.updateListener.of(update => {
@@ -182,7 +249,9 @@ export function open(parent, path, text, onChange, dark, onPosition = () => {}, 
         }
       })
   ];
-  const editor = new EditorView({ parent, doc: text, extensions });
+  const initialMarkers = mixed ? lineBreaks.map(e => e === '\r\n' ? 'W' : e === '\r' ? 'R' : 'L').join('') : undefined;
+  const documentExtensions = markers => mixed ? [extensions, mixedBreaks.init(() => markers)] : extensions;
+  const editor = new EditorView({ parent, doc: text, extensions: documentExtensions(initialMarkers) });
   function setFormat(name) {
     format = name;
     const builtin = custom[name];
@@ -200,20 +269,50 @@ export function open(parent, path, text, onChange, dark, onPosition = () => {}, 
     get parser() {
       return format === 'Shell' && otherShell ? undefined : formatters[format];
     },
-    lineEnding: !separator || (separator === '\n' && lineBreaks.every(e => e === separator)) ? 'LF'
-      : lineBreaks.every(e => e === separator) ? (separator === '\r' ? 'CR' : 'CRLF') : '混合换行',
+    compare(parent, remoteText) {
+      const syntax = [language.get(editor.state), syntaxHighlighting(highlighting), EditorView.lineWrapping,
+        EditorView.theme({}, { dark }), EditorState.phrases.of(phrases)];
+      const comparison = new MergeView({
+        parent, gutter: true, diffConfig: { scanLimit: 500, timeout: 120 },
+        a: { doc: remoteText, extensions: [syntax, EditorState.readOnly.of(true), EditorView.editable.of(false),
+          EditorView.contentAttributes.of({ 'aria-label': '远端最新内容', tabindex: '0' })] },
+        b: { doc: editor.state.doc, extensions: [syntax, basicSetup,
+          EditorView.contentAttributes.of({ 'aria-label': '我的草稿', spellcheck: 'false' }),
+          EditorView.updateListener.of(update => {
+            if (update.docChanged) editor.dispatch({ changes: update.changes,
+              selection: update.state.selection, annotations: Transaction.userEvent.of('input.merge') });
+          })] }
+      });
+      if (comparison.chunks.length) goToNextChunk(comparison.b);
+      comparison.b.focus();
+      return comparison;
+    },
+    snapshot() { return { doc: editor.state.doc, markers: editor.state.field(mixedBreaks, false) }; },
+    matches(saved) { return editor.state.doc.eq(saved.doc) && editor.state.field(mixedBreaks, false) === saved.markers; },
+    serialize() {
+      if (!mixed) return editor.state.sliceDoc();
+      const markers = editor.state.field(mixedBreaks);
+      let index = 0;
+      return editor.state.doc.toString().replace(/\n/g, () => endings[markers[index++]]);
+    },
+    get lineEnding() {
+      const markers = editor.state.field(mixedBreaks, false);
+      if (markers && /[^L]/.test(markers) && /[^W]/.test(markers) && /[^R]/.test(markers)) return '混合换行';
+      const ending = mixed ? endings[markers[0]] : separator;
+      return ending === '\r\n' ? 'CRLF' : ending === '\r' ? 'CR' : 'LF';
+    },
     writable(enabled) { editor.dispatch({ effects: access.reconfigure(permission(enabled)) }); },
     get canUndo() { return undoDepth(editor.state) > 0; },
     get canRedo() { return redoDepth(editor.state) > 0; },
     undo() { if (undo(editor)) editor.focus(); },
     redo() { if (redo(editor)) editor.focus(); },
-    preview(doc) {
+    preview({doc, markers}) {
       // Start each editing session with fresh undo history, including after discarding a draft.
       const previous = editor.state;
       const wrap = wrapping.get(previous);
       const snapshot = editor.scrollSnapshot();
       const selection = previous.selection.main;
-      const next = EditorState.create({ doc, extensions, selection: {
+      const next = EditorState.create({ doc, extensions: documentExtensions(markers), selection: {
         anchor: Math.min(selection.anchor, doc.length), head: Math.min(selection.head, doc.length) } });
       const activeLanguage = language.get(previous);
       editor.setState(next);
@@ -240,7 +339,9 @@ export function open(parent, path, text, onChange, dark, onPosition = () => {}, 
     },
     wrap(enabled) { editor.dispatch({ effects: wrapping.reconfigure(enabled ? EditorView.lineWrapping : []) }); editor.focus(); },
     applyFormat(formatted, cursor) {
-      editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: Text.of(formatted.split('\n')) },
+      const changes = mixed ? mixedFormatChanges(editor.state.doc, formatted)
+        : { from: 0, to: editor.state.doc.length, insert: Text.of(formatted.split('\n')) };
+      editor.dispatch({ changes,
         selection: { anchor: Math.min(cursor, formatted.length) }, annotations: [isolateHistory.of('full'), Transaction.userEvent.of('input.format')] });
     }
   };

@@ -688,6 +688,24 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
             return transfer::list(&session, value["directory"].as_str().unwrap_or("")).await;
         }
         #[cfg(desktop)]
+        "files:places" => {
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            let mut store = ws.store.lock().unwrap();
+            let data = store.data()?;
+            session.check_route(data)?;
+            let host = session.host.id;
+            let mut places = data.directory_places.get(&host).cloned().unwrap_or_default();
+            if let Some(action) = value["action"].as_str() {
+                let path = ssh::remote_path(string(&value["path"])?)?;
+                if places.change(action, path)? {
+                    let mut next = data.clone();
+                    next.directory_places.insert(host, places.clone());
+                    store.update(next)?;
+                }
+            }
+            return Ok(json!(places));
+        }
+        #[cfg(desktop)]
         "files:inspect" => {
             let session = ws.connections.connected(id(&value["id"])?)?;
             return transfer::inspect_path(&session, string(&value["path"])?).await;
@@ -722,6 +740,21 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         }
         #[cfg(desktop)]
         "files:history" => return Ok(json!(ws.transfers.history(ws)?)),
+        #[cfg(desktop)]
+        "files:remote-location" => {
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            return ws.transfers.remote_location(ws, id(&value["recordId"])?, &session, parse(value["legacyHost"].clone())?);
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        "files:reveal-local" => {
+            let record = ws.transfers.record_for_location(ws, id(&value)?)?;
+            let path = PathBuf::from(record["local"].as_str().ok_or("记录缺少本机路径。")?);
+            return blocking(move || {
+                let (location, selected) = platform::transfer_location(&path)?;
+                platform::show_in_file_manager(location, selected)?;
+                Ok(json!({"selected": selected}))
+            }).await;
+        }
         #[cfg(any(target_os = "macos", windows))]
         "files:reveal-download" => {
             let path = ws.transfers.download_location(ws, id(&value)?)?;
@@ -800,7 +833,23 @@ async fn dispatch(ws: &Workspace, name: &str, value: Value) -> Result<Value, Str
         #[cfg(desktop)]
         "files:discard" => ws.transfers.discard(id(&value)?),
         #[cfg(desktop)]
+        "files:pending" => return ws.transfers.pending(ws),
+        #[cfg(desktop)]
+        "files:cancel-paused-download" => ws.transfers.cancel_download(ws, id(&value)?).await?,
+        #[cfg(desktop)]
+        "files:pause" => ws.transfers.pause(id(&value)?)?,
+        #[cfg(desktop)]
+        "files:resume" => {
+            let session = ws.connections.connected(id(&value["sessionId"])?)?;
+            ws.transfers.resume(ws, id(&value["id"])?, session, value["discard"] == true)?;
+        }
+        #[cfg(desktop)]
         "files:cancel" => ws.transfers.cancel(id(&value)?),
+        #[cfg(desktop)]
+        "files:prepare-retry" => {
+            let session = ws.connections.connected(id(&value["id"])?)?;
+            return ws.transfers.prepare_retry(ws, id(&value["recordId"])?, session, parse(value["legacyHost"].clone())?).await;
+        }
         #[cfg(desktop)]
         "files:retry" => ws.transfers.retry(ws, id(&value)?)?,
         _ => return Err("工作台请求未定义。".into()),
@@ -1298,6 +1347,7 @@ async fn restore(ws: &Workspace, value: Value, from_git: bool) -> Result<Value, 
         return Err("工作区已变化，请重试恢复。".into());
     }
     data.transfer_history = store.data()?.transfer_history.clone();
+    data.transfer_checkpoints = store.data()?.transfer_checkpoints.clone();
     store.install(key, &header, data)?;
     *ws.last_activity.lock().unwrap() = Instant::now();
     Ok(store.status())

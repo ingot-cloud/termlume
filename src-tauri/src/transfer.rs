@@ -1,3 +1,6 @@
+mod resume;
+use resume::Checkpoint;
+use std::sync::atomic::Ordering;
 use crate::{
     error,
     ssh::{file_name, remote_path, require_success, Session},
@@ -156,7 +159,7 @@ pub struct PrepareRequest {
     #[serde(default)]
     folder: bool,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Policy {
     Skip,
@@ -173,6 +176,7 @@ struct File {
     size: u64,
     original: Option<Stat>,
     permissions: Option<u32>,
+    editor_upload: bool,
     folder: Option<Arc<DownloadFolder>>,
 }
 impl File {
@@ -185,14 +189,14 @@ impl File {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 struct DownloadFolder {
     root: String,
     entries: Vec<FolderEntry>,
     skipped: usize,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 struct FolderEntry {
     local: PathBuf,
     remote: String,
@@ -243,13 +247,14 @@ async fn scan_folder(
                 Some(size)
             };
             entries.push(FolderEntry {
-                source: None,
+                source: size.map(|_| remote_stat(metadata)),
                 local: relative,
                 remote: child,
                 size,
             });
         }
     }
+    entries.sort_by(|a, b| a.local.cmp(&b.local));
     Ok((
         DownloadFolder {
             root,
@@ -327,6 +332,7 @@ async fn scan_upload_folder(
         }
         pending.extend(subdirs.into_iter().rev());
     }
+    entries.sort_by(|a, b| a.local.cmp(&b.local));
     Ok((
         DownloadFolder {
             root: canonical.to_string_lossy().into_owned(),
@@ -337,7 +343,7 @@ async fn scan_upload_folder(
     ))
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 struct Stat {
     regular: bool,
     size: u64,
@@ -413,12 +419,17 @@ struct Job {
     policy: Policy,
     cancel: CancellationToken,
     done: Notify,
+    pause: CancellationToken,
+    checkpoint: Option<Checkpoint>,
+    discard: bool,
+    last_event: Mutex<Value>,
     status: Mutex<&'static str>,
 }
 #[derive(Default)]
 struct Queue {
     jobs: HashMap<Uuid, Arc<Job>>,
     order: VecDeque<Arc<Job>>,
+    cleaning: std::collections::HashSet<Uuid>,
     draining: bool,
 }
 #[derive(Default)]
@@ -433,19 +444,67 @@ const HISTORY_LIMIT: usize = 200;
 
 impl Transfers {
     pub fn has_active(&self) -> bool {
-        self.queue.lock().unwrap().jobs.values().any(|j| matches!(*j.status.lock().unwrap(), "queued" | "running" | "committing"))
+        self.queue.lock().unwrap().jobs.values().any(|j| matches!(*j.status.lock().unwrap(), "queued" | "running" | "verifying" | "committing"))
     }
     pub fn active_session(&self, id: Uuid) -> bool {
         self.queue.lock().unwrap().jobs.values().any(|j| {
             j.file.session.id == id
                 && matches!(
                     *j.status.lock().unwrap(),
-                    "queued" | "running" | "committing"
+                    "queued" | "running" | "verifying" | "committing"
                 )
         })
     }
     pub fn history(&self, ws: &Workspace) -> Result<Vec<Value>, String> {
         self.edit_history(ws, |_| ())
+    }
+
+    pub fn record_for_location(&self, ws: &Workspace, id: Uuid) -> Result<Value, String> {
+        {
+            let queue = self.queue.lock().unwrap();
+            let store = ws.store.lock().unwrap();
+            let data = store.data()?;
+            if let Some(job) = queue.jobs.get(&id) {
+                let event = job.last_event.lock().unwrap();
+                if !event.is_null() && event.get("finishedAt").is_none() {
+                    return Ok(event.clone());
+                }
+            }
+            if let Some(point) = data.transfer_checkpoints.get(&id) {
+                return Ok(json!({"local":point["local"], "remote":point["remote"], "route":point["route"]}));
+            }
+        }
+        self.history(ws)?.into_iter().find(|row| row["id"] == json!(id))
+            .ok_or_else(|| "找不到这条传输记录。".into())
+    }
+
+    fn check_record_host(ws: &Workspace, record: &Value, session: &Session, legacy_host: Option<Uuid>) -> Result<(), String> {
+        session.check_route(ws.store.lock().unwrap().data()?)?;
+        if let Some(route) = record.get("route") {
+            if route != &session.transfer_route() {
+                return Err("原主机的连接目标或指纹已变化，请核对主机配置。".into());
+            }
+        } else if legacy_host != Some(session.host.id) {
+            return Err("请为旧记录明确选择此次要连接的主机。".into());
+        }
+        Ok(())
+    }
+
+    pub fn remote_location(&self, ws: &Workspace, id: Uuid, session: &Session, legacy_host: Option<Uuid>) -> Result<Value, String> {
+        let mut record = self.record_for_location(ws, id)?;
+        Self::check_record_host(ws, &record, session, legacy_host)?;
+        let path = remote_path(record["remote"].as_str().ok_or("记录缺少远端路径。")?)?;
+        if record.get("route").is_none() {
+            let id = json!(id);
+            let records = self.edit_history(ws, |records| {
+                if let Some(row) = records.iter_mut().find(|row| row["id"] == id && row.get("route").is_none()) {
+                    row["route"] = session.transfer_route();
+                }
+            })?;
+            record = records.into_iter().find(|row| row["id"] == id).ok_or("这条传输记录已删除。")?;
+            Self::check_record_host(ws, &record, session, None)?;
+        }
+        Ok(json!({"path":path, "route":record["route"]}))
     }
 
     #[cfg(any(target_os = "macos", windows))]
@@ -464,14 +523,17 @@ impl Transfers {
         let mut removed = Vec::new();
         self.edit_history(ws, |records| {
             records.retain(|record| {
-                let remove = record["direction"] == "down"
-                    && id.as_ref().is_none_or(|id| id == &record["id"]);
+                let remove = id.as_ref().is_none_or(|id| id == &record["id"]);
                 if remove {
                     removed.push(record["id"].clone());
                 }
                 !remove
             });
         })?;
+        let mut queue = self.queue.lock().unwrap();
+        for row in &removed {
+            if let Ok(id) = crate::id(row) { queue.jobs.remove(&id); }
+        }
         Ok(removed)
     }
 
@@ -487,8 +549,11 @@ impl Transfers {
         records.extend(pending.iter().cloned());
         edit(&mut records);
         records.drain(..records.len().saturating_sub(HISTORY_LIMIT));
-        if records != data.transfer_history {
+        if records != data.transfer_history || pending.iter().any(|row| crate::id(&row["id"]).is_ok_and(|id| data.transfer_checkpoints.contains_key(&id))) {
             let mut data = data.clone();
+            for event in pending.iter() {
+                if let Ok(id) = crate::id(&event["id"]) { data.transfer_checkpoints.remove(&id); }
+            }
             data.transfer_history = records.clone();
             store.update(data)?;
         }
@@ -638,6 +703,7 @@ impl Transfers {
                 size,
                 original: None,
                 permissions: None,
+                editor_upload: false,
                 folder,
             };
             file.original = target(&sftp, &file).await?;
@@ -699,7 +765,9 @@ impl Transfers {
         for file in files {
             let job = Arc::new(Job {
                 id: Uuid::new_v4(),
-                cancel: file.session.cancel.child_token(),
+                cancel: CancellationToken::new(),
+                pause: CancellationToken::new(),
+                checkpoint: None, discard: false, last_event: Mutex::new(Value::Null),
                 file,
                 policy,
                 done: Notify::new(),
@@ -709,6 +777,10 @@ impl Transfers {
             queue.jobs.insert(job.id, job.clone());
             queue.order.push_back(job);
         }
+        self.start_drain(ws, &mut queue);
+        Ok(())
+    }
+    fn start_drain(&self, ws: &Workspace, queue: &mut Queue) {
         if !queue.draining {
             queue.draining = true;
             let ws = ws.clone();
@@ -716,7 +788,6 @@ impl Transfers {
                 ws.transfers.drain(&ws).await;
             });
         }
-        Ok(())
     }
     async fn drain(&self, ws: &Workspace) {
         loop {
@@ -729,22 +800,26 @@ impl Transfers {
                 job
             };
             let mut file = job.file.clone();
-            let mut bytes = 0;
+            let mut point = job.checkpoint.clone();
+            let mut bytes = point.as_ref().map_or(0, Checkpoint::bytes);
             let mut committing = false;
-            let result = if job.cancel.is_cancelled() {
-                Err("传输已取消。".into())
-            } else {
-                job.emit(ws, &file, "running", 0, "");
-                job.run(ws, &mut file, &mut bytes, &mut committing).await
-            };
-            let (status, message) = match result {
+            job.emit(ws, &file, if point.is_some() { "verifying" } else { "running" }, bytes, "");
+            let result = job.transfer(ws, &mut file, &mut point, &mut bytes, &mut committing).await;
+            let (status, mut message) = match result {
                 Ok(status) => (status, String::new()),
-                Err(message) if committing && file.upload && message.starts_with("提交未确认") => {
-                    ("unverified", message)
-                }
-                Err(message) if job.cancel.is_cancelled() && !committing => ("canceled", message),
-                Err(message) => ("failed", message),
+                Err(e) if committing && e.starts_with("提交未确认") => ("unverified", e),
+                Err(e) if !committing && point.is_some() => ("paused", e),
+                Err(e) if job.cancel.is_cancelled() => ("canceled", e),
+                Err(e) => ("failed", e),
             };
+            if status == "paused" {
+                let checkpoint = point.as_mut().unwrap();
+                checkpoint.message = message.clone();
+                bytes = checkpoint.bytes();
+                if let Err(e) = checkpoint.persist(ws, job.id) {
+                    message = format!("{message} 上次已记录的断点仍可用：{e}");
+                }
+            }
             job.emit(ws, &file, status, bytes, &message);
             job.done.notify_waiters();
         }
@@ -765,20 +840,46 @@ impl Transfers {
             .cloned()
             .collect();
         for job in &jobs {
-            job.cancel.cancel();
+            job.pause.cancel();
         }
         let _ = tokio::time::timeout(Duration::from_secs(3), async {
             for job in jobs {
                 let notified = job.done.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if matches!(*job.status.lock().unwrap(), "running" | "committing") {
+                if matches!(*job.status.lock().unwrap(), "running" | "verifying" | "committing") {
                     notified.await;
                 }
             }
         })
         .await;
     }
+    pub async fn prepare_retry(&self, ws: &Workspace, record_id: Uuid, session: Arc<Session>, legacy_host: Option<Uuid>) -> Result<Value, String> {
+        let record = self.history(ws)?.into_iter().find(|row| row["id"] == json!(record_id))
+            .ok_or("找不到这条传输记录。")?;
+        if !matches!(record["status"].as_str(), Some("failed" | "canceled")) {
+            return Err("仅失败或已取消的传输可以重试。".into());
+        }
+        Self::check_record_host(ws, &record, &session, legacy_host)?;
+        let remote = remote_path(record["remote"].as_str().ok_or("记录缺少远端路径。")?)?;
+        let local = PathBuf::from(record["local"].as_str().ok_or("记录缺少本机路径。")?);
+        if !local.is_absolute() || local.file_name().is_none() || remote == "/" {
+            return Err("记录中的文件路径无效，请重新选择。".into());
+        }
+        let upload = match record["direction"].as_str() {
+            Some("up") => true,
+            Some("down") => false,
+            _ => return Err("记录缺少传输方向。".into()),
+        };
+        let legacy_editor = record.get("editorUpload").is_none() && upload
+            && local.parent().and_then(Path::file_name).and_then(|s| s.to_str())
+                .is_some_and(|name| name.starts_with("termlume-edit-"));
+        if record["editorUpload"] == true || legacy_editor {
+            return Err("请从外部编辑任务重新核对远端版本后回传。".into());
+        }
+        self.stage(session, upload, vec![(remote, local)]).await
+    }
+
     pub fn retry(&self, ws: &Workspace, id: Uuid) -> Result<(), String> {
         let job = self
             .queue
@@ -810,290 +911,21 @@ impl Transfers {
 
 impl Job {
     fn emit(&self, ws: &Workspace, file: &File, status: &'static str, bytes: u64, message: &str) {
-        *self.status.lock().unwrap() = status;
         let mut event = json!({"type":"transfer","id":self.id,"sessionId":file.session.id,"host":file.session.host.name,
             "direction":if file.upload {"up"} else {"down"},"local":file.local,"remote":file.remote,
             "size":file.size,"bytes":bytes,"status":status,"message":message});
-        if !matches!(status, "queued" | "running" | "committing") {
+        event["route"] = file.session.transfer_route();
+        if !matches!(status, "queued" | "running" | "verifying" | "paused" | "committing") {
+            if matches!(status, "failed" | "canceled") {
+                event["editorUpload"] = json!(file.editor_upload);
+            }
             event["finishedAt"] = json!(crate::now());
             ws.transfers.record(ws, &event);
         }
+        *self.last_event.lock().unwrap() = event.clone();
+        *self.status.lock().unwrap() = status;
         ws.emit(event);
     }
-    async fn run(
-        &self,
-        ws: &Workspace,
-        file: &mut File,
-        bytes: &mut u64,
-        committing: &mut bool,
-    ) -> Result<&'static str, String> {
-        let sftp = open(&file.session).await?;
-        let existing = target(&sftp, file).await?;
-        let replace = file.folder.is_none()
-            && self.policy == Policy::Replace
-            && existing.as_ref().is_some_and(|s| s.regular)
-            && file.original.as_ref().is_some_and(|s| s.regular);
-        if replace && existing != file.original {
-            return Err("目标文件已变化，请重新确认后传输。".into());
-        }
-        if existing.is_some() && !replace {
-            if self.policy != Policy::Keep {
-                return Ok("skipped");
-            }
-            self.choose_new_name(&sftp, file).await?;
-        }
-        if let Some(folder) = &file.folder {
-            if file.upload {
-                return self
-                    .upload_folder(ws, file, folder, &sftp, bytes, committing)
-                    .await;
-            }
-            return self
-                .download_folder(ws, file, folder, &sftp, bytes, committing)
-                .await;
-        }
-        let part_name = format!(".termlume-{}.part", self.id);
-        let local_temp = file.local.with_file_name(&part_name);
-        let remote_temp = remote_join(
-            file.remote
-                .rsplit_once('/')
-                .map(|(parent, _)| parent)
-                .unwrap_or(""),
-            &part_name,
-        );
-        let mut created = false;
-        let copied = if file.upload {
-            self.upload(ws, file, &sftp, &remote_temp, bytes, &mut created)
-                .await
-        } else {
-            self.download(ws, file, &sftp, &local_temp, bytes, &mut created)
-                .await
-        };
-        let result = async {
-            copied?;
-            if *bytes != file.size {
-                return Err("源文件大小已改变，请重新选择文件。".into());
-            }
-            if replace && target(&sftp, file).await? != existing {
-                return Err("目标文件已变化，请重新确认。".into());
-            }
-            if self.cancel.is_cancelled() {
-                return Err("传输已取消。".into());
-            }
-            *committing = true;
-            self.emit(ws, file, "committing", *bytes, "");
-            if file.upload {
-                publish_remote(&file.session, &sftp, &remote_temp, &file.remote, replace).await?;
-                created = false;
-            } else if replace {
-                fs::rename(&local_temp, &file.local).await.map_err(error)?;
-                created = false;
-            } else {
-                fs::hard_link(&local_temp, &file.local)
-                    .await
-                    .map_err(error)?;
-            }
-            Ok("done")
-        }
-        .await;
-        if created {
-            let cleanup = if file.upload {
-                sftp.remove_file(&remote_temp).await.map_err(error)
-            } else {
-                fs::remove_file(&local_temp).await.map_err(error)
-            };
-            if cleanup.is_err() {
-                let temp = if file.upload {
-                    remote_temp
-                } else {
-                    local_temp.to_string_lossy().into_owned()
-                };
-                if let Err(e) = result {
-                    return Err(format!("{e} 请检查传输临时文件 {temp}"));
-                }
-                return Err(format!("目标已提交，请清理传输临时文件 {temp}"));
-            }
-        }
-        result
-    }
-
-    async fn upload_folder(
-        &self,
-        ws: &Workspace,
-        file: &File,
-        folder: &DownloadFolder,
-        sftp: &SftpSession,
-        bytes: &mut u64,
-        committing: &mut bool,
-    ) -> Result<&'static str, String> {
-        let parent = file
-            .remote
-            .rsplit_once('/')
-            .map(|(p, _)| p)
-            .ok_or("远端目录无效。")?;
-        let temp = remote_join(parent, &format!(".termlume-{}.part", self.id));
-        sftp.create_dir(&temp).await.map_err(error)?;
-        let mut created = Vec::new();
-        let result = async {
-            let (current, _) = scan_upload_folder(&file.local, &mut 1000, &self.cancel).await?;
-            if current != *folder {
-                return Err("本机目录已变化，请重新选择上传。".into());
-            }
-            for entry in &folder.entries {
-                if self.cancel.is_cancelled() {
-                    return Err("上传已取消。".into());
-                }
-                let relative = entry
-                    .local
-                    .to_str()
-                    .ok_or("文件名不是有效 Unicode。")?
-                    .replace('\\', "/");
-                let destination = remote_join(&temp, &relative);
-                if let Some(size) = entry.size {
-                    let source_path = file.local.join(&entry.local);
-                    let attrs = fs::symlink_metadata(&source_path).await.map_err(error)?;
-                    if !attrs.is_file() || Some(local_stat(attrs)) != entry.source {
-                        return Err("本机文件已变化。".into());
-                    }
-                    let mut source = fs::File::open(&source_path).await.map_err(error)?;
-                    let mut attrs = FileAttributes::empty();
-                    attrs.permissions = Some(0o600);
-                    let mut output = sftp
-                        .open_with_flags_and_attributes(
-                            &destination,
-                            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
-                            attrs,
-                        )
-                        .await
-                        .map_err(error)?;
-                    created.push((destination.clone(), false));
-                    let before = *bytes;
-                    let copied = self.copy(ws, file, &mut source, &mut output, bytes).await;
-                    let closed = output.close().await.map_err(error);
-                    copied?;
-                    closed?;
-                    if *bytes - before != size
-                        || Some(local_stat(
-                            fs::symlink_metadata(&source_path).await.map_err(error)?,
-                        )) != entry.source
-                    {
-                        return Err("上传期间源文件已变化。".into());
-                    }
-                } else {
-                    sftp.create_dir(&destination).await.map_err(error)?;
-                    created.push((destination, true));
-                }
-            }
-            if self.cancel.is_cancelled() {
-                return Err("上传已取消。".into());
-            }
-            let (current, _) = scan_upload_folder(&file.local, &mut 1000, &self.cancel).await?;
-            if current != *folder {
-                return Err("本机目录内容已变化，未提交。".into());
-            }
-            if remote_target(sftp, &file.remote).await?.is_some() {
-                return Err("远端目标已出现，未覆盖。".into());
-            }
-            *committing = true;
-            self.emit(ws, file, "committing", *bytes, "");
-            sftp.rename(&temp, &file.remote).await.map_err(error)?;
-            Ok("done")
-        }
-        .await;
-        if result.is_err() {
-            for (path, directory) in created.into_iter().rev() {
-                let _ = if directory {
-                    sftp.remove_dir(path).await
-                } else {
-                    sftp.remove_file(path).await
-                };
-            }
-            let _ = sftp.remove_dir(temp).await;
-        }
-        result
-    }
-    async fn download_folder(
-        &self,
-        ws: &Workspace,
-        file: &File,
-        folder: &DownloadFolder,
-        sftp: &SftpSession,
-        bytes: &mut u64,
-        committing: &mut bool,
-    ) -> Result<&'static str, String> {
-        if sftp.canonicalize(&file.remote).await.map_err(error)? != folder.root
-            || !sftp
-                .symlink_metadata(&file.remote)
-                .await
-                .map_err(error)?
-                .file_type()
-                .is_dir()
-        {
-            return Err("远端目录已变化，请重新选择。".into());
-        }
-        let parent = file.local.parent().ok_or("本机保存路径无效。")?;
-        let temp = tempfile::Builder::new()
-            .prefix(".termlume-")
-            .suffix(".part")
-            .tempdir_in(parent)
-            .map_err(error)?;
-        let result = async {
-            for entry in &folder.entries {
-                if self.cancel.is_cancelled() {
-                    return Err("传输已取消。".into());
-                }
-                let attrs = sftp.symlink_metadata(&entry.remote).await.map_err(error)?;
-                if sftp.canonicalize(&entry.remote).await.map_err(error)? != entry.remote {
-                    return Err("目录中的项目已变化，请重新选择。".into());
-                }
-                let destination = temp.path().join(&entry.local);
-                if let Some(size) = entry.size {
-                    if !attrs.file_type().is_file() || attrs.size != Some(size) {
-                        return Err("目录中的文件已变化，请重新选择。".into());
-                    }
-                    let mut source = sftp.open(&entry.remote).await.map_err(error)?;
-                    let mut options = fs::OpenOptions::new();
-                    options.write(true).create_new(true);
-                    #[cfg(unix)]
-                    options.mode(0o600);
-                    let mut output = options.open(&destination).await.map_err(error)?;
-                    let before = *bytes;
-                    let copied = self.copy(ws, file, &mut source, &mut output, bytes).await;
-                    let _ = source.close().await;
-                    copied?;
-                    if *bytes - before != size {
-                        return Err("目录中的文件大小已变化，请重新选择。".into());
-                    }
-                    output.sync_all().await.map_err(error)?;
-                } else if attrs.file_type().is_dir() {
-                    fs::create_dir(&destination).await.map_err(error)?;
-                } else {
-                    return Err("目录中的项目已变化，请重新选择。".into());
-                }
-            }
-            if self.cancel.is_cancelled() {
-                return Err("传输已取消。".into());
-            }
-            *committing = true;
-            self.emit(ws, file, "committing", *bytes, "");
-            publish_folder(temp.path(), &file.local)
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                let _ = temp.keep();
-                Ok("done")
-            }
-            Err(message) => {
-                let staging = temp.path().display().to_string();
-                if temp.close().is_err() {
-                    return Err(format!("{message} 请检查传输临时目录 {staging}"));
-                }
-                Err(message)
-            }
-        }
-    }
-
     async fn choose_new_name(&self, sftp: &SftpSession, file: &mut File) -> Result<(), String> {
         let old = file.clone();
         let target = old.target();
@@ -1123,98 +955,7 @@ impl Job {
         }
         Err("找不到可用的另存文件名。".into())
     }
-    async fn upload(
-        &self,
-        ws: &Workspace,
-        file: &File,
-        sftp: &SftpSession,
-        temp: &str,
-        bytes: &mut u64,
-        created: &mut bool,
-    ) -> Result<(), String> {
-        let mut source = fs::File::open(&file.local).await.map_err(error)?;
-        if !source.metadata().await.map_err(error)?.is_file() {
-            return Err("请选择普通文件。".into());
-        }
-        if self.cancel.is_cancelled() {
-            return Err("传输已取消。".into());
-        }
-        let mut attrs = FileAttributes::empty();
-        attrs.permissions = file.permissions.or(Some(0o600));
-        let mut destination = sftp
-            .open_with_flags_and_attributes(
-                temp,
-                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
-                attrs,
-            )
-            .await
-            .map_err(error)?;
-        *created = true;
-        let result = self
-            .copy(ws, file, &mut source, &mut destination, bytes)
-            .await;
-        let closed = destination.close().await.map_err(error);
-        result.and(closed)
-    }
-    async fn download(
-        &self,
-        ws: &Workspace,
-        file: &File,
-        sftp: &SftpSession,
-        temp: &Path,
-        bytes: &mut u64,
-        created: &mut bool,
-    ) -> Result<(), String> {
-        if !remote_target(sftp, &file.remote)
-            .await?
-            .is_some_and(|m| m.regular)
-        {
-            return Err("远端文件不再是普通文件。".into());
-        }
-        let mut source = sftp.open(&file.remote).await.map_err(error)?;
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut destination = options.open(temp).await.map_err(error)?;
-        *created = true;
-        let result = self
-            .copy(ws, file, &mut source, &mut destination, bytes)
-            .await;
-        let _ = source.close().await;
-        result?;
-        destination.sync_all().await.map_err(error)
-    }
-    async fn copy(
-        &self,
-        ws: &Workspace,
-        file: &File,
-        source: &mut (impl AsyncRead + Unpin),
-        target: &mut (impl AsyncWrite + Unpin),
-        bytes: &mut u64,
-    ) -> Result<(), String> {
-        let mut buffer = vec![0; 128 * 1024];
-        let mut update = Instant::now();
-        loop {
-            let count = tokio::select! {
-                _ = self.cancel.cancelled() => return Err("传输已取消。".into()),
-                result = source.read(&mut buffer) => result.map_err(error)?,
-            };
-            if count == 0 {
-                break;
-            }
-            tokio::select! {
-                _ = self.cancel.cancelled() => return Err("传输已取消。".into()),
-                result = target.write_all(&buffer[..count]) => result.map_err(error)?,
-            }
-            *bytes += count as u64;
-            if update.elapsed() >= Duration::from_millis(125) {
-                self.emit(ws, file, "running", *bytes, "");
-                update = Instant::now();
-            }
-        }
-        target.flush().await.map_err(error)
-    }
+
 }
 
 fn publish_folder(source: &Path, target: &Path) -> Result<(), String> {
@@ -1482,14 +1223,18 @@ impl Editors {
     }
 }
 const EDITOR_LIMIT: usize = 4 * 1024 * 1024;
+const EDITOR_FILE_ERROR: &str = "编辑器支持不超过 4 MiB 的普通 UTF-8 文本文件。";
 
-async fn read_editor_file(
+async fn read_bounded_text(
     sftp: &SftpSession,
     path: &str,
-) -> Result<(Vec<u8>, FileAttributes), String> {
+) -> Result<(Option<Vec<u8>>, FileAttributes), String> {
     let attrs = sftp.symlink_metadata(path).await.map_err(error)?;
-    if !attrs.file_type().is_file() || attrs.size.is_some_and(|size| size > EDITOR_LIMIT as u64) {
-        return Err("编辑器支持不超过 4 MiB 的普通 UTF-8 文本文件。".into());
+    if !attrs.file_type().is_file() {
+        return Err(EDITOR_FILE_ERROR.into());
+    }
+    if attrs.size.is_some_and(|size| size > EDITOR_LIMIT as u64) {
+        return Ok((None, attrs));
     }
     let mut file = sftp.open(path).await.map_err(error)?;
     let mut bytes = Vec::new();
@@ -1500,10 +1245,18 @@ async fn read_editor_file(
         .map_err(error);
     let _ = file.close().await;
     read?;
-    if bytes.len() > EDITOR_LIMIT || std::str::from_utf8(&bytes).is_err() || bytes.contains(&0) {
-        return Err("编辑器支持不超过 4 MiB 的普通 UTF-8 文本文件。".into());
+    if bytes.len() > EDITOR_LIMIT {
+        return Ok((None, attrs));
     }
-    Ok((bytes, attrs))
+    if std::str::from_utf8(&bytes).is_err() || bytes.contains(&0) {
+        return Err(EDITOR_FILE_ERROR.into());
+    }
+    Ok((Some(bytes), attrs))
+}
+
+async fn read_editor_file(sftp: &SftpSession, path: &str) -> Result<(Vec<u8>, FileAttributes), String> {
+    let (bytes, attrs) = read_bounded_text(sftp, path).await?;
+    Ok((bytes.ok_or(EDITOR_FILE_ERROR)?, attrs))
 }
 
 async fn editor_read(sftp: &SftpSession, path: &str) -> Result<(Vec<u8>, Stat), String> {
@@ -1526,7 +1279,10 @@ fn text_revision(bytes: &[u8], attrs: &FileAttributes) -> String {
 pub async fn read_text(session: &Session, path: &str) -> Result<Value, String> {
     let sftp = open(session).await?;
     let path = canonical_entry(&sftp, path).await?;
-    let (bytes, attrs) = read_editor_file(&sftp, &path).await?;
+    let (bytes, attrs) = read_bounded_text(&sftp, &path).await?;
+    let Some(bytes) = bytes else {
+        return Ok(json!({"path": path, "tooLarge": true}));
+    };
     let revision = text_revision(&bytes, &attrs);
     Ok(
         json!({"path": path, "text": String::from_utf8(bytes).map_err(error)?, "revision": revision}),
@@ -1546,10 +1302,10 @@ pub async fn save_text(
     let _mutation = mutation_guard(ws, session)?;
     let sftp = open(session).await?;
     let path = canonical_entry(&sftp, path).await?;
-    let conflict = "远端文件已改变。请重新打开并合并修改。";
+    let conflict = "远端文件已改变。";
     let (original, attrs) = read_editor_file(&sftp, &path).await?;
     if text_revision(&original, &attrs) != expected {
-        return Err(conflict.into());
+        return Ok(json!({"conflict":true}));
     }
     // Verify write permission on the original even when its parent is writable.
     sftp.open_with_flags(&path, OpenFlags::WRITE)
@@ -1606,6 +1362,7 @@ pub async fn save_text(
             .is_ok_and(|entry| entry.is_none())
             || sftp.remove_file(&temporary).await.is_ok()
         {
+            if failure == conflict { return Ok(json!({"conflict":true})); }
             return Err(failure);
         }
         return Err(format!("{failure} 请检查远端临时文件 {temporary}"));
@@ -1738,6 +1495,7 @@ pub async fn prepare_edited_upload(ws: &Workspace, id: Uuid) -> Result<Value, St
     let token = crate::id(&ticket["ticket"])?;
     if let Some(ticket) = ws.transfers.tickets.lock().unwrap().get_mut(&token) {
         ticket.files[0].original = Some(file.original.clone());
+        ticket.files[0].editor_upload = true;
     }
     Ok(ticket)
 }

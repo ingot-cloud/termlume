@@ -659,10 +659,17 @@
     await tick();
     const remotePath = dialog.querySelector('input');
     assert(remotePath.value === production.files.directory, '前往目录时填入当前远端路径');
+    const priorDirectory = production.files.directory;
+    findButton(dialog, '收藏当前目录').click(); await tick();
+    assert(findButton(dialog, '取消收藏当前目录') && dialog.querySelector('.directory-places').textContent.includes(priorDirectory), '当前主机可以收藏当前目录');
     remotePath.value = '/var/log/归档';
     remotePath.form.requestSubmit();
     await tick();
     assert(production.files.directory === '/var/log/归档', '前往按钮打开指定的远端目录');
+    findButton($('files'), '前往').click(); await tick();
+    assert(findButton(dialog, '前往 /var/log/归档') && findButton(dialog, `取消收藏 ${priorDirectory}`), '上次收藏和本次访问都可在前往弹窗找到');
+    findButton(dialog, `取消收藏 ${priorDirectory}`).click(); await tick();
+    findButton(dialog, '取消').click(); await tick();
     findButton($('files'), '新建 / 上传').click();
     assert([...hostMenu.panel.querySelectorAll('button')].map(b => b.textContent).join('、') === '新建文件、新建目录、上传文件、上传目录',
       '新建和上传共用一个菜单');
@@ -695,6 +702,41 @@
     findButton(fileEditor,'关闭').click(); await tick();
     const savedBytes = new TextEncoder().encode('中文2026-11-22T12:00:00Z ERROR sample').length;
     assert(document.activeElement === fileChoice() && fileChoice().closest('.file-row').textContent.includes(`${savedBytes} B`), '保存更新文件大小，关闭后返回文件名');
+    api.files.readText = async ({path}) => ({path, tooLarge:true});
+    for (const [label,action] of [['查看最后 200 行','tail'],['实时跟踪','follow']]) {
+      fileChoice().dispatchEvent(new MouseEvent('dblclick', {bubbles:true})); await tick();
+      findButton(fileEditor,label).click(); await tick();
+      const request = previewCalls.findLast(([type])=>type==='command-start')?.[1];
+      assert(!fileEditor.open && active.kind==='command' && request.sessionId===production.id &&
+        request.request.action===action && request.request.argument==='/var/error.log' && request.request.lines===200,
+        `大日志从打开页面直接${label}，目标主机和路径正确`);
+      removeTab(active); selectTab(production); await tick();
+    }
+    api.files.readText = normalRead;
+    {
+      const original = 'a\r\nb\nc\rd\r\n';
+      const mixed = window.TermlumeFileEditor.open(document.createElement('div'),'mixed.txt',original,()=>{},false);
+      const snapshot = mixed.snapshot();
+      mixed.writable(true);
+      mixed.editor.dispatch({changes:{from:0,to:1,insert:'A'}});
+      assert(mixed.serialize() === 'A' + original.slice(1), '单字编辑保留每个 CRLF、LF 和 CR');
+      mixed.preview(mixed.snapshot());
+      mixed.writable(true);
+      mixed.editor.dispatch({changes:{from:1,to:2,insert:''}});
+      assert(mixed.serialize() === 'Ab\nc\rd\r\n', '删除一处换行保留其他行尾');
+      mixed.undo();
+      assert(mixed.serialize() === 'A' + original.slice(1), '撤销删除恢复原换行符');
+      mixed.redo();
+      assert(mixed.serialize() === 'Ab\nc\rd\r\n', '恢复删除后其他换行符仍准确');
+      mixed.preview(snapshot);
+      assert(mixed.serialize() === original && mixed.matches(snapshot), '取消编辑恢复文本及混合行尾');
+      mixed.writable(true);
+      mixed.applyFormat('new\na\nb\nother\nc\nd\n', 0);
+      assert(mixed.serialize().includes('a\r\nb\n') && mixed.serialize().endsWith('c\rd\r\n'), '格式化新增行保留前后原文行尾');
+      mixed.undo();
+      assert(mixed.serialize() === original, '撤销格式化完整还原混合行尾');
+      mixed.editor.destroy();
+    }
     for (const [path, text, format] of [
       ['/etc/nginx/sites-available/default','server { listen 80; }','Nginx'],
       ['/opt/run','#!/usr/bin/env bash\necho "hello"','Shell'],
@@ -728,15 +770,99 @@
     findButton(fileEditor, '保存').click(); await tick();
     assert(readOnly() && previewCalls.filter(([kind]) => kind === 'save-text').length === writesBeforeCleanSave,
       '保存无改动的文件直接回到预览，无需重复写入远端');
+    findButton(fileEditor, '编辑').click();
+    fileEditor.querySelector('.cm-content').focus();
+    document.execCommand('insertText', false, 'draft'); await tick();
+    api.files.saveText = async () => ({conflict:true});
+    api.files.readText = async ({path}) => ({path,text:'Remote change\r\n',revision:'review-2'});
+    findButton(fileEditor, '保存').click(); await tick();
+    assert(!fileEditor.querySelector('.file-conflict-bar').hidden && findButton(fileEditor, '保存').disabled, '发生冲突时暂停保存并提供就地对比');
+    findButton(fileEditor, '查看差异').click(); await tick();
+    const theirs = fileEditor.querySelector('[aria-label="远端最新内容"]');
+    const mine = fileEditor.querySelector('[aria-label="我的草稿"]');
+    assert(theirs.textContent.includes('Remote change') && !theirs.isContentEditable && mine.isContentEditable && mine.textContent.includes('draft'), '差异并排显示只读远端和可写草稿');
+    mine.focus(); document.execCommand('insertText', false, 'merged'); await tick();
+    findButton(fileEditor, '返回编辑').click(); await tick();
+    assert(findButton(fileEditor, '保存').disabled && fileEditor.querySelector('.cm-content').textContent.includes('merged'), '退出对比保留输入并继续保护远端版本');
+    findButton(fileEditor, '查看差异').click(); await tick();
+    findButton(fileEditor, '完成对比').click(); await tick();
+    assert(fileEditor.querySelector('.cm-content').textContent.includes('merged'), '完成对比保留在差异视图中输入的修改');
+    findButton(fileEditor,'保存').click(); await tick();
+    assert(!fileEditor.querySelector('.file-conflict-bar').hidden && findButton(fileEditor,'保存').disabled, '远端再次变化时仍需重新核对');
+    findButton(fileEditor,'查看差异').click(); await tick();
+    findButton(fileEditor,'完成对比').click(); await tick();
+    api.files.saveText = originalSave;
+    findButton(fileEditor,'保存').click(); await tick();
+    assert(readOnly() && previewCalls.at(-1)[1].revision === 'review-2' && previewCalls.at(-1)[1].text.includes('merged'), '仅以最后核对的版本保存草稿，成功返回预览');
+    api.files.readText = normalRead;
     findButton(fileEditor, '关闭').click(); await tick();
-    for (const [direction, state, archived] of [['down','done',true],['down','done',false],['down','failed',true],['up','done',false]]) {
-      const id = `test-reveal-${direction}-${state}-${archived}`;
-      updateJob({id,direction,status:state,remote:'/remote/file',local:'/local/file (2)',size:5,bytes:5,finishedAt:1},archived);
-      const control = [...jobRows.get(id).controls.children].find(b=>b.textContent.includes('中显示'));
-      assert(Boolean(control) === (direction === 'down' && state === 'done'), '仅成功下载提供本机定位');
-      if (control) { control.click(); await tick(); assert(previewCalls.at(-1)[1] === id, '使用下载记录定位'); }
+    for (const [direction, state] of [['down','done'],['up','done'],['down','failed'],['up','running'],['down','paused']]) {
+      const id = `test-reveal-${direction}-${state}`;
+      updateJob({id,direction,status:state,remote:'/remote/file',local:'/local/file (2)',size:5,bytes:5,
+        finishedAt:['done','failed'].includes(state) ? 1 : undefined},true);
+      const controls=jobRows.get(id).controls;
+      assert(findButton(controls,'定位远端文件') && findButton(controls,'打开本地目录'), '各方向和状态均提供两端定位');
+      findButton(controls,'打开本地目录').click(); await tick();
+      assert(previewCalls.at(-1)[0]==='reveal-local' && previewCalls.at(-1)[1]===id,'本地定位只传记录 ID');
       forgetJob(id);
     }
+    const record = {id:'retry-archive', sessionId:'closed-session', host:production.host.name,
+      route:{target:{...production.host,address:production.host.address.toLowerCase()},jump:null},
+      direction:'down',status:'failed',remote:'/srv/example.log',local:'/local/example.log',finishedAt:5,size:12,bytes:2};
+    api.files.prepareRetry = async value => {previewCalls.push(['prepare-retry',value]); return {ticket:'retry-ticket',files:[{exists:true,canReplace:true}]};};
+    api.files.discard = async ticket => previewCalls.push(['discard-ticket',ticket]);
+    api.files.enqueue = async request => previewCalls.push(['enqueue',request]);
+    updateJob(record,true);
+    findButton(jobRows.get(record.id).controls,'重新传输').click(); await tick();
+    assert(dialog.open && dialog.textContent.includes(record.local) && dialog.textContent.includes(record.remote) &&
+      previewCalls.some(([type,request])=>type==='prepare-retry' && request.id === production.id && request.recordId === record.id), '归档记录复用原主机并核对两端路径与同名策略');
+    findButton(dialog,'取消').click(); await tick();
+    assert(previewCalls.at(-1)[0] === 'discard-ticket' && !previewCalls.some(([type,value])=>type==='enqueue' && value.ticket==='retry-ticket'), '取消重试释放确认票据且不开始传输');
+    const directoryBeforeLocate = production.files.directory;
+    const hiddenBeforeLocate = production.files.showHidden;
+    const toLocate = {...record,id:'locate-hidden',status:'done',remote:'/var/log/应用/.env'};
+    updateJob(toLocate,true);
+    production.files.query='other'; production.files.showHidden=false;
+    findButton(jobRows.get(toLocate.id).controls,'定位远端文件').click(); await tick();
+    assert(active===production && filesOpen && production.files.directory==='/var/log/应用' &&
+      $('files').querySelector('input[aria-label="选择 .env"]').checked && !production.files.query &&
+      previewCalls.some(([type,req])=>type==='remote-location' && req.id===production.id && req.recordId===toLocate.id),
+      '复用原主机，打开远端父目录并显示和选中隐藏文件');
+    const missing={...toLocate,id:'locate-missing',remote:'/gone.txt'};
+    updateJob(missing,true);
+    findButton(jobRows.get(missing.id).controls,'定位远端文件').click(); await tick();
+    assert(production.files.directory==='/' && !production.files.selected.size && $('files').textContent.includes('未找到「gone.txt」'),
+      '远端项目缺失仍打开根目录并反馈');
+    forgetJob(toLocate.id);forgetJob(missing.id);
+    production.files.showHidden=hiddenBeforeLocate;
+    await loadFiles(production,directoryBeforeLocate);
+    forgetJob(record.id);
+    const displayJobs = [
+      {id:'pages-down',direction:'down',remote:'/log/Reports.ZIP',local:'/tmp/Reports (2).ZIP',status:'done',finishedAt:8},
+      {id:'pages-up',direction:'up',remote:'/log/app.log',local:'/tmp/App.log',status:'done',finishedAt:9},
+      {id:'pages-paused',direction:'up',remote:'/log/job.bin',local:'/tmp/job.bin',status:'paused'}
+    ];
+    for (const row of displayJobs) updateJob({...row,size:100,bytes:50},true);
+    transferPage='active'; renderTransferSummary();
+    const historyTab=$('transfer-pages').querySelector('[data-transfer-page="history"]');
+    assert($('transfer-history-page').hidden && !$('transfer-active-page').hidden && $('transfer-active-empty').hidden, '进行中页面单独显示待继续任务');
+    historyTab.click();
+    assert($('transfer-active-page').hidden && !$('transfer-history-page').hidden && !$('clear-transfers').disabled &&
+      findButton(jobRows.get('pages-up').controls,'删除记录'), '历史页同时支持上传下载记录清理');
+    const query=$('transfer-search');
+    query.value='REPORTS (2)'; query.dispatchEvent(new Event('input'));
+    assert(!jobRows.get('pages-down').element.hidden && jobRows.get('pages-up').element.hidden, '文件名搜索忽略大小写并匹配本机另存名称');
+    let clearedAll=false;
+    api.files.removeHistory=async id=>{clearedAll=id===null;return ['pages-down','pages-up'];};
+    $('clear-transfers').click(); await tick();
+    findButton(dialog,'取消').click(); await tick();
+    assert(!clearedAll && jobs.has('pages-up'),'取消清空保留历史');
+    $('clear-transfers').click(); await tick(); findButton(dialog,'清空记录').click(); await tick();
+    assert(clearedAll && !jobs.has('pages-up') && !jobs.has('pages-down') && jobs.has('pages-paused'), '筛选时清空仍覆盖全部历史并保留断点');
+    query.value=''; query.dispatchEvent(new Event('input'));
+    forgetJob('pages-paused');
+    transferPage='active';renderTransferSummary();
+
     const selected = $('files').querySelector('input[aria-label="选择 error.log"]'); selected.click();
     findButton($('files'), '所选项 ⋯').click();
     assert(!findButton(hostMenu.panel, '跟踪日志').disabled && !findButton(hostMenu.panel, '重命名').disabled &&

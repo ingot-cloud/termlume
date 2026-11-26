@@ -30,7 +30,7 @@ const transferHistoryLimit = 200;
 const recent = new Map();
 const actionLabels = { custom:'自定义命令', tail: '查看日志末尾', follow: '跟踪日志', journal: '查看服务日志', disk: '查看磁盘' };
 const authLabels = { password: '密码', key: '私钥', agent: 'Agent' };
-const jobLabels = { queued: '等待', running: '传输中', committing: '提交中', done: '完成', canceled: '已取消', skipped: '已跳过', failed: '失败', unverified: '待确认' };
+const jobLabels = { queued: '等待', paused: '已暂停', verifying: '校验断点', running: '传输中', committing: '提交中', done: '完成', canceled: '已取消', skipped: '已跳过', failed: '失败', unverified: '待确认' };
 const searchOptions = { decorations: {
   matchBackground: '#544622', matchBorder: '#b49352', matchOverviewRuler: '#b49352',
   activeMatchBackground: '#795120', activeMatchBorder: '#ffd68d', activeMatchColorOverviewRuler: '#ffd68d'
@@ -79,6 +79,7 @@ let vaultStatus = {};
 let touchIdAvailable = false;
 let draggedFileCount = 0;
 let transferDirection = '';
+let transferPage = 'active';
 let loadingHistory;
 let historyReady = false;
 let editingHistory = false;
@@ -568,6 +569,8 @@ function applyVaultState(state) {
     $('server-info').hidden = $('server-info').inert = true;
     workspace.dataset.serverInfo = 'closed';
     for (const tab of tabs.values()) {
+      tab.cancelCredential?.();
+      tab.pendingTransfer = undefined;
       tab.serverInfo = tab.networkHistory = tab.resourceHistory = tab.diskHistory = undefined;
       tab.serverHistoryPaused = true;
     }
@@ -4360,7 +4363,9 @@ function renderConnectionPage(tab) {
     node('div', 'connection-track', node('span', 'connection-start', chromeIcon('server')),
       node('span', 'connection-line'), node('span', 'connection-end', chromeIcon('terminal'))),
     node('h2', '', title), detail);
-  if (tab.status === 'trust') {
+  if (tab.credentialForm) {
+    body.append(tab.credentialForm);
+  } else if (tab.status === 'trust') {
     const host = tab.trustHost || tab.host;
     body.append(node('p', 'connection-fingerprint', tab.trustStage === 'jump' ? '跳板机 ' : '目标主机 ',
       endpoint(host), ' · ', node('code', '', tab.fingerprint)));
@@ -4405,6 +4410,10 @@ function renderContext() {
   if (session?.jumpHost) $('context').append(summaryText('small', `经 ${session.jumpHost.name}`));
   const controls = $('session-actions');
   controls.replaceChildren();
+  if (tab.pendingTransfer && readySession(tab)) {
+    const label = { locate: '定位远端文件', retry: '核对传输路径', resume: '继续传输', discard: '取消传输' }[tab.pendingTransfer.action];
+    controls.append(button(label, () => continueTransferAction(tab), 'outlined'));
+  }
   if (tab.kind === 'command') {
     if (session) controls.append(button('返回终端', () => selectTab(session), 'outlined'));
     if (tab.action === 'follow' && ['running', 'connecting'].includes(tab.status)) controls.append(button('停止跟踪', () => api.commands.stop(tab.id)));
@@ -4460,7 +4469,7 @@ async function trust(tab, accepted) {
   await api.ssh.trust({ id: tab.id, accepted, challenge });
 }
 
-async function enterCredential(host, jump = false) {
+async function enterCredential(host, jump = false, pane) {
   const passwordAuth = host.auth === 'password';
   const credential = input('', 'password');
   credential.required = passwordAuth;
@@ -4478,13 +4487,33 @@ async function enterCredential(host, jump = false) {
     }
   }
   try {
+    if (pane) {
+      return await new Promise(resolve => {
+        const submit = node('button', 'primary', '连接');
+        submit.type = 'submit';
+        const finish = value => {
+          pane.credentialForm = pane.cancelCredential = undefined;
+          resolve(value);
+        };
+        const form = node('form', 'pane-credential', node('strong', '', jump ? '跳板机认证' : '目标主机认证'), ...fields,
+          node('div', 'connection-actions', submit, button('取消认证', () => finish(undefined), 'outlined')));
+        form.onsubmit = event => {
+          event.preventDefault();
+          finish({ secret: credential.value, remember: remember.checked, sharePassword: share.checked });
+        };
+        pane.credentialForm = form;
+        pane.cancelCredential = () => finish(undefined);
+        renderConnectionPage(pane);
+        if (active === pane) credential.focus();
+      });
+    }
     return await prompt(jump ? '跳板机认证' : '目标主机认证', fields, '连接', () => ({ secret: credential.value, remember: remember.checked, sharePassword: share.checked }));
   } finally {
     credential.value = '';
   }
 }
 
-async function connect(tab, enterPassword = false, automatic = false) {
+async function connect(tab, enterPassword = false, automatic = false, paneCredentials = false) {
   clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);
   tab.reconnectTimer=undefined;
   if(!automatic){tab.retryCount=0;tab.reconnectCancelled=false;}
@@ -4505,20 +4534,19 @@ async function connect(tab, enterPassword = false, automatic = false) {
     renderContext();
     const credentialFor = async (host, isJump = false) => {
       const useSaved = host.auth === 'password' && !enterPassword && !tab.promptForPassword && await api.hosts.hasPassword(host.id);
+      if (!tabs.has(tab.id) || tab.closing || vaultStatus.locked) return;
       if(automatic&&!automaticCredential(host.auth,useSaved)) throw new Error('自动重连需要手动输入凭据，请点击连接继续。');
-      const credentials = host.auth === 'agent' || (host.auth === 'key' && api.hosts.hasKeyPassphrase) || useSaved ? { secret: '' } : await enterCredential(host, isJump);
+      const credentials = host.auth === 'agent' || (host.auth === 'key' && api.hosts.hasKeyPassphrase) || useSaved ? { secret: '' } : await enterCredential(host, isJump, paneCredentials ? tab : undefined);
       return credentials && { ...credentials, useSaved };
     };
     const jumpCredentials = jumpHost ? await credentialFor(jumpHost, true) : undefined;
-    if (jumpHost && !jumpCredentials) { updateSession(tab, 'idle', '已取消连接。'); return; }
+    if (jumpHost && !jumpCredentials) { if (tabs.has(tab.id)) updateSession(tab, 'idle', '已取消连接。'); return; }
     if (!tabs.has(tab.id)) return;
     const credentials = await credentialFor(tab.host);
-    const useSaved = credentials?.useSaved;
-    if (!tabs.has(tab.id)) return;
-    tab.usedSavedPassword = useSaved || jumpCredentials?.useSaved;
+    if (!tabs.has(tab.id) || tab.closing) return;
+    if (!credentials || vaultStatus.locked) { updateSession(tab, 'idle', '已取消连接。'); return; }
+    tab.usedSavedPassword = credentials.useSaved || jumpCredentials?.useSaved;
     if (enterPassword) tab.promptForPassword = true;
-    if (!tabs.has(tab.id)) return;
-    if (!credentials) { updateSession(tab, 'idle', '已取消连接。'); return; }
     tab.files.generation = (tab.files.generation || 0) + 1;
     tab.files.entries = undefined;
     tab.files.error = '';
@@ -4547,7 +4575,7 @@ async function openHost(host, { force = false, draftTab, connectNow = true } = {
   tabs.set(tab.id, tab);
   selectTab(tab);
   if (connectNow) await connect(tab);
-  else updateSession(tab, 'idle', '会话布局已打开，点击「连接」开始 SSH 会话。');
+  else updateSession(tab, 'idle', '点击「连接」开始 SSH 会话。');
   return tab;
 }
 
@@ -4558,10 +4586,10 @@ async function closeAllTabs() {
   closingAllTabs = true; renderTabs();
   try {
     const ids = new Set(targets.map(tab => tab.id));
-    const ongoing = () => [...jobs.values()].filter(job => ids.has(job.sessionId) && ['queued', 'running', 'committing'].includes(job.status));
+    const ongoing = () => [...jobs.values()].filter(job => ids.has(job.sessionId) && ['queued', 'running', 'verifying', 'committing'].includes(job.status));
     if (ongoing().some(job => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭所有会话。'); return; }
     const transfers = ongoing();
-    if (transfers.length && !await confirm('关闭所有会话', `关闭 ${targets.length} 个标签，并取消正在传输的 ${transfers.length} 项任务？`, '取消任务并关闭所有')) return;
+    if (transfers.length && !await confirm('关闭所有会话', `关闭 ${targets.length} 个标签，将中断 ${transfers.length} 项传输，已保存的断点可继续。`, '中断传输并关闭所有')) return;
     if (ongoing().some(job => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭所有会话。'); return; }
     for (const tab of [...targets.filter(tab => tab.kind === 'command'), ...targets.filter(tab => tab.kind !== 'command')]) {
       if (tabs.has(tab.id)) await closeTab(tab, { confirmed: true });
@@ -4573,9 +4601,9 @@ async function closeAllTabs() {
 async function closeWorkspaceTab(tab) {
   const entry = workspaceEntryFor(tab.id);
   if (!entry?.group) { await closeTab(tab); return; }
-  const ongoing = [...jobs.values()].filter(job => entry.panes.includes(job.sessionId) && ['queued', 'running', 'committing'].includes(job.status));
+  const ongoing = [...jobs.values()].filter(job => entry.panes.includes(job.sessionId) && ['queued', 'running', 'verifying', 'committing'].includes(job.status));
   if (ongoing.some(job => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭工作区。'); return; }
-  if (ongoing.length && !await confirm('关闭分屏工作区', `关闭 ${entry.panes.length} 个会话，并取消正在传输的 ${ongoing.length} 项任务？`, '取消任务并关闭')) return;
+  if (ongoing.length && !await confirm('关闭分屏工作区', `关闭 ${entry.panes.length} 个会话，将中断 ${ongoing.length} 项传输，已保存的断点可继续。`, '中断传输并关闭')) return;
   for (const id of [...entry.panes]) if (tabs.has(id)) await closeTab(tabs.get(id), { confirmed: true });
 }
 
@@ -4585,9 +4613,9 @@ async function closeTab(tab, options = {}) {
   clearTimeout(tab.reconnectTimer);clearTimeout(tab.stableTimer);
   try {
     if (tab.kind === 'shell') {
-      const ongoing = [...jobs.values()].filter((job) => job.sessionId === tab.id && ['queued', 'running', 'committing'].includes(job.status));
+      const ongoing = [...jobs.values()].filter((job) => job.sessionId === tab.id && ['queued', 'running', 'verifying', 'committing'].includes(job.status));
       if (ongoing.some((job) => job.status === 'committing')) { status('文件正在提交，请等待完成后再关闭会话。'); return; }
-      if (ongoing.length && !options.confirmed && !await confirm('关闭 SSH 会话', `取消「${tab.host.name}」正在传输的 ${ongoing.length} 项任务？`, '取消任务并关闭')) return;
+      if (ongoing.length && !options.confirmed && !await confirm('关闭 SSH 会话', `「${tab.host.name}」的 ${ongoing.length} 项传输将中断，已保存的断点可继续。`, '中断传输并关闭')) return;
       if (!tabs.has(tab.id)) return;
       await api.ssh.close(tab.id);
     } else if (tab.kind === 'command') {
@@ -4600,6 +4628,8 @@ async function closeTab(tab, options = {}) {
 function removeTab(tab) {
   cancelTabDrag();
   if (!tabs.delete(tab.id)) return;
+  tab.cancelCredential?.();
+  tab.pendingTransfer = undefined;
   clearTimeout(tab.reconnectTimer);
   clearTimeout(tab.stableTimer);
   const partner = tabs.get(removeSplitPane(tab.id));
@@ -4659,6 +4689,7 @@ function updateSession(tab, next, detail = '') {
     renderTerminalBottom();
   }
   if (active === tab || origin() === tab) renderContext();
+  if (next === 'ready' && tab.pendingTransfer && active === tab && !dialog.open && !fileEditor.open) void continueTransferAction(tab);
   if (filesOpen && origin() === tab) renderFiles();
   if (origin() === tab) {
     renderServerInfo();
@@ -4871,12 +4902,17 @@ async function configureCommand(session, action, file) {
   });
   if (!details || !readySession(session, attempt)) { focusTerminal(source); return; }
   if (!file) { fillTerminalCommand(session, details.preview, attempt); return; }
+  await openFileCommandOutput(session, details.request, details.preview);
+}
+
+async function openFileCommandOutput(session, request, preview) {
+  const { action } = request;
   const tab = { id: sessionId(), kind: 'command', sessionId: session.id, host: session.host, action, status: 'connecting' };
   attachTerminal(tab);
-  tab.rendering.write(`\x1b[90m$ ${details.preview}\x1b[0m\r\n`);
+  tab.rendering.write(`\x1b[90m$ ${preview}\x1b[0m\r\n`);
   tabs.set(tab.id, tab);
   selectTab(tab);
-  try { await api.commands.start({ id: tab.id, sessionId: session.id, request: details.request }); }
+  try { await api.commands.start({ id: tab.id, sessionId: session.id, request }); }
   catch (error) {
     if (!tabs.has(tab.id)) return;
     updateSession(tab, 'failed', message(error));
@@ -5345,8 +5381,8 @@ function openRemoteFile(tab, path, trigger) {
   const source = active;
   const attempt = tab.attempts;
   const lifetime = new AbortController();
-  let view, editor, savedDoc, revision, remotePath, formatRequest;
-  let editing = false, busy = false;
+  let view, editor, savedFile, revision, remotePath, formatRequest;
+  let editing = false, busy = false, conflict = false, comparison, reviewed;
   const title = summaryText('h2', path.split('/').at(-1));
   title.id = 'file-editor-title';
   title.tabIndex = -1;
@@ -5365,7 +5401,58 @@ function openRemoteFile(tab, path, trigger) {
   const languagePicker = selectControl(modes, '文件语言', { searchable: true, align: 'end', placeholder: '搜索文件语言' });
   languagePicker.hidden = true;
   modes.addEventListener('change', () => { view.setFormat(modes.value); refresh(); });
-  const dirty = () => editing && !editor.state.doc.eq(savedDoc);
+  const dirty = () => editing && (Boolean(reviewed) || !view.matches(savedFile));
+  const comparePanel = node('div', 'file-editor-content file-comparison');
+  const compareBody = node('div', 'file-comparison-body');
+  const compareNotice = node('span', '', '远端文件已更改。核对差异后可继续保存。');
+  const compareButton = button('查看差异', openComparison, 'outlined');
+  const compareBar = node('div', 'file-conflict-bar', compareNotice, compareButton);
+  function leaveComparison(accepted) {
+    comparison.destroy();
+    comparison = undefined;
+    conflict = !accepted;
+    comparePanel.hidden = true;
+    content.hidden = false;
+    heading.hidden = false;
+    notice.textContent = accepted ? '已核对远端版本，点击保存提交草稿。' : '草稿已保留，保存前请完成对比。';
+    refresh();
+    editor.focus();
+  }
+  const remoteLabel = node('strong');
+  const draftLabel = node('strong');
+  const finishComparison = button('完成对比', () => leaveComparison(true), 'primary');
+  comparePanel.append(node('div', 'file-comparison-actions', title.textContent, node('div', 'file-tools',
+    button('返回编辑', () => leaveComparison(false), 'outlined'), finishComparison)),
+    node('div', 'file-comparison-labels', remoteLabel, draftLabel), compareBody);
+  comparePanel.hidden = compareBar.hidden = true;
+  async function openComparison() {
+    if (busy || !editing || !conflict || comparison) return;
+    busy = true;
+    refresh();
+    try {
+      if (!readySession(tab, attempt)) throw new Error('原 SSH 会话已断开，草稿仍可复制。');
+      const latest = await api.files.readText({ id: tab.id, path: remotePath });
+      if (!content.isConnected) return;
+      if (!readySession(tab, attempt) || latest.path !== remotePath) throw new Error('连接目标已变化，草稿已保留。');
+      if (latest.tooLarge) throw new Error('远端文件已超过 4 MiB，无法就地对比。草稿已保留。');
+      view.search(false);
+      toggleJump(false);
+      comparePanel.hidden = false;
+      content.hidden = true;
+      heading.hidden = true;
+      const breaks = new Set(latest.text.match(/\r\n|\r|\n/g));
+      const ending = breaks.size > 1 ? '混合换行' : breaks.has('\r\n') ? 'CRLF' : breaks.has('\r') ? 'CR' : 'LF';
+      remoteLabel.textContent = `远端最新版本 · 只读 · ${ending}`;
+      draftLabel.textContent = `我的草稿 · 可编辑 · ${view.lineEnding}`;
+      comparison = view.compare(compareBody, latest.text);
+      reviewed = latest;
+    } catch (error) {
+      heading.hidden = false;
+      content.hidden = false;
+      comparePanel.hidden = true;
+      notice.textContent = message(error);
+    } finally { busy = false; refresh(); }
+  }
   function action(icon, label, run, tooltip = label, primary = false) {
     const control = button(label, run, primary ? 'primary' : '', label);
     control.replaceChildren(chromeIcon(icon), node('span', '', label));
@@ -5383,7 +5470,9 @@ function openRemoteFile(tab, path, trigger) {
   }
   function refresh() {
     edit.disabled = !view || busy;
-    save.disabled = !editing || busy || Boolean(formatRequest);
+    save.disabled = !editing || busy || conflict || Boolean(formatRequest);
+    compareBar.hidden = !editing || !conflict || Boolean(comparison);
+    compareButton.disabled = busy || Boolean(formatRequest);
     close.disabled = cancel.disabled = busy;
     undo.disabled = !editing || busy || !view?.canUndo;
     redo.disabled = !editing || busy || !view?.canRedo;
@@ -5392,6 +5481,7 @@ function openRemoteFile(tab, path, trigger) {
     prettify.disabled = !editing || busy || Boolean(formatRequest) || !view?.parser;
     prettify.title = !editing ? '进入编辑后可格式化' : view?.parser ? '格式化当前文件 (Shift+Alt+F)' : `${view.format} 暂无可用的格式化工具`;
     modified.hidden = !dirty();
+    if (view) ending.textContent = view.lineEnding;
   }
   function preview(messageText) {
     formatRequest?.abort();
@@ -5399,7 +5489,7 @@ function openRemoteFile(tab, path, trigger) {
     editing = false;
     jumpRow.hidden = true;
     go.setAttribute('aria-pressed', 'false');
-    view.preview(savedDoc);
+    view.preview(savedFile);
     notice.textContent = messageText;
     syncMode();
     editor.focus();
@@ -5415,16 +5505,27 @@ function openRemoteFile(tab, path, trigger) {
   }, '编辑当前文件', true);
   const save = action('check', '保存', async () => {
     if (!editing || busy || formatRequest) return;
-    if (!dirty()) { preview(''); return; }
-    const doc = editor.state.doc;
+    if (conflict || comparison) return;
+    if (!dirty() && !reviewed) { preview(''); return; }
+    const snapshot = view.snapshot();
     busy = true;
     view.writable(false);
     refresh();
     notice.textContent = '正在保存…';
     try {
       if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化。请重新打开文件后合并更改。');
-      const result = await api.files.saveText({ id: tab.id, path: remotePath, text: editor.state.sliceDoc(), revision });
-      savedDoc = doc;
+      const result = await api.files.saveText({ id: tab.id, path: remotePath, text: view.serialize(), revision: reviewed?.revision ?? revision });
+      if (!content.isConnected) return;
+      if (result.conflict) {
+        reviewed = undefined;
+        conflict = true;
+        view.writable(true);
+        notice.textContent = '保存前需要核对远端版本';
+        compareButton.focus();
+        return;
+      }
+      reviewed = undefined;
+      savedFile = snapshot;
       revision = result.revision;
       const entry = tab.files.entries?.find(item => item.kind === 'file' && pathOf(tab, item.name) === path);
       if (entry && Number.isFinite(result.size)) {
@@ -5454,7 +5555,25 @@ function openRemoteFile(tab, path, trigger) {
       if (!content.isConnected) return;
       if (!discard) { notice.textContent = ''; editor.focus(); return; }
     }
-    preview('');
+    if (conflict && !reviewed && readySession(tab, attempt)) {
+      busy = true;
+      refresh();
+      try {
+        const latest = await api.files.readText({id: tab.id, path: remotePath});
+        if (!content.isConnected) return;
+        if (!latest.tooLarge && latest.path === remotePath) reviewed = latest;
+      } catch { /* The original preview is still available offline. */ }
+      finally { busy = false; }
+    }
+    const stale = conflict && !reviewed;
+    conflict = false;
+    if (reviewed) {
+      const latest = reviewed;
+      reviewed = undefined;
+      editor.destroy();
+      mountFile(latest);
+    }
+    preview(stale ? '显示打开时的版本' : '');
   }, '取消编辑，返回预览');
   const close = action('close', '关闭', () => { if (!editing && !busy) fileEditor.close(); });
   const download = action('import', '下载', async () => {
@@ -5543,6 +5662,7 @@ function openRemoteFile(tab, path, trigger) {
   const heading = node('header', 'file-editor-heading', identity, actions);
   fileEditor.addEventListener('cancel', event => {
     event.preventDefault();
+    if (comparison) { leaveComparison(false); return; }
     if (!jumpRow.hidden) { toggleJump(false); editor.focus(); }
     else if (search.getAttribute('aria-pressed') === 'true') { view.search(false); editor.focus(); }
     else (editing ? cancel : close).click();
@@ -5550,6 +5670,10 @@ function openRemoteFile(tab, path, trigger) {
   fileEditor.addEventListener('keydown', event => {
     if (event.isComposing || event.defaultPrevented) return;
     const key = event.key.toLowerCase();
+    if (comparison) {
+      if (keyboard.primary(event) && key === 's') event.preventDefault();
+      return;
+    }
     if (keyboard.primary(event) && !event.shiftKey && key === 's') { if (editing) save.click(); }
     else if (event.altKey && event.shiftKey && !event.metaKey && !event.ctrlKey && event.code === 'KeyF') prettify.click();
     else if (view && key === 'f' && !event.shiftKey && keyboard.primary(event)) { toggleJump(false); view.search(true); }
@@ -5562,44 +5686,76 @@ function openRemoteFile(tab, path, trigger) {
   fileEditor.addEventListener('close', () => {
     lifetime.abort();
     formatRequest?.abort();
+    comparison?.destroy();
     editor?.destroy();
     fileEditor.replaceChildren();
-    if (trigger?.isConnected && origin() === tab) trigger.focus({ preventScroll: true });
-    else focusTerminal(source);
+    if (active === source) {
+      if (trigger?.isConnected && origin() === tab) trigger.focus({ preventScroll: true });
+      else focusTerminal(source);
+    }
   }, { once: true });
-  fileEditor.replaceChildren(heading, jumpRow, content, node('footer', 'file-editor-footer',
+  fileEditor.replaceChildren(heading, compareBar, jumpRow, content, comparePanel, node('footer', 'file-editor-footer',
     node('div', 'file-editor-status', mode, modified, notice), position, languagePicker, format, ending));
   syncMode();
   window.overlays.show(fileEditor);
   title.focus({ preventScroll: true });
+  function mountFile(file) {
+    revision = file.revision;
+    const draftChanged = () => {
+      if (!busy && !formatRequest) notice.textContent = '';
+      refresh();
+    };
+    const updatePosition = (line, column, selected) => {
+      position.textContent = `行 ${line}，列 ${column}${selected ? ` · 已选 ${selected}` : ''}`;
+    };
+    view = window.TermlumeFileEditor.open(content, remotePath, file.text, draftChanged,
+      document.documentElement.dataset.theme === 'dark', updatePosition, open => search.setAttribute('aria-pressed', String(open)));
+    editor = view.editor;
+    savedFile = view.snapshot();
+    content.hidden = false;
+    if (!modes.length) for (const name of window.TermlumeFileEditor.formatNames) modes.add(new Option(name, name));
+    modes.value = view.format;
+    modes.dispatchEvent(new Event('input'));
+    languagePicker.hidden = false;
+    format.textContent = 'UTF-8';
+    updatePosition(1, 1, 0);
+    notice.textContent = '';
+    refresh();
+    if (document.activeElement === title) editor.focus();
+  }
   void (async () => {
     try {
       const file = await api.files.readText({ id: tab.id, path });
       if (!fileEditor.open || !content.isConnected) return;
       if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化。请重新打开文件。');
       ({ path: remotePath, revision } = file);
-      const draftChanged = () => {
-        if (!busy && !formatRequest) notice.textContent = '';
-        refresh();
-      };
-      const updatePosition = (line, column, selected) => {
-        position.textContent = `行 ${line}，列 ${column}${selected ? ` · 已选 ${selected}` : ''}`;
-      };
-      view = window.TermlumeFileEditor.open(content, remotePath, file.text, draftChanged,
-        document.documentElement.dataset.theme === 'dark', updatePosition, open => search.setAttribute('aria-pressed', String(open)));
-      editor = view.editor;
-      savedDoc = editor.state.doc;
-      content.hidden = false;
-      for (const name of window.TermlumeFileEditor.formatNames) modes.add(new Option(name, name));
-      modes.value = view.format;
-      modes.dispatchEvent(new Event('input'));
-      languagePicker.hidden = false;
-      format.textContent = 'UTF-8';
-      ending.textContent = view.lineEnding;
-      updatePosition(1, 1, 0);
-      notice.textContent = '';
-      refresh();
-      if (document.activeElement === title) editor.focus();
+      if (file.tooLarge) {
+        const largeLog = window.TermlumeFileEditor.isLogFile(remotePath) || remotePath === tab.host.logPath;
+        if (!largeLog) { notice.textContent = '文件超过 4 MiB，可下载到本机查看。'; return; }
+        async function openLog(action) {
+          if (busy) return;
+          if (!readySession(tab, attempt)) { notice.textContent = 'SSH 会话已变化，请重新打开日志。'; return; }
+          busy = true;
+          refresh();
+          const request = { action, argument: remotePath, lines: 200 };
+          try {
+            const command = await api.commands.preview(request);
+            if (!content.isConnected || !fileEditor.open) return;
+            if (!readySession(tab, attempt) || active !== source) throw new Error('SSH 会话已变化，请重新打开日志。');
+            fileEditor.close();
+            await openFileCommandOutput(tab, request, command);
+          } catch (error) { notice.textContent = message(error); }
+          finally { busy = false; if (content.isConnected) refresh(); }
+        }
+        content.replaceChildren(node('div', 'empty-state', settingsIcon('file'), node('h3', '', '日志超过 4 MiB'),
+          node('p', '', '可读取最后 200 行，或从这里开始跟踪新增内容。'),
+          node('div', 'file-tools', button('查看最后 200 行', () => openLog('tail'), 'primary'),
+            button('实时跟踪', () => openLog('follow'), 'outlined'))));
+        notice.textContent = '';
+        content.hidden = false;
+        return;
+      }
+      mountFile(file);
     } catch (error) { notice.textContent = message(error); }
   })();
 }
@@ -5681,26 +5837,56 @@ function ensureFiles(tab) {
   }
 }
 
-async function loadFiles(tab, directory) {
+async function loadFiles(tab, directory, revealName) {
   const files = tab.files;
   const attempt = tab.attempts;
   const generation = files.generation = (files.generation || 0) + 1;
   files.loading = true;
   files.error = '';
+  files.notice = '';
   if (origin() === tab) renderFiles();
   try {
     const result = await api.files.list({ id: tab.id, directory });
     if (files.generation !== generation || !readySession(tab, attempt)) return;
+    if (api.files.places && (!files.entries || files.directory !== result.directory)) {
+      files.recordVisit = api.files.places({ id: tab.id, action: 'visit', path: result.directory })
+        .catch(error => { if (readySession(tab, attempt)) status(`记录最近目录失败 · ${message(error)}`); });
+    }
     if (files.directory !== result.directory) {
       files.selected.clear();
       files.scrollTop = 0;
       files.query = '';
     }
     Object.assign(files, result);
+    if (revealName) {
+      files.query = '';
+      files.selected.clear();
+      const item = result.entries.find(entry => entry.name === revealName);
+      if (item) {
+        if (revealName.startsWith('.')) files.showHidden = true;
+        files.selected.add(revealName);
+      } else {
+        files.notice = `已打开所在目录，未找到「${revealName}」。`;
+      }
+    }
   } catch (error) {
-    if (files.generation === generation) files.error = message(error);
+    if (files.generation === generation) {
+      files.error = message(error);
+      if (revealName) {
+        Object.assign(files, { directory, entries: [], query: '', error: `无法打开远端目录 ${directory} · ${files.error}` });
+        files.selected.clear();
+      }
+    }
   } finally {
-    if (files.generation === generation) { files.loading = false; if (origin() === tab) renderFiles(); }
+    if (files.generation === generation) {
+      files.loading = false;
+      if (origin() === tab) {
+        renderFiles();
+        if (filesOpen && revealName && files.selected.has(revealName)) {
+          $('files').querySelector('.file-row.selected')?.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
   }
 }
 
@@ -5714,15 +5900,67 @@ function bytes(size) {
 
 async function goToRemoteDirectory(tab) {
   const attempt = tab.attempts;
-  const directory = input(tab.files.directory || '');
-  directory.required = true;
-  directory.placeholder = '/var/log';
-  const destination = prompt('前往目录', [field('远端路径', directory)], '前往', () => {
-    const path = terminalPaths.resolve(directory.value, tab.files.directory);
+  const current = tab.files.directory || '';
+  const directory = input(current);
+  directory.placeholder = api.files.places ? '输入路径或筛选已记住的目录' : '/var/log';
+  const fields = [field('远端路径', directory)];
+  const choices = node('div', 'palette-list directory-places');
+  const feedback = node('p', 'dialog-error');
+  feedback.setAttribute('role', 'status');
+  let places, filtered = [], query = '', selected;
+  let savingFavorite = false;
+  const pinCurrent = button('收藏当前目录', () => changeFavorite(current, !places.favorites.includes(current)), 'outlined');
+  pinCurrent.disabled = true;
+  async function changeFavorite(path, pin) {
+    if (savingFavorite || !readySession(tab, attempt)) return;
+    savingFavorite = true;
+    feedback.textContent = '';
+    try {
+      places = await api.files.places({ id: tab.id, path, action: pin ? 'pin' : 'unpin' });
+    } catch (error) { feedback.textContent = message(error); }
+    finally { savingFavorite = false; if (choices.isConnected) render(); }
+  }
+  function render() {
+    if (!places) return;
+    pinCurrent.disabled = !current;
+    pinCurrent.textContent = places.favorites.includes(current) ? '取消收藏当前目录' : '收藏当前目录';
+    choices.replaceChildren();
+    filtered = [];
+    const groups = [
+      ['收藏目录', places.favorites],
+      ['最近目录', places.recent.filter(path => !places.favorites.includes(path))]
+    ];
+    for (const [title, paths] of groups) {
+      const matches = paths.filter(path => path.toLowerCase().includes(query.toLowerCase()));
+      if (!matches.length) continue;
+      choices.append(node('h3', 'palette-group', title));
+      for (const path of matches) {
+        filtered.push(path);
+        const open = button('', () => { selected = path; directory.form.requestSubmit(); }, 'directory-choice', `前往 ${path}`);
+        open.append(summaryText('span', path));
+        const favorite = places.favorites.includes(path);
+        const pin = button(favorite ? '取消收藏' : '收藏', () => changeFavorite(path, !favorite), '', `${favorite ? '取消收藏' : '收藏'} ${path}`);
+        choices.append(node('div', 'directory-choice-row', open, pin));
+      }
+    }
+    if (!filtered.length) choices.append(node('p', 'muted', query ? '没有匹配的目录，可直接输入路径。' : '暂无目录记录'));
+  }
+  if (api.files.places) fields.push(pinCurrent, choices, feedback);
+  directory.addEventListener('input', () => { query = directory.value.trim(); render(); });
+  const destination = prompt('前往目录', fields, '前往', () => {
+    const value = directory.value;
+    const keywordMatch = query && !value.includes('/') && !value.startsWith('.') && filtered[0];
+    const path = selected || keywordMatch || terminalPaths.resolve(value, current);
     if (!path) throw new Error('请输入有效的远端目录。');
     return path;
   });
   directory.select();
+  if (api.files.places && directory.form) {
+    wireSearchChoices(directory.form, directory, choices, '.directory-choice');
+    void Promise.resolve(tab.files.recordVisit).then(() => api.files.places({ id: tab.id }))
+      .then(result => { if (choices.isConnected) { places = result; render(); } })
+      .catch(error => { feedback.textContent = message(error); });
+  }
   const path = await destination;
   if (path && filesOpen && origin() === tab && readySession(tab, attempt)) await loadFiles(tab, path);
 }
@@ -5766,7 +6004,8 @@ function renderFiles() {
   crumbs.scrollLeft = crumbs.scrollWidth;
   if (files.loading) { panel.append(node('p', 'inline-status muted', '正在读取目录…')); return; }
   if (files.error) panel.append(node('p', 'inline-status danger', files.error));
-  if (!files.directory || !files.entries) return;
+  if (files.notice) panel.append(node('p', 'inline-status muted', files.notice));
+  if (!files.directory || !files.entries || (files.error && !files.entries.length)) return;
 
   const selectable = (kind) => kind === 'file' || (kind === 'directory' && api.files.directoryDownloads);
   const selection = () => files.entries.filter(({ name, kind }) => selectable(kind) && files.selected.has(name));
@@ -5843,6 +6082,7 @@ function renderFiles() {
     const rows = [];
     for (const { name, kind, size } of entries) {
       const row = node('div', 'file-row');
+      row.classList.toggle('selected', files.selected.has(name));
       if (selectable(kind)) {
         const checkbox = input('', 'checkbox');
         checkbox.checked = files.selected.has(name);
@@ -5853,7 +6093,6 @@ function renderFiles() {
           row.classList.toggle('selected', checkbox.checked);
           updateSelection();
         });
-        row.classList.toggle('selected', checkbox.checked);
         row.append(checkbox);
         if (kind === 'file') {
           const entry = fileEntry(name, kind, () => checkbox.click());
@@ -5937,7 +6176,7 @@ async function showMutationResults(tab){const result=tab.files.lastMutation||[];
 
 async function mutateRemote(tab, deleting, entries) {
   const attempt=tab.attempts;
-  if([...jobs.values()].some(j=>j.sessionId===tab.id&&['queued','running','committing'].includes(j.status))) throw new Error('请先完成或取消此会话的传输，再修改远端文件。');
+  if([...jobs.values()].some(j=>j.sessionId===tab.id&&['queued','running','verifying','committing'].includes(j.status))) throw new Error('请先完成或取消此会话的传输，再修改远端文件。');
   const paths=entries.map(entry=>pathOf(tab,entry.name));
   const preview=await api.files.mutationPreview({id:tab.id,paths});
   if(!readySession(tab,attempt)) return;
@@ -5984,6 +6223,10 @@ async function prepareTransfer(tab, direction, names, { directory = tab.files.di
     if ($('status').textContent === preparing && origin() === tab) status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
   }
   if (!prepared) return;
+  return confirmTransfer(tab, attempt, direction, directory, prepared);
+}
+
+async function confirmTransfer(tab, attempt, direction, directory, prepared, record) {
   const { ticket, files } = prepared;
   try {
     if (!readySession(tab, attempt)) return;
@@ -5997,11 +6240,16 @@ async function prepareTransfer(tab, direction, names, { directory = tab.files.di
     }
     const targets = node('ul', 'target-list', ...files.map((file) => node('li', '',
       `${file.target}${file.kind === 'directory' ? '（目录）' : ''}${file.exists ? '（已存在）' : ''}`)));
-    const fields = [node('p', '', `${tab.host.name} · ${directory}`), targets];
+    const fields = record ? [node('strong', '', `${tab.host.name} · ${endpoint(tab.host)}`),
+      node('p', '', '将从头重新传输。请核对两端路径。'),
+      field('本机路径', node('code', 'command-preview', record.local)),
+      field('远端路径', node('code', 'command-preview', record.remote))]
+      : [node('p', '', `${tab.host.name} · ${directory}`), targets];
+    if (record && conflicts.length) fields.push(node('p', 'muted', '目标已存在，请选择同名处理方式。'));
     const skipped = files.reduce((sum, file) => sum + (file.skipped || 0), 0);
     if (skipped) fields.push(node('p', 'muted', `将跳过 ${skipped} 个链接、特殊文件或不支持的文件名。`));
     if (conflicts.length) fields.push(field('同名文件', selectControl(choices, '同名文件处理方式')));
-    const confirmed = await prompt(direction === 'up' ? '确认上传' : '确认下载', fields, '开始传输', async () => {
+    const confirmed = await prompt(record ? '核对重试路径' : direction === 'up' ? '确认上传' : '确认下载', fields, '开始传输', async () => {
       if (!readySession(tab, attempt)) throw new Error('SSH 会话已变化，请重新选择文件。');
       await api.files.enqueue({ ticket, policy: choices.value });
       return true;
@@ -6017,7 +6265,8 @@ function loadTransferHistory() {
   const feedback = $('transfer-feedback');
   feedback.textContent = '正在读取传输记录…';
   feedback.hidden = false;
-  loadingHistory = api.files.history().then((records) => {
+  loadingHistory = Promise.all([api.files.history(), api.files.pending?.() || []]).then(([history, pending]) => {
+    const records = [...history, ...pending];
     if (vaultStatus.locked) return;
     for (const record of records) if (!jobs.has(record.id)) updateJob(record, true);
     historyReady = true;
@@ -6035,18 +6284,18 @@ function forgetJob(id) {
   jobs.delete(id);
 }
 
-async function removeDownloadHistory(id = null) {
+async function removeTransferHistory(id = null) {
   if (editingHistory || !historyReady) return;
   editingHistory = true;
   renderTransferSummary();
   try {
-    if (!id && !await confirm('清空下载记录', '将移除所有已结束的下载记录。已下载的文件会保留。', '清空记录')) return;
+    if (!id && !await confirm('清空全部历史', '将清空所有已结束的上传和下载记录，包括当前筛选之外的记录。文件和进行中的任务会保留。', '清空记录')) return;
     const ids = await api.files.removeHistory(id);
     for (const removed of ids) {
       removedJobs.add(removed);
       forgetJob(removed);
     }
-    if (ids.length) status(id ? '已删除下载记录。' : '已清空下载记录。');
+    if (ids.length) status(id ? '已删除传输记录。' : '已清空全部历史。');
   } finally {
     editingHistory = false;
     renderTransferSummary();
@@ -6059,12 +6308,15 @@ function renderTransferSummary() {
   let shownActive = 0;
   let shownHistory = 0;
   let canClear = false;
+  const query = $('transfer-search').value.trim().toLocaleLowerCase();
   for (const job of jobs.values()) {
-    const visible = !transferDirection || job.direction === transferDirection;
+    const names = [job.remote?.split('/').pop(), job.local?.split(/[\\/]/).pop()];
+    const visible = (!transferDirection || job.direction === transferDirection) &&
+      (!query || names.some(name => name?.toLocaleLowerCase().includes(query)));
     jobRows.get(job.id).element.hidden = !visible;
     if (job.finishedAt) {
       if (visible) shownHistory += 1;
-      if (job.direction === 'down') canClear = true;
+      canClear = true;
       if (!job.archived && ['failed', 'unverified'].includes(job.status)) failed += 1;
     } else {
       running += 1;
@@ -6072,9 +6324,20 @@ function renderTransferSummary() {
     }
   }
   $('queue-button').textContent = `⇄ 传输记录${running ? ` · ${running} 项进行中` : ''}${failed ? ` · ${failed} 项待处理` : ''}`;
+  const history = transferPage === 'history';
+  for (const control of $('transfer-pages').children) {
+    if (control.dataset.transferPage === transferPage) control.setAttribute('aria-current', 'page');
+    else control.removeAttribute('aria-current');
+  }
+  $('transfer-active-page').hidden = history;
+  $('transfer-history-page').hidden = !history;
+  $('clear-transfers').hidden = !history;
+  const filtered = query || transferDirection;
+  $('transfer-active-empty').textContent = filtered ? '没有匹配的进行中任务。' : '暂无进行中的传输。';
+  $('transfer-history-empty').textContent = filtered ? '没有匹配的历史记录。' : '暂无传输记录。';
   $('transfer-active-empty').hidden = shownActive > 0;
   $('transfer-history-empty').hidden = !historyReady || shownHistory > 0;
-  $('clear-downloads').disabled = !historyReady || editingHistory || !canClear;
+  $('clear-transfers').disabled = !historyReady || editingHistory || !canClear;
 }
 
 function updateJob(event, archived = false) {
@@ -6140,31 +6403,109 @@ function refreshTransferActions(sessionId) {
   }
 }
 
+async function continueTransferAction(tab) {
+  const pending = tab.pendingTransfer;
+  if (!pending || !readySession(tab) || dialog.open || fileEditor.open) return;
+  const { job, legacyHost, action } = pending;
+  const attempt = tab.attempts;
+  tab.pendingTransfer = undefined;
+  renderContext();
+  try {
+    if (action === 'locate') {
+      const {path, route} = await api.files.remoteLocation({ id: tab.id, recordId: job.id, legacyHost });
+      const current = jobs.get(job.id);
+      if (current) current.route = route;
+      if (active !== tab || !readySession(tab, attempt) || dialog.open || fileEditor.open) return;
+      const split = path.lastIndexOf('/');
+      filesOpen = true;
+      serverInfoOpen = false;
+      renderServerInfo();
+      renderContext();
+      await loadFiles(tab, path.slice(0, split) || '/', path.slice(split + 1));
+      return;
+    }
+    if (action === 'resume' || action === 'discard') {
+      await api.files.resume({id: job.id, sessionId: tab.id, discard: action === 'discard'});
+      if (active === tab && !dialog.open && !fileEditor.open) {
+        transferPage = 'active';
+        selectTab(undefined, 'transfers');
+        renderTransferSummary();
+      }
+      return;
+    }
+    const prepared = await api.files.prepareRetry({id: tab.id, recordId: job.id, legacyHost});
+    if (active !== tab || !readySession(tab, attempt) || dialog.open || fileEditor.open) {
+      await api.files.discard(prepared.ticket);
+      if (readySession(tab, attempt) && !tab.pendingTransfer) tab.pendingTransfer = pending;
+      renderContext();
+      return;
+    }
+    await confirmTransfer(tab, attempt, job.direction, '', prepared, job);
+  } catch (error) { status(message(error)); }
+}
+
+async function reconnectTransfer(job, action) {
+  const discard = action === 'discard';
+  if (discard && !await confirm('取消此传输？', '将清理这项任务的临时文件和断点。', '取消任务')) return;
+  if (discard && job.direction === 'down') return api.files.cancelPausedDownload(job.id);
+  await refreshHosts();
+  if (vaultStatus.locked || dialog.open) return;
+  const original = job.route?.target;
+  let host = original && hosts.find(item => item.id === original.id);
+  const matchesEndpoint = (entry, saved) => entry && entry.address.toLowerCase() === saved.address &&
+    entry.port === saved.port && entry.username === saved.username;
+  const jump = job.route?.jump;
+  if (original && (!matchesEndpoint(host, original) || (host.jumpHostId || null) !== (jump?.id || null) ||
+      (jump && !matchesEndpoint(hosts.find(item => item.id === jump.id), jump)))) {
+    throw new Error('原主机已删除或连接目标已变化，请核对主机配置。');
+  }
+  if (!original) {
+    const picker = node('select');
+    picker.add(new Option('请选择主机', ''));
+    for (const entry of hosts) picker.add(new Option(`${entry.name} · ${endpoint(entry)}`, entry.id));
+    const matches = hosts.filter(entry => entry.name === job.host);
+    if (matches.length === 1) picker.value = matches[0].id;
+    picker.required = true;
+    const hint = action === 'locate' ? '确认并连接成功后，这条记录会记住所选主机。' : '请选择对应的连接目标。';
+    host = await prompt('为旧传输记录选择主机', [node('p', '', `原记录仅保存了主机名称「${job.host}」。${hint}`),
+      field('目标主机', selectControl(picker, '目标主机', { searchable: true }))], '继续', () => {
+        const selected = hosts.find(item => item.id === picker.value);
+        if (!selected) throw new Error('请选择此次传输的目标主机。');
+        return selected;
+      });
+    if (!host) return;
+  }
+  let tab = [...tabs.values()].filter(item => item.kind === 'shell' && item.host.id === host.id && !item.pendingTransfer &&
+    !item.closing && ['ready','connecting','trust'].includes(item.status))
+    .sort((a,b) => Number(readySession(b)) - Number(readySession(a)) ||
+      Number(b.id === job.sessionId) - Number(a.id === job.sessionId))[0];
+  if (!tab) tab = await openHost(host, {force:true, connectNow:false});
+  else selectTab(tab);
+  if (!tab || vaultStatus.locked) return;
+  tab.pendingTransfer = {job, action, legacyHost: original ? undefined : host.id};
+  if (readySession(tab)) return continueTransferAction(tab);
+  if (tab.status === 'idle') await connect(tab, false, false, true);
+}
+
 function renderJobActions(job, row) {
   const tab = tabs.get(job.sessionId);
-  const retry = !job.archived && readySession(tab) && ['failed', 'canceled'].includes(job.status);
+  const retry = !job.editorUpload && ['failed', 'canceled'].includes(job.status) && (Boolean(api.files.prepareRetry) || (!job.archived && readySession(tab)));
   const state = `${job.status}:${Boolean(tab)}:${retry}`;
   if (row.actionState === state) return;
   row.actionState = state;
   const controls = [];
-  if (['queued', 'running'].includes(job.status)) controls.push(button('取消', () => api.files.cancel(job.id)));
-  if (retry) controls.push(button('重试', () => api.files.retry(job.id)));
-  if (tab) controls.push(button('转到会话', () => { if (tabs.has(tab.id)) selectTab(tab); }));
-  if (job.finishedAt && job.direction === 'down') {
-    if (job.status === 'done' && api.files.revealDownload) {
-      controls.push(button(keyboard.isMac ? '在访达中显示' : '在资源管理器中显示', async () => {
-        try {
-          await api.files.revealDownload(job.id);
-          row.error.hidden = !job.message;
-          row.error.textContent = job.message || '';
-        } catch (error) {
-          row.error.textContent = message(error);
-          row.error.hidden = false;
-        }
-      }, 'outlined'));
-    }
-    controls.push(button('删除记录', () => removeDownloadHistory(job.id), '', `删除下载记录 ${job.remote}`));
-  }
+  if (['running', 'verifying'].includes(job.status) && api.files.pause) controls.push(button('暂停', () => api.files.pause(job.id)));
+  if (job.status === 'paused' && api.files.resume) {
+    controls.push(button('继续传输', () => reconnectTransfer(job, 'resume'), 'primary'),
+      button('取消任务', () => reconnectTransfer(job, 'discard')));
+  } else if (['queued', 'running', 'verifying'].includes(job.status)) controls.push(button('取消', () => api.files.cancel(job.id)));
+  if (retry) controls.push(button(api.files.prepareRetry ? '重新传输' : '重试', () => api.files.prepareRetry ? reconnectTransfer(job, 'retry') : api.files.retry(job.id)));
+  if (api.files.remoteLocation) controls.push(button('定位远端文件', () => reconnectTransfer(jobs.get(job.id), 'locate'), 'outlined'));
+  if (api.files.revealLocal) controls.push(button('打开本地目录', async () => {
+    const { selected } = await api.files.revealLocal(job.id);
+    status(selected ? '已在本地目录中选中该项目。' : '已打开本地目录，记录中的项目尚未生成或已移走。');
+  }, 'outlined'));
+  if (job.finishedAt) controls.push(button('删除记录', () => removeTransferHistory(job.id), '', `删除传输记录 ${job.remote}`));
   row.controls.hidden = !controls.length;
   row.controls.replaceChildren(...controls);
 }
@@ -6460,7 +6801,12 @@ $('queue-button').addEventListener('click', () => {
   selectTab(undefined, 'transfers');
   $('transfer-filters').querySelector('[aria-pressed="true"]')?.focus();
 });
-$('clear-downloads').addEventListener('click', () => removeDownloadHistory().catch((error) => status(message(error))));
+for (const control of $('transfer-pages').children) control.onclick = () => {
+  transferPage = control.dataset.transferPage;
+  renderTransferSummary();
+};
+$('transfer-search').addEventListener('input', renderTransferSummary);
+$('clear-transfers').addEventListener('click', () => removeTransferHistory().catch((error) => status(message(error))));
 for (const control of transferFilters) {
   control.addEventListener('click', () => {
     transferDirection = control.dataset.direction;

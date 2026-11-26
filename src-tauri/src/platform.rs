@@ -6,15 +6,43 @@ pub fn reveal_download(path: &std::path::Path) -> Result<(), String> {
         std::io::ErrorKind::NotFound => "本机文件已移动或删除。".to_owned(),
         _ => format!("无法访问下载位置：{error}"),
     })?;
+    show_in_file_manager(path, true)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+pub fn transfer_location(path: &std::path::Path) -> Result<(&std::path::Path, bool), String> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err("记录中的本机路径无效。".into());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok((path, true)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or("找不到本机目录。")?;
+            if parent.is_dir() { Ok((parent, false)) }
+            else { Err(format!("本机目录已移动或无法访问：{}", parent.display())) }
+        }
+        Err(e) => Err(format!("无法访问本机路径：{e}")),
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+pub fn show_in_file_manager(path: &std::path::Path, select: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let status = std::process::Command::new("/usr/bin/open").arg("-R").arg(path)
-            .status().map_err(crate::error)?;
-        if !status.success() { return Err("无法在访达中显示下载文件。".into()); }
+        let mut cmd = std::process::Command::new("/usr/bin/open");
+        if select { cmd.arg("-R"); } else { cmd.args(["-a", "Finder"]); }
+        let status = cmd.arg(path).status().map_err(crate::error)?;
+        if !status.success() { return Err("无法在访达中打开本地目录。".into()); }
         Ok(())
     }
     #[cfg(windows)]
-    windows::select_in_explorer(path)
+    {
+        if select { return windows::select_in_explorer(path); }
+        let system = std::env::var_os("SystemRoot").ok_or("找不到资源管理器。")?;
+        std::process::Command::new(PathBuf::from(system).join("explorer.exe"))
+            .arg(path).spawn().map_err(crate::error)?;
+        Ok(())
+    }
 }
 
 pub struct GitTools {
@@ -241,7 +269,7 @@ pub mod windows {
                 CoTaskMemFree(item.cast());
             }
             if initialized >= 0 { CoUninitialize(); }
-            if result < 0 { return Err("无法在资源管理器中显示下载文件。".into()); }
+            if result < 0 { return Err("无法在资源管理器中定位本地项目。".into()); }
         }
         Ok(())
     }

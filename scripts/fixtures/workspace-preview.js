@@ -1,4 +1,5 @@
 // Isolated UI fixture: no SSH, filesystem, keychain or Git operations.
+const previewDirectoryPlaces = new Map();
 const previewHosts = [
   {id:'api',name:'API 生产',address:'api.example.test',username:'ops',port:22,auth:'agent',group:'生产环境',tags:['api','production']},
   {id:'stage',name:'API 预发',address:'stage.example.test',username:'ops',port:2222,auth:'agent',group:'预发环境',tags:['api','staging']},
@@ -194,10 +195,20 @@ window.termlume = {
       return structuredClone(previewSnippets);
     }},
   ssh:{jumpHosts:true,connect:async value=>{previewCalls.push(['connect',value]);queueMicrotask(()=>previewListener({type:'session',id:value.id,status:'ready'}));},input:async value=>previewCalls.push(['input',value]),resize:value=>previewResizes.push(value),ack(){},close:async()=>{},directory:async()=>'/srv/app'},
-  commands:{preview:async()=> 'df -h',close:async()=>{},stop:async()=>{}},
+  commands:{preview:async()=> 'df -h',start:async value=>previewCalls.push(['command-start',value]),close:async()=>{},stop:async()=>{}},
   files:{
     directoryDownloads:true,directoryUploads:true,mutations:true,history:async()=>[],
-    revealDownload:async id=>previewCalls.push(['reveal-download',id]),
+    places:async ({id,action,path})=>{
+      const host = tabs.get(id).host.id;
+      const places = previewDirectoryPlaces.get(host) || {recent:[], favorites:[]};
+      if(action==='visit') places.recent=[path,...places.recent.filter(p=>p!==path)].slice(0,12);
+      if(action==='pin') places.favorites=[path,...places.favorites.filter(p=>p!==path)];
+      if(action==='unpin') places.favorites=places.favorites.filter(p=>p!==path);
+      previewDirectoryPlaces.set(host,places);
+      return structuredClone(places);
+    },
+    revealLocal:async id=>{previewCalls.push(['reveal-local',id]);return {selected:true};},
+    remoteLocation:async request=>{previewCalls.push(['remote-location',request]);const job=jobs.get(request.recordId);return {path:job.remote,route:job.route};},
     list:async value=>{previewCalls.push(['list',value]);return {directory:value.directory||'/var/log/应用',entries:[{name:'nginx',kind:'directory'},{name:'error.log',kind:'file',size:1240},{name:'access.log',kind:'file',size:28000},{name:'.env',kind:'file',size:40}]};},
     inspect:async ({path})=>({path,kind:path.endsWith('.json')?'file':'directory',downloadable:true}),
     readText:async ({path})=>({path,text:'{\r\n  "port": 22\r\n}\r\n',revision:'original'}),

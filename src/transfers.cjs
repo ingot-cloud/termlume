@@ -17,6 +17,11 @@ function sameTarget(current, original, upload) {
     .every((key) => current[key] === original[key]);
 }
 
+function transferRoute({ host, fingerprint }) {
+  const target = { id: host.id, address: host.address.toLowerCase(), port: host.port, username: host.username, fingerprint };
+  return { target, jump: null };
+}
+
 class Transfers {
   constructor(ssh, emit) {
     this.ssh = ssh;
@@ -61,7 +66,7 @@ class Transfers {
   publish(job) {
     this.emit({
       type: 'transfer', id: job.id, sessionId: job.session.id, host: job.session.host.name,
-      direction: job.direction, local: job.local, remote: job.remote, size: job.size,
+      direction: job.direction, local: job.local, remote: job.remote, size: job.size, route: transferRoute(job.session),
       bytes: job.bytes, status: job.status, message: job.message || ''
     });
   }
@@ -212,4 +217,4 @@ class Transfers {
   }
 }
 
-module.exports = { Transfers };
+module.exports = { Transfers, transferRoute };
