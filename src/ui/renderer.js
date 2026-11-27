@@ -6004,19 +6004,23 @@ function handleFileDrag({ phase, position, count, ticket }) {
   if (phase === 'enter' || phase === 'drop') draggedFileCount = count;
   if (phase === 'leave') draggedFileCount = 0;
   const overlay = $('terminal-drop');
-  const tab = active;
-  const rect = $('terminal-stage').getBoundingClientRect();
-  const eligible = draggedFileCount > 0 && readySession(tab) && !dialog.open && !fileEditor.open &&
-    !$('session-switcher').open &&
-    position && position.x >= rect.left && position.x < rect.right && position.y >= rect.top && position.y < rect.bottom;
+  const view = position && document.elementFromPoint(position.x, position.y)?.closest('.terminal-view');
+  const tab = view && [...tabs.values()].find(item => item.view === view);
+  const eligible = draggedFileCount > 0 && tab?.kind === 'shell' && readySession(tab) &&
+    !dialog.open && !fileEditor.open && !$('session-switcher').open;
   overlay.hidden = phase === 'drop' || !eligible;
   if (phase === 'drop') {
     draggedFileCount = 0;
-    if (eligible) void uploadDroppedFiles(tab, ticket, count).catch((error) => status(message(error)));
+    if (eligible) {
+      if (active !== tab) selectTab(tab);
+      void uploadDroppedFiles(tab, ticket, count).catch((error) => status(message(error)));
+    }
   } else if (eligible) {
-    const directory = tab.paths.uploadDirectory;
+    const stage = $('terminal-stage').getBoundingClientRect();
+    const pane = view.getBoundingClientRect();
+    overlay.style.inset = `${pane.top - stage.top + 8}px ${stage.right - pane.right + 8}px ${stage.bottom - pane.bottom + 8}px ${pane.left - stage.left + 8}px`;
     overlay.textContent = draggedFileCount > 100 ? '每次可上传最多 100 个普通文件。'
-      : directory ? `上传到 ${endpoint(tab.host)}:${directory}` : `上传到 ${endpoint(tab.host)} · 松手后读取终端目录`;
+      : `松手上传到 ${endpoint(tab.host)} 的终端当前目录`;
   }
 }
 
@@ -6024,7 +6028,8 @@ async function uploadDroppedFiles(tab, ticket, count) {
   if (count > 100) throw new Error('每次可上传最多 100 个普通文件。');
   const attempt = tab.attempts;
   status('正在核对当前终端目录…');
-  let directory = await currentTerminalDirectory(tab);
+  const current = await api.ssh.directory?.(tab.id);
+  let directory = terminalPaths.absolute(current) ? current : tab.paths.uploadDirectory;
   if (!readySession(tab, attempt) || active !== tab || dialog.open || $('session-switcher').open) return;
   status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
   if (!directory) {
@@ -6034,26 +6039,29 @@ async function uploadDroppedFiles(tab, ticket, count) {
 }
 
 async function chooseRemoteDirectory(tab, attempt, count) {
-  const path = input(tab.files.directory);
+  const path = input('');
+  path.required = true;
   path.placeholder = '/srv/app';
   const entries = node('div', 'palette-list');
-  let revision = 0;
-  const browse = async (directory) => {
+  let revision = 0, browsing = '';
+  const browse = async (directory, select = true) => {
     const version = ++revision;
     const typed = path.value;
     entries.replaceChildren(node('p', 'muted', '正在读取目录…'));
     try {
       const result = await api.files.list({ id: tab.id, directory });
       if (version !== revision || !entries.isConnected) return;
-      if (path.value === typed) path.value = result.directory;
+      browsing = result.directory;
+      if (select && path.value === typed) path.value = browsing;
       const folders = result.entries.filter(({ kind }) => kind === 'directory');
-      entries.replaceChildren(...folders.map(({ name }) => button(`▸ ${name}`, () => browse(`${address(result.directory)}/${name}`))));
+      entries.replaceChildren(button(`选择此目录 · ${browsing}`, () => { path.value = result.directory; }),
+        ...folders.map(({ name }) => button(`▸ ${name}`, () => browse(`${address(result.directory)}/${name}`))));
       if (!folders.length) entries.append(node('p', 'muted', '没有子目录。'));
     } catch (error) {
       if (version === revision && entries.isConnected) entries.replaceChildren(node('p', 'danger', message(error)));
     }
   };
-  const parent = button('上一级', () => browse(path.value.replace(/\/[^/]+\/?$/, '') || '/'));
+  const parent = button('上一级', () => browse(browsing.replace(/\/[^/]+\/?$/, '') || '/'));
   const open = button('浏览', () => browse(path.value), 'outlined');
   const selection = prompt('选择上传目录', [
     node('p', '', `${endpoint(tab.host)} · ${count} 个本机项目`),
@@ -6066,7 +6074,7 @@ async function chooseRemoteDirectory(tab, attempt, count) {
     if (result.kind !== 'directory') throw new Error('请选择远端目录。');
     return result.path;
   });
-  void browse(path.value);
+  void browse(tab.files.directory || '', false);
   return selection;
 }
 
@@ -6507,18 +6515,18 @@ async function prepareTransfer(tab, direction, names, { directory = tab.files.di
     if ($('status').textContent === preparing && origin() === tab) status(`${tab.host.name} · SSH 已连接${tab.jumpHost ? `（经 ${tab.jumpHost.name}）` : ''}`);
   }
   if (!prepared) return;
-  return confirmTransfer(tab, attempt, direction, directory, prepared);
+  return confirmTransfer(tab, attempt, direction, directory, prepared, { dropped: Boolean(dropTicket) });
 }
 
-async function confirmTransfer(tab, attempt, direction, directory, prepared, record) {
+async function confirmTransfer(tab, attempt, direction, directory, prepared, { record, dropped } = {}) {
   const { ticket, files } = prepared;
   try {
     if (!readySession(tab, attempt)) return;
     const choices = node('select');
     const conflicts = files.filter((file) => file.exists);
-    if (prepared.quickDownload && !conflicts.length && files.every(file => !file.skipped)) {
+    if ((prepared.quickDownload || dropped) && files.length && !conflicts.length && files.every(file => !file.skipped)) {
       await api.files.enqueue({ ticket, policy: 'skip' });
-      status('已加入下载队列。');
+      status(dropped ? `已加入上传队列 · ${tab.host.name} · ${directory}` : '已加入下载队列。');
       return;
     }
     for (const [value, label] of [['skip', '跳过同名文件'], ['keep', '另存为新名称'], ['replace', '覆盖已确认的同名普通文件']]) {
@@ -6802,7 +6810,7 @@ async function continueTransferAction(tab) {
       renderContext();
       return;
     }
-    await confirmTransfer(tab, attempt, job.direction, '', prepared, job);
+    await confirmTransfer(tab, attempt, job.direction, '', prepared, { record: job });
   } catch (error) { status(message(error)); }
 }
 

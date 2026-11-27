@@ -846,6 +846,33 @@ async fn connect_tab(
 }
 
 #[tokio::test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the isolated OpenSSH fixture"]
+async fn terminal_directory_follows_cd_in_each_ssh_pty() {
+    let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());
+    let home = tempfile::tempdir().unwrap();
+    let (_profile, ws) = make_workspace(home.path(), None);
+    let port: u16 = std::fs::read_to_string(fixture.join("openssh-port")).unwrap().trim().parse().unwrap();
+    let host = call(&ws, "hosts:save", json!({"address":"127.0.0.1","port":port,
+        "username":std::env::var("USER").unwrap(),"auth":"key","keyPath":fixture.join("client")})).await[0].clone();
+    let mut events = events(&ws);
+    let first = connect_tab(&ws, &mut events, &host, "", false, false).await;
+    let second = connect_tab(&ws, &mut events, &host, "", false, false).await;
+    let root = home.path().canonicalize().unwrap();
+    let subdir = root.join("中文 subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    for (tab, path) in [(first, &subdir), (second, &root)] {
+        call(&ws, "ssh:input", json!({"id":tab,"data":format!("cd '{}' && touch .cwd-ready\r", path.display())})).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !path.join(".cwd-ready").exists() { tokio::time::sleep(Duration::from_millis(30)).await; }
+        }).await.unwrap();
+    }
+    assert_eq!(call(&ws, "ssh:directory", json!(first)).await, json!(subdir));
+    assert_eq!(call(&ws, "ssh:directory", json!(second)).await, json!(root));
+    for tab in [first, second] { call(&ws, "ssh:close", json!(tab)).await; }
+}
+
+#[tokio::test]
 #[ignore = "requires the isolated OpenSSH fixture"]
 async fn macos_host_key_passphrase_persists_connects_and_cleans_up() {
     let fixture = PathBuf::from(std::env::var("TERMLUME_TEST_FIXTURE").unwrap());

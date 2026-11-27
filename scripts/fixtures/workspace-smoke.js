@@ -885,6 +885,30 @@
     api.files.discard = async ticket => previewCalls.push(['discard-ticket',ticket]);
     api.files.enqueue = async request => previewCalls.push(['enqueue',request]);
     {
+      const originalPrepare = api.files.prepare, originalDirectory = api.ssh.directory;
+      api.ssh.directory = async () => '/srv/当前 目录';
+      await new Promise(resolve => production.terminal.write('\x1b]1337;CurrentDir=/root\x07', resolve));
+      const terminalDirectory = '/srv/当前 目录';
+      api.files.prepare = async req => {
+        previewCalls.push(['drop-prepare',req]);
+        return {ticket:req.dropTicket,files:[{target:req.directory+'/sample.log',exists:req.dropTicket==='collision',canReplace:true}]};
+      };
+      await uploadDroppedFiles(production,'drop-new',1);
+      assert(previewCalls.some(([action,value])=>action==='drop-prepare' && value.id===production.id && value.directory===terminalDirectory) &&
+        previewCalls.some(([action,value])=>action==='enqueue' && value.ticket==='drop-new' && value.policy==='skip') && !dialog.open,
+        '拖入文件重新读取终端目录，优先于旧 /root 报告和文件面板，普通文件直接上传');
+      const collision = uploadDroppedFiles(production,'collision',1); await tick();
+      assert(dialog.open && dialog.textContent.includes(terminalDirectory) && dialog.querySelector('select').options.length===3, '拖入同名文件仍可核对目标和选择冲突策略');
+      findButton(dialog,'取消').click(); await collision;
+      production.paths.reset();
+      api.ssh.directory = async () => null;
+      const unknown = uploadDroppedFiles(production,'unknown',1); await tick();
+      assert(dialog.open && !dialog.querySelector('input').value && dialog.querySelector('input').required, '无法确认终端目录时须明确选择，不预填 SFTP 目录');
+      findButton(dialog,'取消').click(); await unknown;
+      assert(!previewCalls.some(([action,value])=>action==='drop-prepare' && value.dropTicket==='unknown'), '取消选择不会上传到登录目录');
+      api.files.prepare = originalPrepare; api.ssh.directory = originalDirectory;
+    }
+    {
       const ticket = 'quick-download';
       await confirmTransfer(production, production.attempts, 'down', '/var', {ticket, quickDownload:true, files:[{target:'/local/new.log'}]});
       assert(!dialog.open && previewCalls.some(([action, request]) => action === 'enqueue' && request.ticket === ticket && request.policy === 'skip'),
@@ -979,6 +1003,16 @@
     assert(splitLayout.tree.ratio === 55 && connectCount === previewCalls.filter(([type]) => type === 'connect').length, '分屏调整保留连接');
     splitLayout = splitFromTree(layoutState.presetTree([staging.id, production.id], 'horizontal', 55));
     selectTab(staging);
+    {
+      const rect = production.surface.getBoundingClientRect();
+      const position = {x:rect.left+rect.width/2, y:rect.top+rect.height/2};
+      handleFileDrag({phase:'enter',position,count:1});
+      assert(!$('terminal-drop').hidden && $('terminal-drop').textContent.includes(endpoint(production.host)), '分屏拖入提示使用鼠标所在终端的主机');
+      handleFileDrag({phase:'drop',position,count:1,ticket:'pane-drop'}); await tick();
+      assert(active===production && previewCalls.some(([action,value])=>action==='prepare' && value.dropTicket==='pane-drop' && value.id===production.id),
+        '文件落在后台窗格时查询并上传到该窗格的 SSH 会话');
+      selectTab(staging);
+    }
     const savedTabIds = [...tabs.keys()];
     $('save-layout').click(); await tick();
     assert(dialog.open && dialog.querySelector('h2').textContent === '保存会话布局',
