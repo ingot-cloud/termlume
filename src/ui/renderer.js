@@ -2643,7 +2643,7 @@ async function manageGroups(page) {
     await ask('分组管理',[search,list],'关闭',()=>true,[button('新建分组',()=>{choice={create:true};close();},'primary')]);
     if(!choice) break;
     if (choice.remove) { await deleteHostGroup(choice.remove); continue; }
-    await editGroup(choice.group, choice.parent, page);
+    await editGroup(choice.group, choice.create ? browsedGroup() : choice.parent, page);
   }
   await refreshHosts();
 }
@@ -3219,9 +3219,27 @@ async function deleteHostGroup(group) {
   status(`已删除分组「${current?.path || path}」，${hostCount} 台主机已移到未分组。`);
 }
 
+function browsedGroup() {
+  return groupAssets.find(group => group.path === currentGroup);
+}
+
+async function createHostGroup(parent) {
+  const created = await editGroup(undefined, parent, undefined, { submitLabel: '创建分组' });
+  if (!created) return;
+  if (workspace.dataset.hostLayout === 'tree') {
+    const byId = new Map(groupAssets.map(group => [group.id, group]));
+    for (let group = created; group && byId.delete(group.id); group = byId.get(group.parentId)) {
+      expandedHostGroups.add(group.id);
+    }
+    saveExpandedHostGroups();
+  }
+  openGroup(created.path);
+}
+
 function groupActions(group) {
   const more = button('⋯', () => showActionMenu(`${group.path} 的操作`, more,
-    [...hostOrderActions('group', group), button('删除分组', () => deleteHostGroup(group), 'danger')]), 'host-edit', `分组操作 ${group.path}`);
+    [button('添加子组', () => createHostGroup(group)), ...hostOrderActions('group', group),
+      button('删除分组', () => deleteHostGroup(group), 'danger')]), 'host-edit', `分组操作 ${group.path}`);
   more.setAttribute('aria-haspopup', 'menu');
   more.setAttribute('aria-expanded', 'false');
   return more;
@@ -3349,8 +3367,11 @@ function groupTree(tree, expanded, options) {
   return list;
 }
 
-function renderHostTree(matching, query, tag, draft) {
-  let tree = orderedHostTree();
+function saveExpandedHostGroups() {
+  try { localStorage.setItem('host-tree-expanded', JSON.stringify([...expandedHostGroups])); } catch { /* Keep in memory. */ }
+}
+
+function renderHostTree(tree, matching, query, tag, draft) {
   const key = JSON.stringify([query, tag]);
   const searching = Boolean(query || tag);
   if (searching) {
@@ -3366,8 +3387,9 @@ function renderHostTree(matching, query, tag, draft) {
   const view = groupTree(tree, searching ? expandedSearchGroups : expandedHostGroups, {
     label: '主机树', hostRow: hostCard,
     ...(api.groups ? { actions: groupActions } : {}),
-    onToggle: (_branch, _open, content) => {
-      if (!searching) try { localStorage.setItem('host-tree-expanded', JSON.stringify([...expandedHostGroups])); } catch { /* Keep in memory. */ }
+    onToggle: (branch, open, content) => {
+      currentGroup = open ? branch.group.path : groupAssets.find(group => group.id === branch.group.parentId)?.path || '';
+      if (!searching) saveExpandedHostGroups();
       if (content.hidden && [...content.querySelectorAll('.host-open')].some(item => item.dataset.hostId === selectedHostId)) {
         selectedHostId = '';
         for (const item of content.querySelectorAll('.host-open')) item.setAttribute('aria-pressed', 'false');
@@ -3598,14 +3620,11 @@ function showHostActions() {
     if (id) action.id = id;
     actions.push(action);
   };
-  if (api.groups) add('新建分组', async () => {
-    const created = await editGroup(undefined, groupAssets.find(group => group.path === currentGroup), undefined, { submitLabel: '创建分组' });
-    if (created) openGroup(created.path);
-  }, 'group');
+  if (api.groups) add('新建分组', () => createHostGroup(browsedGroup()), 'group');
   add('导入 OpenSSH', () => importHosts(), 'import', 'import-hosts');
   if (api.hosts.csvPreview) add('导入 CSV', () => importHosts(true), 'import', 'import-csv');
   if (api.hosts.csvExport) add('导出 CSV', () => exportHosts(), 'export', 'export-csv');
-  if (currentGroup) add('删除当前分组', () => deleteHostGroup(currentGroup), 'group', undefined, 'danger');
+  if (currentGroup && workspace.dataset.hostLayout !== 'tree') add('删除当前分组', () => deleteHostGroup(currentGroup), 'group', undefined, 'danger');
   showActionMenu('更多主机操作', anchor, actions, anchor.getBoundingClientRect().left);
 }
 
@@ -3788,10 +3807,9 @@ function renderHosts() {
   const treeLayout = workspace.dataset.hostLayout === 'tree';
   const groupByPath = new Map(groupAssets.map(group => [group.path, group]));
   const groupById = new Map(groupAssets.map(group => [group.id, group]));
-  const groups = new Map(groupAssets.map(g=>[g.path,0]));
-  for (const host of hosts) {
-    if (host.group) groups.set(host.group, (groups.get(host.group) || 0) + 1);
-  }
+  const ordered = orderedHostTree();
+  const branches = window.hostTree.flattenBranches(ordered);
+  const groups = new Map(branches.map(({group, count}) => [group.path, count]));
   const tagControl = $('tag-filter');
   if (currentGroup && !groups.has(currentGroup)) {
     currentGroup = selectedGroup = '';
@@ -3818,8 +3836,7 @@ function renderHosts() {
   const matching = scope.filter((host) => (!tag || host.tags?.includes(tag)) && hostMatches(host, query, target));
   const visibleHosts = treeLayout || currentGroup || searching ? matching : matching.filter((host) => !host.group);
   if (!visibleHosts.some((host) => host.id === selectedHostId)) selectedHostId = '';
-  const ordered = orderedHostTree();
-  const groupPositions = new Map(window.hostTree.flattenGroups(ordered).map((g,index) => [g.id,index]));
+  const groupPositions = new Map(branches.map(({group}, index) => [group.id, index]));
   const positions = new Map(window.hostTree.flatten(ordered).map((h, index) => [h.id, index]));
   const hostSort = uiPreferences.hostSort || 'recent';
   visibleHosts.sort(hostSort === 'manual' ? (a,b) => positions.get(a.id) - positions.get(b.id) : window.hostTree.compare(hostSort, recent));
@@ -3845,7 +3862,7 @@ function renderHosts() {
   const draft = target && !exact.length;
   hostSearchMatch = saved ? { run: () => openHost(saved) } : draft ? { draft: true, run: () => editHost(undefined, undefined, target) } : undefined;
   updateHostActions();
-  if (treeLayout) { renderHostTree(matching, query, tag, draft); return; }
+  if (treeLayout) { renderHostTree(ordered, matching, query, tag, draft); return; }
   const groupEntries = visibleGroups.map(([group, count]) => groupCard(group, count, groupByPath.get(group)));
   const hostEntries = visibleHosts.map(hostCard);
   if (!currentGroup && !groupEntries.length) groupEntries.push(node('p', 'muted', searching ? '没有匹配的分组' : '暂无分组'));

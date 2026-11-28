@@ -10,11 +10,23 @@
     const hostList = $('host-list');
     const [groupSection, hostSection] = hostList.children;
     const visibleHostIds = () => [...hostList.querySelectorAll('.host-open')].map(item => item.dataset.hostId);
+    const checkNewGroupParent = async expected => {
+      $('host-actions').click();
+      findButton(hostMenu.panel, '新建分组').click();
+      await tick();
+      const parent = dialog.querySelector('[aria-label="上级分组"]').closest('.dropdown').querySelector('select');
+      assert(parent.value === expected, `新建分组默认使用当前位置（${expected || '无上级'}）`);
+      const closed = new Promise(resolve => dialog.addEventListener('close', resolve, {once: true}));
+      findButton(dialog, '取消').click();
+      await closed;
+      await tick();
+    };
     assert(groupSection.querySelector('h2').textContent === '分组' && hostSection.querySelector('h2').textContent === '主机' &&
       groupSection.getBoundingClientRect().bottom < hostSection.getBoundingClientRect().top &&
       visibleHostIds().join() === 'jump', '首页上方是分组，下方只显示未分组主机');
     assert(hostSection.querySelector('.host-identity small').textContent === endpoint(previewHosts[3]), '主机第二行仅显示连接地址');
     assert(!$('host-count') && !$('host-selection-hint') && !$('host-selection-actions') && $('host-list').getBoundingClientRect().top - $('host-library').getBoundingClientRect().top <= 24, '主机列表直接开始，不再占用数量及选中信息栏空间');
+    await checkNewGroupParent('');
     hostList.querySelector('.group-open[data-group="生产环境"]').click();
     assert(visibleHostIds().sort().join() === 'api,db' && hostList.children.length === 1 &&
       hostList.querySelector('h2').textContent === '主机', '没有子分组时只显示组内主机区块');
@@ -22,6 +34,12 @@
     const appGroup = { id: 'prod-app', parentId: 'prod', name: '应用 / 网关', path: '生产环境 / 应用 / 网关', hosts: [] };
     const leafGroup = { id: 'prod-node', parentId: appGroup.id, name: '节点', path: `${appGroup.path} / 节点`, hosts: [] };
     groupAssets = [...groupAssets, appGroup, leafGroup];
+    const originalHosts = hosts;
+    hosts = [...hosts, { ...hosts[0], id: 'leaf-host', groupId: leafGroup.id, group: leafGroup.path }];
+    openGroup('');
+    assert(hostList.querySelector('.group-open[data-group="生产环境"] small').textContent === '3 台主机',
+      '顶层分组汇总直属主机和孙组主机');
+    hostList.querySelector('.group-open[data-group="生产环境"]').click();
     renderHosts();
     const breadcrumb = $('host-breadcrumb');
     const trailButtons = () => [...breadcrumb.querySelectorAll('button')];
@@ -29,6 +47,7 @@
       hostList.querySelector('.group-open')?.dataset.group === appGroup.path &&
       hostList.querySelector('.group-open strong')?.textContent === appGroup.name, '子分组卡片只显示当前组名');
     hostList.querySelector('.group-open').click();
+    await checkNewGroupParent(appGroup.id);
     hostList.querySelector('.group-open').click();
     assert(trailButtons().map(b => b.textContent).join('|') === `全部主机|生产环境|${appGroup.name}` &&
       breadcrumb.querySelector('[aria-current="location"]').textContent === leafGroup.name, '面包屑按实际分组层级显示，组名中的斜线属于组名');
@@ -41,6 +60,7 @@
     $('host-search').value = '预发';
     $('host-search').dispatchEvent(new Event('input'));
     assert(!hostList.querySelector('.group-open') && hostList.children.length === 1, '组内搜索不会显示其他分组');
+    hosts = originalHosts;
     groupAssets = originalGroups;
     $('all-hosts').click();
     assert(breadcrumb.hidden && !hostList.querySelector('[aria-pressed="true"]') && !$('hosts').contains(document.activeElement),

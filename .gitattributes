@@ -1,0 +1,2 @@
+# This script runs on the remote POSIX host, including when bundled on Windows.
+src/terminal-directory.sh text eol=lf

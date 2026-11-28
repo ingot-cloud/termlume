@@ -73,6 +73,8 @@
     return [{ parentId: tree.group?.id || null, ids: kind === 'group' ? tree.groups.map(b => b.group.id) : tree.hosts.map(h => h.id) },
       ...tree.groups.flatMap(branch => scopes(branch, kind))];
   }
-  function flattenGroups(tree) { return tree.groups.flatMap(branch => [branch.group, ...flattenGroups(branch)]); }
-  return { build, filter, descendants, compare, flatten, flattenGroups, scopes };
+  function flattenBranches(tree) {
+    return tree.groups.flatMap(branch => [branch, ...flattenBranches(branch)]);
+  }
+  return { build, filter, descendants, compare, flatten, flattenBranches, scopes };
 });

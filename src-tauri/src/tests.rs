@@ -845,6 +845,11 @@ async fn connect_tab(
     }
 }
 
+#[test]
+fn bundled_terminal_directory_script_uses_posix_line_endings() {
+    assert!(!include_bytes!("../../src/terminal-directory.sh").contains(&b'\r'));
+}
+
 #[tokio::test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the isolated OpenSSH fixture"]

@@ -214,7 +214,7 @@ async function main() {
     await js("dialog.querySelector('form').requestSubmit()");await wait('!dialog.open && !dialog.childElementCount');
     await wait("!hosts.some(h=>h.id==='delete-host')");
     assert.equal(await js("previewCalls.filter(([type])=>type==='remove-host').length"),before+1);
-    await js(`document.querySelector('[aria-label="分组操作 删除验收"]').click();hostMenu.panel.querySelector('button').click()`);
+    await js(`document.querySelector('[aria-label="分组操作 删除验收"]').click();[...hostMenu.panel.querySelectorAll('button')].find(b=>b.textContent==='删除分组').click()`);
     await wait("dialog.open && dialog.textContent.includes('1 个子分组')");
     assert(await js("dialog.textContent.includes('1 台主机会移到未分组')"));
     await overflow();await shot(`group-delete-confirm-${width}.png`);
@@ -295,6 +295,11 @@ async function main() {
     assert(await js(`${toggle('prod')}.getAttribute('aria-expanded')==='false'`),'Clearing search must restore the previous collapsed state');
     await js("$('tag-filter').value='database';$('tag-filter').dispatchEvent(new Event('change'))");
     assert(await js("document.querySelector('#host-list .host-open[data-host-id=db]').getClientRects().length && document.querySelectorAll('#host-list .host-open').length===1"),'Tag filtering must retain ancestors of nested matches');
+    await js(`$('tag-filter').value='';$('tag-filter').dispatchEvent(new Event('change'));if (${toggle('prod')}.getAttribute('aria-expanded')==='true') ${toggle('prod')}.click();${toggle('prod')}.click()`);
+    await js(`$('host-actions').click();[...hostMenu.panel.querySelectorAll('button')].find(b=>b.textContent==='新建分组').click()`);
+    await wait("dialog.open && dialog.querySelector('[aria-label=\"上级分组\"]')");
+    assert(await js("dialog.querySelector('[aria-label=\"上级分组\"]').closest('.dropdown').querySelector('select').value==='prod'"), 'New groups in tree view inherit the opened group');
+    await js('dialog.close()');await wait('!dialog.open && !dialog.childElementCount');
     await js("$('tag-filter').value='';$('tag-filter').dispatchEvent(new Event('change'));for(const b of $('host-list').querySelectorAll('.tree-group-toggle[aria-expanded=false]'))b.click()");
     await tick();await overflow();await shot(`host-tree-dark-${width}.png`);
     await js("uiPreferences.theme='light';applyPreferences()");await tick();await overflow();await shot(`host-tree-light-${width}.png`);
